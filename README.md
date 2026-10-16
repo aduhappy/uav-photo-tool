@@ -89,11 +89,21 @@
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\batch_gcp_transfer.ps1 `
     -Tool <工具 exe> -Source <照片上级目录> -Out <输出目录> `
-    -RefTerrace <梯田参考期.psx> -RefVeg <植被参考期.psx> `
+    [-RefTerrace <梯田参考期.psx>] [-RefVeg <植被参考期.psx>] `
+    [-Select [-NoGui]] [-Include "*梯田*"] [-Pick 1,3,5-9] `
     [-Skip 名字1,名字2] [-ExcludeTerrace 4] [-ExcludeVeg ...] [-Plan]
 ```
 
-- `-Plan`：只列出每一期会用哪个参考期，不实际运行，建议先跑一次看看。
+选择要跑哪些期（可以组合，先按 `-Include` 筛，再按 `-Pick` / `-Select` 选）：
+
+- `-Select`：扫描后弹出一个表格窗口，列出序号、期次、类型、照片数、参考期、状态。在窗口顶上的筛选框输入「梯田」等文字即可过滤，按住 Ctrl 或 Shift 多选，点「确定」后只跑选中的期。加 `-NoGui` 则不弹窗，改为在命令行里输入序号。
+- `-Include "*梯田*"`：只要名字匹配的期（通配符，多个用逗号隔开）。
+- `-Pick 1,3,5-9`：按扫描列表的序号选（先用 `-Plan` 看序号）。
+- 只给 `-RefTerrace`、不给 `-RefVeg`，就等于只跑梯田。适合一台电脑跑梯田、另一台跑植被。
+
+其他参数：
+
+- `-Plan`：只列出扫描结果和每一期会用哪个参考期，不实际运行，建议先跑一次看看。
 - `-Skip`：不处理的期次，比如参考期本身。
 - `-ExcludeTerrace` / `-ExcludeVeg`：给梯田 / 植被的每一期统一排除某些控制点（改作检查点，误差照报）。
 - 想重跑某一期，删掉输出目录里这一期的 `<名>_去定位_控制点` 再运行即可，已去定位的照片会直接复用。
