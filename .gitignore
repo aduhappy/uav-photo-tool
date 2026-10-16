@@ -1,0 +1,14 @@
+# 白名单：只把下面放行的文件发布到 GitHub。
+# 其余内容都留在本地、不进仓库：内部协作文档（AGENTS.md、STATUS.md、文档/、CLAUDE.md、GEMINI.md）、
+# 样例数据说明、发布/ 下的 exe（exe 通过 GitHub Releases 发布）。
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/src/
+!/scripts/
+
+/scripts/README.md
+/scripts/check_handoff.py
+__pycache__/
+*.pyc
