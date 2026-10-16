@@ -6,6 +6,7 @@
   2. 空三：调用用户电脑上的 Metashape Pro 对齐照片，导出不带坐标系的 Blocks Exchange XML。
   3. 控制点（D-16、D-17）：①迁移：新一期照片和已有控制点的参考期联合匹配，零刺点自动放点、细化、平差、判定；
      ②建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 是否对调，再细化、平差、判定。
+     迁移时细化把点挪得太远（D-20）就自动排除该点；也可以手动排除。导出的 XML 写 CC 的 Local:unit=meter（D-19）。
 
 规则：
   - 字节级原位等长改写，输出大小 = 原文件，SOS 之后的数据逐字节不变，不解码图像。
@@ -22,7 +23,9 @@
                                  [--recursive] [--no-auto-strip] [--out 输出位置]
                                  [--keypoints N] [--tiepoints N]
   python uav_photo_tool.py gcp-transfer <照片目录> --ref <参考期.psx> [--out 输出位置] [--accuracy 0.01]
+                                        [--exclude 1,2] [--max-shift 50]
   python uav_photo_tool.py gcp-init <空三.psx> --csv <控制点.csv> [--cc <CC导出.xml/.xmlz>] [--out 输出位置]
+                                    [--exclude 1,2]
   python uav_photo_tool.py check-update
 不带参数启动图形界面（菜单「帮助」里可以检查更新）。
 退出码：0 成功（控制点＝自动通过）/ 1 有失败 / 2 拒绝执行 / 3 已取消 / 4 控制点需人工核对 / 10 有新版本（check-update）。
@@ -48,7 +51,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -1092,6 +1095,13 @@ GCP_REJECT_FACTOR = 3.0
 GCP_REJECT_ROUNDS = 2        # 最多 2 轮
 GCP_EDGE_MARGIN = 20         # 蓝旗离图像边缘 ≥ 20 px
 GCP_SWAP_RATIO = 10.0        # 「原样」「X/Y 对调」两种 RMS 相差 > 10 倍才判定对调
+GCP_MAX_SHIFT_PX = 50.0      # D-20：细化挪动 > 50 px 的投影删掉；挪动中位数 > 50 px 的点自动排除（迁移模式，可改）
+GCP_MIN_POINTS = 3           # T4 🔒：参与平差的点少于 3 个判失败
+# D-19：「控制点」输出的 Blocks Exchange 写 CC 自己的局部米制坐标系，<Block> 和每个 <ControlPoint> 都挂 SRSId
+BX_LOCAL_SRS_ID = "1"
+BX_LOCAL_SRS_NAME = "Local coordinate system (meters)"
+BX_LOCAL_SRS_DEF = "Local:unit=meter"
+GCP_STATUS_LABEL = {"used": "参与平差", "auto": "自动排除（细化挪动过大）", "user": "用户排除"}
 # Blocks Exchange（CC 导出）的像素坐标 + 0.5 = Metashape 的像素坐标：Metashape 导出 Blocks Exchange 时
 # 主点写成 w/2 + cx - 0.5（本机 1.7.2 实测 cx=36.78908 → 2676.28908），两边约定差半个像素。
 CC_PIXEL_OFFSET = 0.5
@@ -1260,6 +1270,65 @@ def refine(chunk, markers, pred, stats):
         s["refine_max_px"] = max(shifts) if shifts else None
 
 
+def shift_guard(chunk, markers, pred, stats):
+    """D-20（只在迁移模式）：细化后挪动 > max_shift 的投影删掉；挪动中位数（删之前、细化留下的全部投影）> max_shift
+    的点返回去，由调用方自动排除。"""
+    lim = P["max_shift"]
+    by_key = dict((c.key, c) for c in chunk.cameras)
+    auto = []
+    for m in markers:
+        n = 0
+        for k, xy in pred.get(m.label, {}).items():
+            c = by_key[k]
+            pr = m.projections[c]
+            if pr is not None and math.hypot(pr.coord.x - xy[0], pr.coord.y - xy[1]) > lim:
+                m.projections[c] = None
+                n += 1
+        s = stats[m.label]
+        s["shift_removed"] = n
+        if s.get("refine_median_px") is not None and s["refine_median_px"] > lim:
+            auto.append(m.label)
+    return auto
+
+
+def set_aside(markers, excl, stats):
+    """被排除的点：参考关掉（导出成检查点），投影先拿下来不参与平差，平差完再 restore() 放回去算三维误差。"""
+    kept = {}
+    for m in markers:
+        st = excl.get(m.label)
+        stats[m.label]["status"] = st or "used"
+        if not st:
+            continue
+        m.reference.enabled = False
+        kept[m.label] = [(c, pr.coord) for c, pr in m.projections.items()]
+        for c, _ in kept[m.label]:
+            m.projections[c] = None
+    return kept
+
+
+def restore(markers, kept):
+    for m in markers:
+        for c, xy in kept.get(m.label, []):
+            m.projections[c] = Metashape.Marker.Projection(xy, True)
+
+
+def need_points(used, excl):
+    if len(used) < P["min_points"]:
+        raise UserError("参与平差的控制点只剩 %d 个（%s），少于 %d 个，判失败。被排除的：%s。"
+                        "请在 Metashape 里打开输出的 .psx 把认错的点拖准，或换一期做参考期"
+                        % (len(used), "、".join(m.label for m in used) or "无", P["min_points"],
+                           "、".join("%s 号（%s）" % (k, "细化挪动过大" if v == "auto" else "用户排除")
+                                    for k, v in excl.items())))
+
+
+def check_exclude(markers):
+    names = set(m.label for m in markers)
+    bad = [x for x in P["exclude"] if x not in names]
+    if bad:
+        raise UserError("要排除的控制点 %s 不存在；现有的点：%s" % ("、".join(bad), "、".join(m.label for m in markers)))
+    return dict((x, "user") for x in P["exclude"])
+
+
 def pin_all(markers):
     for m in markers:
         for c, pr in list(m.projections.items()):
@@ -1356,6 +1425,7 @@ def run_transfer():
     markers = [m for m in ch.markers if m.reference.location is not None]
     if len(markers) < 3:
         raise UserError("参考期工程里带坐标的控制点只有 %d 个，至少要 3 个" % len(markers))
+    excl = check_exclude(markers)
     if len(old_aligned) < 2:
         raise UserError("参考期工程里已对齐的照片只有 %d 张" % len(old_aligned))
     missing = [c.photo.path for c in old_aligned if not os.path.isfile(c.photo.path)]
@@ -1409,12 +1479,16 @@ def run_transfer():
     # 细化必须在去掉参考期相机之前做：refineMarkers 以参考期的绿旗为模板
     ev("stage", stage="refine")
     refine(ch, markers, pred, stats)
-    ev("refined", stats=stats)
+    for x in shift_guard(ch, markers, pred, stats):  # D-20
+        excl.setdefault(x, "auto")
+    for m in markers:
+        stats[m.label]["status"] = excl.get(m.label, "used")
+    ev("refined", stats=stats, excluded=excl, max_shift=P["max_shift"])
 
     ev("stage", stage="adjust")
     ch.remove(old)
-    used = set(c.sensor.key for c in ch.cameras)
-    orphan = [s for s in ch.sensors if s.key not in used]
+    keys = set(c.sensor.key for c in ch.cameras)
+    orphan = [s for s in ch.sensors if s.key not in keys]
     if orphan:
         try:
             ch.remove(orphan)
@@ -1423,11 +1497,22 @@ def run_transfer():
     pin_all(markers)
     set_accuracy(ch, markers)
     refs_off(ch.cameras)
+    used = [m for m in markers if m.label not in excl]
+    if len(used) < P["min_points"]:
+        for m in markers:
+            if m.label in excl:
+                m.reference.enabled = False
+        doc.save()  # 留下工程给用户在 Metashape 里改
+        need_points(used, excl)
+    kept = set_aside(markers, excl, stats)
     optimize(ch)
     ev("stage", stage="reject")
-    reject(ch, markers, stats)
+    reject(ch, used, stats)
+    restore(markers, kept)
     rows = marker_rows(ch, markers, stats)
-    ev("rows", rows=rows, rms3d=rms3d(rows), cameras=len(ch.cameras), tiepoints=n_tiepoints(ch))
+    # RMS3D 只算参与平差的点；被排除的点（检查点）逐点照报
+    ev("rows", rows=rows, rms3d=rms3d([r for r in rows if r.get("status", "used") == "used"]), cameras=len(ch.cameras),
+       tiepoints=n_tiepoints(ch))
     finish(doc)
 
 
@@ -1466,17 +1551,23 @@ def run_init():
 
     markers = [m for m in ch.markers if m.label in csv]
     labels = set(m.label for m in markers)
+    excl = check_exclude(markers)
     stats = {}
     for m in markers:
         pins = sum(1 for c, pr in m.projections.items() if pr.pinned and c.transform is not None)
-        stats[m.label] = {"pins": pins, "placed": 0, "rejected": 0}
-    ok = [m.label for m in markers if stats[m.label]["pins"] >= 2]
+        stats[m.label] = {"pins": pins, "placed": 0, "rejected": 0, "status": excl.get(m.label, "used")}
+    ok = [m.label for m in markers if stats[m.label]["pins"] >= 2 and m.label not in excl]
     ev("markers", used=[m.label for m in markers], ok=ok, csv_unused=[k for k in csv if k not in labels],
-       extra=[m.label for m in ch.markers if m.label not in csv])
+       extra=[m.label for m in ch.markers if m.label not in csv], excluded=excl)
     if len(ok) < 3:
-        raise UserError("能用的控制点只有 %d 个（%s）：至少要 3 个点、每个点在已对齐照片上刺 >= 2 张。"
-                        "没有 CC 刺点时，请先在 Metashape 里刺好、保存，再用本工具" % (len(ok), "、".join(ok) or "无"))
+        raise UserError("能用的控制点只有 %d 个（%s）：至少要 3 个点、每个点在已对齐照片上刺 >= 2 张%s。"
+                        "没有 CC 刺点时，请先在 Metashape 里刺好、保存，再用本工具" % (
+                            len(ok), "、".join(ok) or "无", "（不算用户排除的 %s）" % "、".join(excl) if excl else ""))
     set_accuracy(ch, markers)
+    for m in markers:
+        if m.label in excl:
+            m.reference.enabled = False  # 用户排除的点也不参与 X/Y 判断
+    used = [m for m in markers if m.label not in excl]
 
     # X/Y 判断：原样、对调各做一次 updateTransform，取 RMS 小的
     ev("stage", stage="swap")
@@ -1486,7 +1577,7 @@ def run_init():
             x, y, z = csv[m.label]
             m.reference.location = Metashape.Vector([y, x, z] if key == "swap" else [x, y, z])
         ch.updateTransform()
-        rows = marker_rows(ch, markers)
+        rows = marker_rows(ch, used)
         var[key] = {"rms3d": rms3d(rows), "rows": rows}
     a, b = var["asis"]["rms3d"], var["swap"]["rms3d"]
     use_swap = b < a
@@ -1496,7 +1587,7 @@ def run_init():
         m.reference.location = Metashape.Vector([y, x, z] if use_swap else [x, y, z])
     ch.updateTransform()
     dx, dy = [], []
-    for m in markers:
+    for m in used:
         if m.position is None:
             continue
         for c, pr in m.projections.items():
@@ -1513,14 +1604,18 @@ def run_init():
     ev("placed", counts=dict((k, len(v)) for k, v in pred.items()))
     ev("stage", stage="refine")
     refine(ch, markers, pred, stats)
-    ev("refined", stats=stats)
+    ev("refined", stats=stats, excluded=excl, max_shift=None)
     ev("stage", stage="adjust")
     pin_all(markers)
+    kept = set_aside(markers, excl, stats)
     optimize(ch)
     ev("stage", stage="reject")
-    reject(ch, markers, stats)
+    reject(ch, used, stats)
+    restore(markers, kept)
     rows = marker_rows(ch, markers, stats)
-    ev("rows", rows=rows, rms3d=rms3d(rows), cameras=len(ch.cameras), tiepoints=n_tiepoints(ch))
+    # RMS3D 只算参与平差的点；被排除的点（检查点）逐点照报
+    ev("rows", rows=rows, rms3d=rms3d([r for r in rows if r.get("status", "used") == "used"]), cameras=len(ch.cameras),
+       tiepoints=n_tiepoints(ch))
     finish(doc)
 
 
@@ -1551,7 +1646,7 @@ finally:
 '''
 
 _GCP_SPAN = {
-    "transfer": {"open": (0, 2, "打开参考期"), "add": (2, 3, "导入照片"), "match": (3, 65, "联合匹配"),
+    "transfer": {"open": (0, 2, "打开参考期"), "add": (2, 3, "导入照片"), "match": (3, 65, "联合匹配（约需 3～5 分钟）"),
                  "align": (65, 85, "对齐新照片"), "place": (85, 86, "放蓝旗"), "refine": (86, 93, "细化标记点"),
                  "adjust": (93, 96, "平差"), "reject": (96, 97, "自动剔除"), "save": (97, 98, "保存工程"),
                  "export": (98, 99, "导出 XML"), "fix": (99, 100, "修正 XML")},
@@ -1768,6 +1863,28 @@ def judge_gcp(rows, accuracy):
     return bool(rows) and not bad, bad
 
 
+def judge_gcp_run(rows, accuracy, max_shift=None):
+    """T4 🔒：只拿「参与平差」的点按 D-17 判；被排除的点改作检查点（加 why 说明原因，不算通过障碍）。
+    参与平差的点 < GCP_MIN_POINTS → 失败；有点被 D-20 自动排除 → 至少「需人工核对」。
+    返回 (结论, [(点名, [原因…]), …], 参与平差点数)。"""
+    used = [r for r in rows if r.get("status", "used") == "used"]
+    passed, bad = judge_gcp(used, accuracy)
+    for r in rows:
+        st = r.get("status", "used")
+        if st == "auto":
+            r["ok"] = None
+            r["why"] = ["细化挪动过大，已自动排除（迁移偏差中位数 %s px > %g px），改作检查点" % (
+                _fmt(r.get("refine_median_px"), 1, "%.1f"), max_shift if max_shift is not None else GCP_MAX_SHIFT_PX)]
+            bad.append((r["name"], r["why"]))
+        elif st == "user":
+            r["ok"] = None
+            r["why"] = ["用户排除，改作检查点"]
+    if len(used) < GCP_MIN_POINTS:
+        return "失败", bad, len(used)
+    auto = any(r.get("status") == "auto" for r in rows)
+    return ("自动通过" if passed and not auto else "需人工核对"), bad, len(used)
+
+
 def count_bx_control_points(xml_path):
     """数 Blocks Exchange 里的 <ControlPoint> 和其下 <Measurement>。"""
     n_cp = n_meas = 0
@@ -1785,6 +1902,149 @@ def count_bx_control_points(xml_path):
         elif el.tag in ("Photo", "TiePoint"):
             el.clear()
     return n_cp, n_meas
+
+
+def add_local_meter_srs(src, dst):
+    """D-19：在已按 D-10 去掉坐标系的 XML（fix_blocks_exchange 的输出）上，流式加回 CC 认的局部米制坐标系：
+    <Block> 前插 <SpatialReferenceSystems>（唯一一个 <SRS>，Id 1），<Block> 的 <Name> 之后插 <SRSId>1</SRSId>，
+    每个 <ControlPoint> 的第一个子元素之前插 <SRSId>1</SRSId>；缩进照抄相邻元素，其余逐字保留。
+    「空三」页签不调用它（那里仍不写坐标系）。返回 {"Block": 插了几处, "ControlPoint": 插了几处}。"""
+    stats = {"Block": 0, "ControlPoint": 0}
+    stack = []
+    ws = ""                   # 上一个空白文本（下一个标签的缩进）
+    need = None               # 等着插 SRSId 的元素：("Block" | "ControlPoint", 栈深度)
+    srsid = "<SRSId>%s</SRSId>" % BX_LOCAL_SRS_ID
+
+    def tag_name(tok):
+        m = re.match(r"</?\s*([^\s/>]+)", tok)
+        return m.group(1) if m else ""
+
+    def indent(w):
+        return w[w.rfind("\n") + 1:] if "\n" in w else w
+
+    with open(src, "r", encoding="utf-8") as fi, open(dst, "w", encoding="utf-8", newline="") as fo:
+        buf = ""
+        while True:
+            chunk = fi.read(4 * 1024 * 1024)
+            buf += chunk
+            if chunk:
+                cut = buf.rfind(">") + 1
+                if cut <= 0:
+                    continue
+                work, buf = buf[:cut], buf[cut:]
+            else:
+                work, buf = buf, ""
+            for m in _TOKEN_RE.finditer(work):
+                tok = m.group(0)
+                if not tok.startswith("<"):
+                    fo.write(tok)
+                    ws = tok if not tok.strip() else ""
+                    continue
+                if tok.startswith("<?") or tok.startswith("<!"):
+                    fo.write(tok)
+                    ws = ""
+                    continue
+                name = tag_name(tok)
+                closing = tok.startswith("</")
+                selfclose = tok.endswith("/>")
+                nl = "\n" + indent(ws) if "\n" in ws else ws
+                if not closing:
+                    parent = stack[-1] if stack else ""
+                    if name == "SRSId" or name == "SpatialReferenceSystems":
+                        raise ValueError("XML 里已经有 <%s>，要先按 D-10 去掉坐标系" % name)
+                    if need is not None and len(stack) == need[1] and not (need[0] == "Block" and name == "Name"):
+                        # 刚好在待插元素的下一个子元素（Block 跳过 <Name>）之前：插 SRSId，缩进同这个子元素
+                        fo.write(srsid + nl)
+                        stats[need[0]] += 1
+                        need = None
+                    if name == "Block" and parent == "BlocksExchange":
+                        fo.write("<SpatialReferenceSystems>" + nl + "  <SRS>" + nl + "    <Id>%s</Id>" % BX_LOCAL_SRS_ID
+                                 + nl + "    <Name>%s</Name>" % BX_LOCAL_SRS_NAME
+                                 + nl + "    <Definition>%s</Definition>" % BX_LOCAL_SRS_DEF
+                                 + nl + "  </SRS>" + nl + "</SpatialReferenceSystems>" + nl)
+                    fo.write(tok)
+                    stack.append(name)
+                    if name in ("Block", "ControlPoint") and not selfclose:
+                        need = (name, len(stack))
+                    if selfclose:
+                        stack.pop()
+                else:
+                    if need is not None and len(stack) == need[1]:
+                        raise ValueError("<%s> 里没有可以挂 <SRSId> 的位置" % need[0])
+                    fo.write(tok)
+                    if stack:
+                        stack.pop()
+                ws = ""
+            if not chunk:
+                break
+    return stats
+
+
+def check_bx_local_srs(xml_path):
+    """D-19 检查：有且只有一个 <SpatialReferenceSystems>/<SRS>（Id 1、Name、Definition 与 CC 写法一致），
+    <Block> 下 1 处、每个 <ControlPoint> 下 1 处 <SRSId>1</SRSId>，别处没有 SRSId，<Pose> 下没有 <Metadata>。
+    返回 (问题列表, {"control_points": n})。"""
+    problems = []
+    srs = []
+    n_cp = 0
+    block_ids, cp_ids, other_ids, pose_meta = [], [], 0, 0
+    stack = []
+    for event, el in ET.iterparse(str(xml_path), events=("start", "end")):
+        if event == "start":
+            if el.tag == "Metadata" and stack and stack[-1] == "Pose":
+                pose_meta += 1
+            stack.append(el.tag)
+            continue
+        stack.pop()
+        parent = stack[-1] if stack else ""
+        if el.tag == "SRSId":
+            if parent == "Block":
+                block_ids.append((el.text or "").strip())
+            elif parent == "ControlPoint":
+                cp_ids.append((el.text or "").strip())
+            else:
+                other_ids += 1
+        elif el.tag == "SRS":
+            srs.append((parent, el.findtext("Id"), el.findtext("Name"), el.findtext("Definition"), len(list(el))))
+        elif el.tag == "ControlPoint":
+            n_cp += 1
+            if sum(1 for c in el if c.tag == "SRSId") != 1:
+                problems.append("控制点 %s 下的 <SRSId> 不是 1 处" % el.findtext("Name"))
+            el.clear()
+        elif el.tag in ("Photo", "TiePoint"):
+            el.clear()
+    want = ("SpatialReferenceSystems", BX_LOCAL_SRS_ID, BX_LOCAL_SRS_NAME, BX_LOCAL_SRS_DEF, 3)
+    if srs != [want]:
+        problems.append("<SRS> 应该只有一个且是 %s，实际 %s" % (want[1:4], [s[1:4] for s in srs]))
+    if block_ids != [BX_LOCAL_SRS_ID]:
+        problems.append("<Block> 下的 <SRSId> 应该是 1 处「%s」，实际 %s" % (BX_LOCAL_SRS_ID, block_ids))
+    if len(cp_ids) != n_cp or any(v != BX_LOCAL_SRS_ID for v in cp_ids):
+        problems.append("控制点 %d 个，挂 <SRSId>%s</SRSId> 的 %d 处" % (
+            n_cp, BX_LOCAL_SRS_ID, sum(1 for v in cp_ids if v == BX_LOCAL_SRS_ID)))
+    if other_ids:
+        problems.append("Block / ControlPoint 以外还有 %d 处 <SRSId>" % other_ids)
+    if pose_meta:
+        problems.append("<Pose> 下还有 %d 个 <Metadata>" % pose_meta)
+    return problems, {"control_points": n_cp, "block_srsid": len(block_ids), "cp_srsid": len(cp_ids)}
+
+
+def parse_exclude(text):
+    """「排除的控制点」：逗号/顿号/分号/空格分隔的点名，如 "1,2"。返回去重后的点名列表（保持顺序）。"""
+    out = []
+    for x in re.split(r"[\s,，、;；]+", (text or "").strip()):
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _check_max_shift(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("细化挪动上限要填数字（像素），例如 50")
+    if not f > 0:
+        raise ValueError("细化挪动上限要大于 0（像素，默认 %g）" % GCP_MAX_SHIFT_PX)
+    return f
 
 
 def _check_gcp_accuracy(accuracy):
@@ -1814,7 +2074,8 @@ def _gcp_result(mode, out_dir, metashape, accuracy, **kw):
            "secs": None, "note": "", "warnings": [], "photos_dir": "", "ref": "", "psx_in": "", "csv": "", "cc": "",
            "total": None, "aligned": None, "unaligned": [], "tiepoints": None, "ref_moved_max": None, "ref_lost": [],
            "placed": {}, "swap": None, "cc_info": None, "cc_loaded": None, "markers_info": None, "rows": [],
-           "rms3d": None, "rejects": [], "bad": [], "xml": "", "xml_info": None, "xml_cp": None, "fix_stats": None}
+           "rms3d": None, "rejects": [], "bad": [], "xml": "", "xml_info": None, "xml_cp": None, "fix_stats": None,
+           "exclude": [], "max_shift": None, "excluded": {}, "refine_stats": {}, "srs_stats": None, "n_used": None}
     res.update(kw)
     return res
 
@@ -1827,9 +2088,11 @@ def _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts
     psx = out_dir / (name + ".psx")
     xml_final = out_dir / (name + "_BlocksExchange.xml")
     xml_raw = out_dir / (name + "_BlocksExchange.未修正.xml.tmp")
+    xml_d10 = out_dir / (name + "_BlocksExchange.无坐标系.xml.tmp")
     params = dict(params, mode=mode, psx=str(psx), xml_raw=str(xml_raw), accuracy=res["accuracy"],
                   edge_margin=GCP_EDGE_MARGIN, reject_min_px=GCP_REJECT_MIN_PX, reject_factor=GCP_REJECT_FACTOR,
-                  reject_rounds=GCP_REJECT_ROUNDS, swap_ratio=GCP_SWAP_RATIO)
+                  reject_rounds=GCP_REJECT_ROUNDS, swap_ratio=GCP_SWAP_RATIO, exclude=list(res["exclude"]),
+                  max_shift=res["max_shift"], min_points=GCP_MIN_POINTS)
     span = _GCP_SPAN[mode]
     t_start = time.time()
     tmp = Path(tempfile.mkdtemp(prefix="uav_gcp_"))
@@ -1882,6 +2145,17 @@ def _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts
             res["swap"] = e
             log("X/Y 判断：原样 RMS3D %.4f m，对调 RMS3D %.4f m，相差 %.1f 倍 → %s" % (
                 e["asis"]["rms3d"], e["swap"]["rms3d"], e["ratio"], _swap_verdict(e)))
+        elif kind == "refined":
+            res["refine_stats"], res["excluded"] = e["stats"], e.get("excluded") or {}
+            for n, st in res["excluded"].items():
+                if st == "auto":
+                    log("D-20：%s 号细化挪动中位数 %.1f px > %g px，已自动排除（改作检查点）" % (
+                        n, e["stats"][n]["refine_median_px"], e["max_shift"]))
+                else:
+                    log("%s 号由用户排除（改作检查点）" % n)
+            moved = ["%s 号 %d 处" % (n, v["shift_removed"]) for n, v in e["stats"].items() if v.get("shift_removed")]
+            if moved:
+                log("细化挪动 > %g px 删掉的投影：%s" % (e["max_shift"], "，".join(moved)))
         elif kind == "placed":
             res["placed"] = e["counts"]
             log("放蓝旗：%s" % "，".join("%s 号 %d 张" % kv for kv in e["counts"].items()))
@@ -1918,23 +2192,33 @@ def _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts
         if not xml_raw.is_file():
             raise RuntimeError("Metashape 没有导出 Blocks Exchange XML")
         progress(0.99, "修正 XML")
-        log("按 D-10 去掉 XML 里的坐标系定义（坐标值保留）…")
-        res["fix_stats"] = fix_blocks_exchange(xml_raw, xml_final)
+        log("按 D-19 修正 XML：去掉 Metashape 写的坐标系，改写 CC 的 %s（区块和每个控制点都挂上）…" % BX_LOCAL_SRS_DEF)
+        res["fix_stats"] = fix_blocks_exchange(xml_raw, xml_d10)
         xml_raw.unlink()
-        res["xml"] = str(xml_final)
-        problems, info = check_blocks_exchange(xml_final, res["aligned"])
+        problems, info = check_blocks_exchange(xml_d10, res["aligned"])
         res["xml_info"] = info
         if problems:
             raise RuntimeError("XML 没通过检查：" + "；".join(problems))
+        res["srs_stats"] = add_local_meter_srs(xml_d10, xml_final)
+        xml_d10.unlink()
+        res["xml"] = str(xml_final)
+        problems, _ = check_bx_local_srs(xml_final)
+        if problems:
+            raise RuntimeError("XML 坐标系没通过检查（D-19）：" + "；".join(problems))
         res["xml_cp"] = count_bx_control_points(xml_final)
-        log("XML 检查通过：%d 张照片、%d 个连接点、%d 个控制点（%d 处刺点），没有坐标系定义"
-            % (info["photos"], info["tiepoints"], res["xml_cp"][0], res["xml_cp"][1]))
-        passed, res["bad"] = judge_gcp(res["rows"], res["accuracy"])
-        res["status"] = "自动通过" if passed else "需人工核对"
+        log("XML 检查通过：%d 张照片、%d 个连接点、%d 个控制点（%d 处刺点）；坐标系 %s，区块 + %d 个控制点挂 SRSId"
+            % (info["photos"], info["tiepoints"], res["xml_cp"][0], res["xml_cp"][1], BX_LOCAL_SRS_DEF,
+               res["srs_stats"]["ControlPoint"]))
+        res["status"], res["bad"], res["n_used"] = judge_gcp_run(res["rows"], res["accuracy"], res["max_shift"])
+        if res["status"] == "失败":
+            res["reason"] = "参与平差的控制点只有 %d 个，少于 %d 个" % (res["n_used"], GCP_MIN_POINTS)
         for r in res["rows"]:
+            st = r.get("status", "used")
             log("  %s 号：%d 张，三维误差 %s，像素 RMS %s%s" % (
                 r["name"], r["n"], "%.1f mm" % (r["d3"] * 1000) if r["d3"] is not None else "-",
-                "%.2f" % r["px_rms"] if r["px_rms"] is not None else "-", "" if r["ok"] else "  ← " + "；".join(r["why"])))
+                "%.2f" % r["px_rms"] if r["px_rms"] is not None else "-",
+                "  ← " + "；".join(r["why"]) if st == "used" and not r["ok"] else
+                "" if st == "used" else "  （%s，检查点，仅供参考）" % GCP_STATUS_LABEL[st]))
         log("RMS3D %s；判定：%s" % ("%.1f mm" % (res["rms3d"] * 1000) if res["rms3d"] is not None else "-", res["status"]))
         progress(1.0, res["status"])
     except (AlignCancelled, KeyboardInterrupt):
@@ -1949,11 +2233,12 @@ def _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts
         log("失败：%s" % ex)
     finally:
         res["secs"] = time.time() - t_start
-        if xml_raw.exists() and res["status"] not in ("自动通过", "需人工核对"):
-            try:
-                xml_raw.unlink()
-            except OSError:
-                pass
+        for f in (xml_raw, xml_d10):
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
         _write_metashape_log(out_dir / "metashape_日志.txt", res, events, tmp / "console.txt")
         _write_gcp_report(out_dir / "控制点报告.txt", res)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1974,6 +2259,14 @@ def _fmt(v, scale=1.0, f="%.1f"):
 def _write_gcp_report(path, res):
     mode = res["mode"]
     lines = ["控制点报告（%s v%s）" % (APP_NAME, APP_VERSION), "", "判定：%s" % res["status"]]
+    ex = res["excluded"] or {}
+    auto = [n for n, v in ex.items() if v == "auto"]
+    user = [n for n, v in ex.items() if v == "user"]
+    if auto:
+        lines.append("%s 号已自动排除（细化挪动过大，D-20），没参与平差，改作检查点；有点被自动排除就不算自动通过"
+                     % "、".join(auto))
+    if user:
+        lines.append("%s 号是用户排除的（--exclude），没参与平差，改作检查点" % "、".join(user))
     if res["status"] == "需人工核对":
         lines.append("需人工核对的点（在 Metashape 里打开 .psx 看这些点的投影）：")
         lines += ["  %s 号：%s" % (n, "；".join(why)) for n, why in res["bad"]]
@@ -1981,6 +2274,8 @@ def _write_gcp_report(path, res):
         lines.append("原因：%s" % res["reason"])
     if res["status"] == "自动通过" and res["unaligned"]:
         lines.append("注意：有 %d 张照片没对齐，没有参与（清单见下）" % len(res["unaligned"]))
+    if res["status"] == "需人工核对" or (res["status"] == "失败" and auto):
+        lines += ["", "怎么处理："] + ["  " + x for x in _GCP_FIX_STEPS]
     lines += ["", "模式：%s" % GCP_MODE_LABEL[mode]]
     if mode == "transfer":
         lines += ["照片目录：%s" % res["photos_dir"], "参考期工程：%s（只读，没改）" % res["ref"]]
@@ -1994,7 +2289,12 @@ def _write_gcp_report(path, res):
               % (GCP_PASS_FACTOR * res["accuracy"] * 1000, GCP_PASS_FACTOR, res["accuracy"], GCP_MAX_PX_RMS, GCP_MIN_PHOTOS),
               "自动剔除：像素残差 > max(%g px, %g×该点中位数) 的投影删掉后重新平差，最多 %d 轮；蓝旗离图像边缘 ≥ %d px"
               % (GCP_REJECT_MIN_PX, GCP_REJECT_FACTOR, GCP_REJECT_ROUNDS, GCP_EDGE_MARGIN),
-              "平差：updateTransform + optimizeCameras（f, cx, cy, k1～k3, p1, p2）；坐标系 Local（米）"]
+              "平差：updateTransform + optimizeCameras（f, cx, cy, k1～k3, p1, p2）；坐标系 Local（米）；"
+              "参与平差的点少于 %d 个判失败" % GCP_MIN_POINTS]
+    if mode == "transfer":
+        lines.append("细化挪动保护（D-20）：细化挪动 > %g px 的投影删掉；某点挪动中位数 > %g px 就自动排除该点（本次用 %g px）"
+                     % (res["max_shift"], res["max_shift"], res["max_shift"]))
+    lines.append("排除的控制点（用户指定）：%s" % ("、".join(res["exclude"]) if res["exclude"] else "无"))
     if mode == "transfer":
         lines.append("匹配：精度高（downscale=1）、通用预选 开、参考预选 关、关键点 %d、连接点 %d、reset_matches=True"
                      % (DEFAULT_KEYPOINTS, DEFAULT_TIEPOINTS))
@@ -2033,20 +2333,39 @@ def _write_gcp_report(path, res):
     for rj in res["rejects"]:
         lines.append("自动剔除第 %d 轮：删掉 %d 处" % (rj["round"], rj["removed"]))
     if res["rows"]:
-        lines += ["", "RMS3D：%s mm（%d 个点）" % (_fmt(res["rms3d"], 1000), len(res["rows"])), "逐点："]
-        lines.append("  点名  照片数  放蓝旗  细化挪动中位数px  细化删掉  自动剔除  dx/dy/dz(mm)  三维误差mm  像素RMS  像素最大  结论")
+        n_used = sum(1 for r in res["rows"] if r.get("status", "used") == "used")
+        lines += ["", "RMS3D：%s mm（%d 个参与平差的点%s）" % (
+            _fmt(res["rms3d"], 1000), n_used, "；检查点不算在内" if n_used < len(res["rows"]) else ""), "逐点："]
+        lines.append("  点名  状态  照片数  放蓝旗  迁移偏差（细化挪动）中位数px  细化删掉  挪动过大删掉  自动剔除"
+                     "  dx/dy/dz(mm)  三维误差mm  像素RMS  像素最大  结论")
         for r in res["rows"]:
             d = r["d"] or [None] * 3
-            lines.append("  %-4s  %5d  %6s  %14s  %8s  %8s  %s  %10s  %7s  %8s  %s" % (
-                r["name"], r["n"], r.get("placed", "-"), _fmt(r.get("refine_median_px"), 1, "%.2f"),
-                r.get("refine_removed", "-"), r.get("rejected", "-"),
+            st = r.get("status", "used")
+            lines.append("  %-4s  %s  %5d  %6s  %26s  %8s  %12s  %8s  %s  %10s  %7s  %8s  %s" % (
+                r["name"], GCP_STATUS_LABEL[st], r["n"], r.get("placed", "-"), _fmt(r.get("refine_median_px"), 1, "%.2f"),
+                r.get("refine_removed", "-"), r.get("shift_removed", "-"), r.get("rejected", "-"),
                 "/".join(_fmt(v, 1000) for v in d), _fmt(r["d3"], 1000), _fmt(r["px_rms"], 1, "%.2f"),
-                _fmt(r["px_max"], 1, "%.2f"), "通过" if r.get("ok") else "不通过：" + "；".join(r.get("why") or ["-"])))
+                _fmt(r["px_max"], 1, "%.2f"),
+                ("通过" if r.get("ok") else "不通过：" + "；".join(r.get("why") or ["-"])) if st == "used"
+                else "检查点，误差仅供参考"))
+        lines.append(_GCP_SHIFT_NOTE)
+    elif res["refine_stats"]:
+        lines += ["", "没有平差结果；细化阶段的逐点统计：",
+                  "  点名  状态  放蓝旗  迁移偏差（细化挪动）中位数px  细化删掉  挪动过大删掉"]
+        for n, v in res["refine_stats"].items():
+            lines.append("  %-4s  %s  %6s  %26s  %8s  %12s" % (
+                n, GCP_STATUS_LABEL[v.get("status", "used")], v.get("placed", "-"),
+                _fmt(v.get("refine_median_px"), 1, "%.2f"), v.get("refine_removed", "-"), v.get("shift_removed", "-")))
+        lines.append(_GCP_SHIFT_NOTE)
     if res["xml"]:
-        fs, xi = res["fix_stats"], res["xml_info"]
+        fs, xi, ss = res["fix_stats"], res["xml_info"], res["srs_stats"] or {}
         lines += ["", "Blocks Exchange：%s" % res["xml"],
-                  "  按 D-10 去掉坐标系定义：删 <SpatialReferenceSystems> %d 个、<SRSId> %d 个、<Pose> 下的 <Metadata> %d 个；坐标值保留"
-                  % (fs["SpatialReferenceSystems"], fs["SRSId"], fs["Pose/Metadata"])]
+                  "  坐标系（D-19）：去掉 Metashape 原样写的坐标系（<SpatialReferenceSystems> %d 个、<SRSId> %d 个、"
+                  "<Pose> 下的 <Metadata> %d 个），改写 CC 的「%s」（%s）；<Block> 挂 SRSId %d 处、控制点挂 %d 处；坐标值保留"
+                  % (fs["SpatialReferenceSystems"], fs["SRSId"], fs["Pose/Metadata"], BX_LOCAL_SRS_NAME, BX_LOCAL_SRS_DEF,
+                     ss.get("Block", 0), ss.get("ControlPoint", 0))]
+        if ex:
+            lines.append("  被排除的点在 XML 里是检查点（<CheckPoint>true</CheckPoint>），CC 平差时不会用它们")
         if xi:
             lines.append("  照片 %d 张、连接点 %d 个；控制点 %d 个、刺点 %d 处；ImagePath 缺失 %d 个" % (
                 xi["photos"], xi["tiepoints"], res["xml_cp"][0], res["xml_cp"][1], len(xi["missing_images"])))
@@ -2058,6 +2377,21 @@ def _write_gcp_report(path, res):
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_GCP_SHIFT_NOTE = ("  迁移偏差（细化挪动）：自动放的位置和按图像细化后的位置差多少像素，越小说明迁移越准；"
+                   "几十上百像素多半是认错了角点。")
+_GCP_FIX_STEPS = (
+    "1. 用 Metashape 打开本目录的 .psx；左边「工作区」展开「标记」（Markers），右键上面列出的点 →「按标记过滤照片」"
+    "（Filter Photos by Markers），下方只剩看得到这个点的照片。",
+    "2. 逐张双击打开，看旗子是不是落在这个控制点标靶的中心：偏了就按住旗子拖到中心（拖过的变成绿旗）。",
+    "3. 落在别的角点上、或者看不清的，右键这面旗 →「删除标记」（Remove Marker）只删这一张上的投影；"
+    "对着「参考」面板看该点误差，改完点「优化相机」（Optimize Cameras）再看一次，满意就保存。",
+    "4. 只想先用其余的点：重跑本工具并排除这些点，命令行加 --exclude 1,2（界面在「排除的控制点」里填 1,2），"
+    "它们会当检查点，其余点照常自动判定。",
+    "5. 自己在 Metashape 里改完再导出的 Blocks Exchange 没有 D-19 的米制坐标系，导入 CC 会显示「单位」（数值仍是米）；"
+    "要米制就用第 4 步重跑本工具得到的 XML。",
+)
+
+
 def _gcp_out_dir(base, name):
     out = Path(base) / (name + GCP_SUFFIX)
     if not _dir_empty_or_missing(out):
@@ -2066,14 +2400,17 @@ def _gcp_out_dir(base, name):
 
 
 def run_gcp_transfer(photo_dir, ref_psx, metashape, out_base=None, accuracy=DEFAULT_GCP_ACCURACY, auto_strip=True,
-                     progress=None, log=None, stop_event=None, **timeouts):
-    """模式一「迁移」：照片目录 + 参考期 .psx → <照片目录名>_控制点\\。不满足条件抛 ValueError（不动任何文件）。"""
+                     progress=None, log=None, stop_event=None, exclude=None, max_shift=GCP_MAX_SHIFT_PX, **timeouts):
+    """模式一「迁移」：照片目录 + 参考期 .psx → <照片目录名>_控制点\\。不满足条件抛 ValueError（不动任何文件）。
+    exclude：手动排除的点名（列表或 "1,2"），改作检查点；max_shift：D-20 细化挪动上限（px）。"""
     log = log or (lambda s: None)
     progress = progress or (lambda f, s: None)
     err = check_metashape(metashape)
     if err:
         raise ValueError(err)
     acc = _check_gcp_accuracy(accuracy)
+    max_shift = _check_max_shift(max_shift)
+    exclude = parse_exclude(exclude) if isinstance(exclude, str) else list(exclude or [])
     ref = _check_psx(ref_psx, "参考期工程")
     if not photo_dir or not Path(photo_dir).is_dir():
         raise ValueError("照片目录不存在：%s" % photo_dir)
@@ -2123,14 +2460,17 @@ def run_gcp_transfer(photo_dir, ref_psx, metashape, out_base=None, accuracy=DEFA
         work = src
         out_dir = _gcp_out_dir(out_base or src.parent, src.name)
 
-    res = _gcp_result("transfer", out_dir, metashape, acc, note=note, photos_dir=str(work), ref=str(ref))
+    res = _gcp_result("transfer", out_dir, metashape, acc, note=note, photos_dir=str(work), ref=str(ref),
+                      exclude=exclude, max_shift=max_shift)
+    if exclude:
+        log("用户排除的控制点：%s" % "、".join(exclude))
     params = {"ref": str(ref), "photos": [str(p) for p in photos], "downscale": ACCURACY_DOWNSCALE["high"],
               "keypoint_limit": DEFAULT_KEYPOINTS, "tiepoint_limit": DEFAULT_TIEPOINTS}
     return _gcp_run(res, params, work.name, metashape, log, progress, stop_event, **timeouts)
 
 
 def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy=DEFAULT_GCP_ACCURACY,
-                 progress=None, log=None, stop_event=None, **timeouts):
+                 progress=None, log=None, stop_event=None, exclude=None, **timeouts):
     """模式二「建参考期」：空三 .psx + 控制点 CSV（+ CC 刺点）→ <名>_控制点\\（可作参考期）。
     不满足条件抛 ValueError（不动任何文件）。"""
     log = log or (lambda s: None)
@@ -2142,6 +2482,12 @@ def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy
     src = _check_psx(psx, "空三工程")
     pts = read_gcp_csv(csv_path)
     log("控制点 CSV：%s（%d 个点）" % (csv_path, len(pts)))
+    exclude = parse_exclude(exclude) if isinstance(exclude, str) else list(exclude or [])
+    bad = [x for x in exclude if x not in pts]
+    if bad:
+        raise ValueError("要排除的控制点 %s 在 CSV 里没有；CSV 里的点：%s" % ("、".join(bad), "、".join(pts)))
+    if exclude:
+        log("用户排除的控制点：%s" % "、".join(exclude))
     cc, cc_info, unknown = None, None, []
     if cc_path:
         marks, cc_info = read_cc_marks(cc_path)
@@ -2155,7 +2501,7 @@ def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy
     name = src.stem
     out_dir = _gcp_out_dir(Path(os.path.abspath(out_base)) if out_base else src.parent.parent, name)
     res = _gcp_result("init", out_dir, metashape, acc, psx_in=str(src), csv=str(csv_path),
-                      cc=str(cc_path) if cc_path else "", cc_info=cc_info)
+                      cc=str(cc_path) if cc_path else "", cc_info=cc_info, exclude=exclude)
     if unknown:
         res["warnings"].append("CC 里这些点名 CSV 里没有，没用：%s" % "、".join(unknown))
     params = {"psx_in": str(src), "csv": dict((k, list(v)) for k, v in pts.items()),
@@ -2544,6 +2890,8 @@ def run_gui():
     v3_out = tk.StringVar()
     v3_acc = tk.StringVar(value=str(DEFAULT_GCP_ACCURACY))
     v3_auto = tk.BooleanVar(value=True)
+    v3_excl = tk.StringVar()
+    v3_shift = tk.StringVar(value="%g" % GCP_MAX_SHIFT_PX)
     st3 = {"stop": None}
     q3 = queue.Queue()
 
@@ -2592,11 +2940,21 @@ def run_gui():
     cb_auto3 = ttk.Checkbutton(o3, text="照片带定位时先自动去定位", variable=v3_auto)
     cb_auto3.pack(side="left", padx=(16, 0))
     mode_widgets.append(("transfer", (cb_auto3,)))
+    o3b = ttk.Frame(tab3)
+    o3b.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 2))
+    ttk.Label(o3b, text="排除的控制点（可空，如 1,2）：").pack(side="left")
+    ttk.Entry(o3b, textvariable=v3_excl, width=12).pack(side="left")
+    lbl3_shift = ttk.Label(o3b, text="细化挪动上限（px）：")
+    lbl3_shift.pack(side="left", padx=(16, 0))
+    sp3_shift = ttk.Spinbox(o3b, textvariable=v3_shift, from_=5, to=500, increment=5, width=6)
+    sp3_shift.pack(side="left")
+    mode_widgets.append(("transfer", (lbl3_shift, sp3_shift)))
     lbl3_help = ttk.Label(tab3, foreground="#555", wraplength=int(700 * k))
-    lbl3_help.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 4))
+    lbl3_help.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2, 4))
     helps = {
         "transfer": "迁移：新一期照片和参考期一起匹配，自动放控制点、细化、平差、按 D-17 判定。参考期的照片要留在原位置。"
-                    "输出「<照片目录名>_控制点」：.psx、Blocks Exchange XML（局部坐标）、控制点报告.txt。一次约 5 分钟。",
+                    "某点细化挪动中位数超过上限（默认 50 px，多半认错角点）会自动排除、改作检查点，结论为「需人工核对」。"
+                    "输出「<照片目录名>_控制点」：.psx、Blocks Exchange XML（局部坐标，米）、控制点报告.txt。一次约 5 分钟。",
         "init": "建参考期：用「空三」页签的 .psx + 控制点 CSV；有 CC 刺点就选上（没有就先在 Metashape 里给 ≥3 个点各刺 ≥2 张并保存）。"
                 "会自动判断 CSV 的 X/Y 是否对调。输出的 .psx 以后当参考期用。",
     }
@@ -2612,19 +2970,19 @@ def run_gui():
     on_mode()
 
     bar3 = ttk.Frame(tab3)
-    bar3.grid(row=10, column=0, columnspan=3, sticky="ew")
+    bar3.grid(row=11, column=0, columnspan=3, sticky="ew")
     bar3.columnconfigure(0, weight=1)
     pb3 = ttk.Progressbar(bar3, mode="determinate", maximum=1000)
     pb3.grid(row=0, column=0, sticky="ew")
-    lbl3 = ttk.Label(bar3, text="", width=24)
+    lbl3 = ttk.Label(bar3, text="", width=34)
     lbl3.grid(row=0, column=1, padx=6)
     btn3_start = ttk.Button(bar3, text="开始")
     btn3_start.grid(row=0, column=2)
     btn3_stop = ttk.Button(bar3, text="取消", state="disabled")
     btn3_stop.grid(row=0, column=3, padx=(6, 0))
     logf3 = ttk.Frame(tab3)
-    logf3.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
-    tab3.rowconfigure(11, weight=1)
+    logf3.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    tab3.rowconfigure(12, weight=1)
     txt3 = tk.Text(logf3, height=6, wrap="none")
     sb3 = ttk.Scrollbar(logf3, orient="vertical", command=txt3.yview)
     txt3.configure(yscrollcommand=sb3.set)
@@ -2664,12 +3022,19 @@ def run_gui():
                             body.insert(1, "RMS3D：%.1f mm（%d 个点）" % (r["rms3d"] * 1000, len(r["rows"])))
                         if r["swap"] and (r["swap"]["use_swap"] or not r["swap"]["confident"]):
                             body.insert(0, "X/Y：%s" % _swap_verdict(r["swap"]))
+                        ex = r["excluded"] or {}
+                        auto = [n for n, v in ex.items() if v == "auto"]
+                        user = [n for n, v in ex.items() if v == "user"]
+                        if user:
+                            body.insert(0, "%s 号是你排除的（改作检查点）" % "、".join(user))
+                        if auto:
+                            body.insert(0, "%s 号细化挪动过大，已自动排除（改作检查点）" % "、".join(auto))
                         if r["status"] == "自动通过" and not r["unaligned"]:
                             messagebox.showinfo(APP_NAME, "\n".join([head] + body))
                         elif r["status"] in ("自动通过", "需人工核对"):
                             extra = ["%s 号：%s" % (n, "；".join(w)) for n, w in r["bad"]]
                             if extra:
-                                extra.insert(0, "\n需人工核对的点（详见 控制点报告.txt）：")
+                                extra.insert(0, "\n需人工核对的点（处理步骤见 控制点报告.txt）：")
                             messagebox.showwarning(APP_NAME + " - " + r["status"], "\n".join([head] + body + extra))
                         else:
                             messagebox.showerror(APP_NAME, "%s\n%s\n\n%s" % (head, r["reason"], "\n".join(body)))
@@ -2686,9 +3051,11 @@ def run_gui():
             return
         try:
             acc = _check_gcp_accuracy(v3_acc.get().strip())
+            shift = _check_max_shift(v3_shift.get().strip())
         except ValueError as ex:
             messagebox.showwarning(APP_NAME, str(ex))
             return
+        excl = parse_exclude(v3_excl.get())
         ref, pdir, psx, csvp, ccp, out = (v.get().strip() for v in (v3_ref, v3_pdir, v3_psx, v3_csv, v3_cc, v3_out))
         if mode == "transfer" and (not ref or not pdir):
             messagebox.showwarning(APP_NAME, "请选择参考期工程和新一期照片目录")
@@ -2716,9 +3083,9 @@ def run_gui():
         def work():
             try:
                 if mode == "transfer":
-                    res = run_gcp_transfer(pdir, ref, ms, out or None, acc, auto, **kw)
+                    res = run_gcp_transfer(pdir, ref, ms, out or None, acc, auto, exclude=excl, max_shift=shift, **kw)
                 else:
-                    res = run_gcp_init(psx, csvp, ms, ccp or None, out or None, acc, **kw)
+                    res = run_gcp_init(psx, csvp, ms, ccp or None, out or None, acc, exclude=excl, **kw)
                 if res["status"] == "已取消":
                     raise AlignCancelled()
                 q3.put(("done", res))
@@ -2775,10 +3142,12 @@ def main(argv=None):
     a.add_argument("--keypoints", type=int, default=DEFAULT_KEYPOINTS, help="关键点上限，默认 %d" % DEFAULT_KEYPOINTS)
     a.add_argument("--tiepoints", type=int, default=DEFAULT_TIEPOINTS, help="连接点上限，默认 %d" % DEFAULT_TIEPOINTS)
     a.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
-    g = sub.add_parser("gcp-transfer", help="控制点·迁移：从参考期把控制点自动放到新一期照片上并平差（退出码 0 自动通过 / 4 需人工核对）")
+    g = sub.add_parser("gcp-transfer", help="控制点·迁移：从参考期把控制点自动放到新一期照片上并平差"
+                       "（退出码 0 自动通过 / 1 失败 / 2 拒绝 / 3 取消 / 4 需人工核对）")
     g.add_argument("photos", help="新一期照片目录（带定位时自动先去定位）")
     g.add_argument("--ref", required=True, help="参考期工程 .psx（只读，不会被修改）")
-    g2 = sub.add_parser("gcp-init", help="控制点·建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 对调（退出码 0 自动通过 / 4 需人工核对）")
+    g2 = sub.add_parser("gcp-init", help="控制点·建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 对调"
+                        "（退出码 0 自动通过 / 1 失败 / 2 拒绝 / 3 取消 / 4 需人工核对）")
     g2.add_argument("psx", help="「空三」页签产出的 .psx（只读，不会被修改）")
     g2.add_argument("--csv", required=True, help="控制点 CSV：点名,X,Y,Z（米）")
     g2.add_argument("--cc", help="ContextCapture 导出的 Blocks Exchange（.xml/.xmlz），里面的控制点刺点；不给就用工程里已刺的点")
@@ -2788,6 +3157,10 @@ def main(argv=None):
         x.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
         x.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
     g.add_argument("--no-auto-strip", action="store_true", help="照片带定位时不自动去定位（会拒绝执行）")
+    g.add_argument("--max-shift", type=float, default=GCP_MAX_SHIFT_PX,
+                   help="D-20 细化挪动上限（像素），默认 %g：挪动更大的投影删掉，挪动中位数更大的点自动排除" % GCP_MAX_SHIFT_PX)
+    for x in (g, g2):
+        x.add_argument("--exclude", default="", help="排除的控制点，逗号分隔，如 1,2：不参与平差，改作检查点")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
     args = ap.parse_args(argv)
     if args.cmd == "align":
@@ -2855,9 +3228,10 @@ def _cli_gcp(args):
     ms = args.metashape or find_metashape()
     try:
         if args.cmd == "gcp-transfer":
-            res = run_gcp_transfer(args.photos, args.ref, ms, args.out, args.accuracy, not args.no_auto_strip, log=log)
+            res = run_gcp_transfer(args.photos, args.ref, ms, args.out, args.accuracy, not args.no_auto_strip, log=log,
+                                   exclude=args.exclude, max_shift=args.max_shift)
         else:
-            res = run_gcp_init(args.psx, args.csv, ms, args.cc, args.out, args.accuracy, log=log)
+            res = run_gcp_init(args.psx, args.csv, ms, args.cc, args.out, args.accuracy, log=log, exclude=args.exclude)
     except ValueError as ex:
         log("拒绝执行：%s" % ex)
         return 2

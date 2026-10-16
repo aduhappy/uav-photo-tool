@@ -4,7 +4,7 @@
 
 最初是为**室内航测**写的：室内 GPS 信号差，同一架次里有的照片坐标是 0,0，有的在漂，有的又是 RTK 固定解。空三软件把这些坐标当作先验，结果互相打架，对齐不上。这个工具先把定位信息剥掉，再做只靠影像匹配的空三。
 
-> English: A single-file, zero-dependency Windows tool for preprocessing drone survey photos. It strips GPS/location metadata from DJI JPEGs **byte-for-byte without re-encoding the image**, and can drive Agisoft Metashape Pro to align the photos and export a Blocks Exchange XML that ContextCapture / iTwin Capture Modeler can import.
+> English: A single-file, zero-dependency Windows tool for preprocessing drone survey photos. It strips GPS/location metadata from DJI JPEGs **byte-for-byte without re-encoding the image**, and can drive Agisoft Metashape Pro to align the photos and export a Blocks Exchange XML that ContextCapture / iTwin Capture Modeler can import. For repeated surveys of the same site it can also transfer ground control points from a reference epoch with zero manual tie-pointing, adjust, self-check, and export the block in local metric coordinates.
 
 ## 功能
 
@@ -40,6 +40,49 @@
 - 只对齐了一部分照片时，XML 只写已对齐的相机，工程文件里保留全部照片。
 - 可以批量处理：每个含照片的子目录单独做一个工程。
 
+### 3. 控制点（需要 Metashape Pro）
+
+给空三结果加上控制点、平差到真实坐标（局部坐标，单位米），导出 ContextCapture 能直接用的 Blocks Exchange XML。适合**同一场地反复航测**（比如每期框架、控制点都不动）：第一次刺一次点，以后每期都不用刺。
+
+有两种模式：
+
+- **建参考期**（新场地第一次用）：
+  - 输入：「空三」页签产出的 `.psx` + 控制点 CSV。
+  - 刺点来源二选一：ContextCapture 导出的 Blocks Exchange（`.xml` 或 `.xmlz`，里面有你在 CC 里刺的点）；或者先在 Metashape 里给至少 3 个点、每点至少 2 张照片刺好并保存。
+  - 软件把其余照片上的点自动补上、细化、平差，输出的 `.psx` 以后当「参考期」用。
+- **迁移**（以后每一期，零刺点）：
+  - 输入：新一期照片目录 + 参考期 `.psx`。
+  - 软件把新照片和参考期一起匹配，按参考期的控制点自动放点、细化、平差。参考期的照片要留在原来的位置。
+  - 一次约 5 分钟，其中联合匹配占 3～5 分钟。
+- 两种模式都输出到 `<名字>_控制点\`：`.psx`、Blocks Exchange XML、`控制点报告.txt`、Metashape 日志。原工程只读，不会被改。
+
+**控制点 CSV 格式**：每行 `点名,X,Y,Z`，单位米。
+
+- 可以有表头；表头里写了 X/Y/Z，就按表头取列。
+- 分隔符可以是逗号、制表符、分号或空格；编码 UTF-8 或 GBK 都行。
+- 全站仪常用「X 北、Y 东」，和软件要的 X/Y 正好相反。建参考期时软件会把原样、X/Y 对调各算一次，相差 10 倍以上就自动判定，并在报告里写明（如「CSV 的 X/Y 对调了，已按对调后的坐标用」）。差别不到 10 倍时只提示你自己核对 CSV。
+- CC 刺点的像素坐标比 Metashape 的小 0.5 像素（两边像素原点的约定不同），软件读 CC 刺点时已经自动加上了。
+
+**怎么判定**（每个控制点）：
+
+- 三维误差 ≤ 2×控制点精度（默认精度 0.01 m，也就是 20 mm）；
+- 像素 RMS ≤ 3；
+- 至少 3 张照片。
+
+全部通过就是「自动通过」，否则是「需人工核对」，报告里会列出是哪些点、为什么，并附处理步骤。另外：
+
+- 像素残差特别大的投影会先自动删掉，再重新平差。
+- 迁移时，「细化标记点」把某个点挪动超过 50 像素，多半是认错了角点（比如降雨前后场景变了）：
+  - 只是个别投影挪得远：把这几处投影删掉；
+  - 这个点挪动的中位数超过 50 像素：整点自动排除，不参与平差，改作检查点（误差照报，仅供参考）。
+  - 只要有点被自动排除，结论就是「需人工核对」。
+  - 上限可以改：界面「细化挪动上限」，命令行 `--max-shift`。
+- 报告里的「迁移偏差（细化挪动）」一栏，是自动放的位置和按图像细化后的位置相差多少像素，越小说明迁移越准。
+- 你也可以手动排除某些点（界面「排除的控制点」填 `1,2`，命令行 `--exclude 1,2`）。被排除的点同样当检查点，不影响「自动通过」。
+- 参与平差的点少于 3 个，判「失败」。
+
+**导出的 XML** 写的是 ContextCapture 自己的局部米制坐标系（`Local:unit=meter`），区块和每个控制点都挂了坐标系，所以导入 CC 后单位显示为「米」。被排除的点在 XML 里标成检查点，CC 平差时不会用它们。「空三」页签的输出不受影响，仍然不带坐标系。
+
 ## 下载
 
 到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的 `uav-photo-tool_v*.exe`，双击运行即可。
@@ -50,7 +93,7 @@
 
 - Windows 10 / 11，64 位。
 - 「剔除定位」不需要安装任何东西。
-- 「空三」需要 Metashape **Pro** 版（标准版不支持脚本，用不了）。目前只在 Metashape Pro 1.7.2 上实测过，2.x 和 PhotoScan 1.4 没有测过，欢迎反馈。
+- 「空三」「控制点」需要 Metashape **Pro** 版（标准版不支持脚本，用不了）。目前只在 Metashape Pro 1.7.2 上实测过，2.x 和 PhotoScan 1.4 没有测过，欢迎反馈。
 - 已测试的相机：DJI M3E（Mavic 3 Enterprise）。其他大疆机型的照片结构相近，应该也能用；遇到问题请提 Issue。
 
 ## 命令行
@@ -62,6 +105,10 @@ uav_photo_tool.py strip-gps <输入目录> [输出目录] [--no-recursive] [--st
 uav_photo_tool.py align <照片目录> [--metashape 路径] [--accuracy high|medium|low]
                         [--recursive] [--no-auto-strip] [--out 输出位置]
                         [--keypoints N] [--tiepoints N] [--log 日志文件]
+uav_photo_tool.py gcp-transfer <新一期照片目录> --ref <参考期.psx> [--out 输出位置] [--accuracy 0.01]
+                               [--exclude 1,2] [--max-shift 50] [--no-auto-strip] [--metashape 路径] [--log 日志文件]
+uav_photo_tool.py gcp-init <空三.psx> --csv <控制点.csv> [--cc <CC导出.xml/.xmlz>] [--out 输出位置]
+                           [--accuracy 0.01] [--exclude 1,2] [--metashape 路径] [--log 日志文件]
 uav_photo_tool.py check-update
 ```
 
@@ -71,11 +118,14 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
 
 退出码含义：
 
-| 命令 | 0 | 1 | 2 | 3 | 10 |
-|---|---|---|---|---|---|
-| `strip-gps` | 全部成功 | 有照片失败 | 拒绝执行（如输出目录非空） | | |
-| `align` | 全部成功 | 有工程失败 | 拒绝执行（如照片带定位、Metashape 路径不对） | 已取消 | |
-| `check-update` | 已是最新 | 查询失败 | | | 有新版本 |
+| 命令 | 0 | 1 | 2 | 3 | 4 | 10 |
+|---|---|---|---|---|---|---|
+| `strip-gps` | 全部成功 | 有照片失败 | 拒绝执行（如输出目录非空） | | | |
+| `align` | 全部成功 | 有工程失败 | 拒绝执行（如照片带定位、Metashape 路径不对） | 已取消 | | |
+| `gcp-transfer`、`gcp-init` | 自动通过 | 失败（含参与平差的点少于 3 个） | 拒绝执行（如 CSV 格式不对、输出目录非空、参考期不存在） | 已取消 | 需人工核对（含有点被自动排除） | |
+| `check-update` | 已是最新 | 查询失败 | | | | 有新版本 |
+
+批量脚本里请把 4 当作「没通过」处理，不要当成功。
 
 ## 从源码运行和打包
 
@@ -97,6 +147,7 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
   ```powershell
   python scripts/test_strip_gps.py <原片目录> <去定位输出目录> [--pixels]
   python scripts/test_align.py <空三输出目录> [--expect-aligned N] [--metashape 路径]
+  python scripts/test_gcp.py <控制点输出目录> [--expect-aligned N] [--max-rms 0.02] [--metashape 路径]
   ```
 
 ## 许可
