@@ -34,6 +34,8 @@
 import argparse
 import csv
 import datetime
+import hashlib
+import stat
 import glob
 import json
 import os
@@ -327,24 +329,45 @@ def _jpeg_app1_segments(data):
     return out
 
 
+def _clear_inplace_temps(src, log):
+    """Remove stale temporary files created by this tool, recursively."""
+    removed, residual = 0, []
+    for path in src.rglob("*.tmp_part"):
+        try:
+            path.unlink()
+            removed += 1
+        except Exception as ex:
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                path.unlink()
+                removed += 1
+            except Exception as retry_ex:
+                residual.append((path, "%s; retry: %s" % (ex, retry_ex)))
+    log("启动清理：已清理 %d 个本软件 .tmp_part；清理失败 %d 个" % (removed, len(residual)))
+    return residual
+
+
 def _write_location_backup(src, files, stamp, strip_attitude=False):
     """Create and read-back-verify the in-place restore backup before edits."""
     backup = src / ("定位备份_%s.zip" % stamp)
     tmp = backup.with_name(backup.name + ".tmp_part")
-    manifest = {"version": 1, "created": stamp, "files": []}
+    manifest = {"version": 1, "created": stamp, "files": [], "skipped": []}
     try:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as z:
             for index, path in enumerate(files):
-                data = path.read_bytes()
-                entries = _jpeg_app1_segments(data)
-                stripped, _ = strip_jpeg_bytes(data, strip_attitude)
-                rec = {"path": str(path.relative_to(src)), "before_sha256": __import__("hashlib").sha256(data).hexdigest(),
-                       "after_sha256": __import__("hashlib").sha256(stripped).hexdigest(), "segments": []}
-                for seq, (kind, offset, segment) in enumerate(entries):
-                    name = "segments/%06d_%s_%03d.bin" % (index, kind, seq)
-                    z.writestr(name, segment)
-                    rec["segments"].append({"kind": kind, "offset": offset, "size": len(segment), "zip": name})
-                manifest["files"].append(rec)
+                try:
+                    data = path.read_bytes()
+                    entries = _jpeg_app1_segments(data)
+                    stripped, _ = strip_jpeg_bytes(data, strip_attitude)
+                    rec = {"path": str(path.relative_to(src)), "before_sha256": hashlib.sha256(data).hexdigest(),
+                           "after_sha256": hashlib.sha256(stripped).hexdigest(), "segments": []}
+                    for seq, (kind, offset, segment) in enumerate(entries):
+                        name = "segments/%06d_%s_%03d.bin" % (index, kind, seq)
+                        z.writestr(name, segment)
+                        rec["segments"].append({"kind": kind, "offset": offset, "size": len(segment), "zip": name})
+                    manifest["files"].append(rec)
+                except Exception as ex:
+                    manifest["skipped"].append({"path": str(path.relative_to(src)), "reason": "%s: %s" % (type(ex).__name__, ex)})
             z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
         with zipfile.ZipFile(tmp, "r") as z:
             check = json.loads(z.read("manifest.json").decode("utf-8"))
@@ -356,7 +379,13 @@ def _write_location_backup(src, files, stamp, strip_attitude=False):
         return backup, manifest
     finally:
         if tmp.exists():
-            tmp.unlink()
+            try:
+                tmp.unlink()
+            except Exception:
+                try:
+                    os.chmod(tmp, stat.S_IWRITE); tmp.unlink()
+                except Exception:
+                    pass
 
 
 def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=False,
@@ -369,6 +398,7 @@ def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=
         raise ValueError("输入目录不存在：%s" % src)
     if confirm != src.name:
         raise ValueError("确认目录名不正确；必须输入：%s" % src.name)
+    residual = _clear_inplace_temps(src, log)
     files = collect_files(src, recursive)
     jpegs = [p for p in files if p.suffix.lower() in JPEG_EXTS]
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -378,11 +408,14 @@ def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=
         backup_path, manifest = _write_location_backup(src, jpegs, stamp, strip_attitude)
         log("定位备份已写入并校验：%s" % backup_path)
     log_path = src / ("原地抹除日志_%s.csv" % stamp)
-    stats = {"成功": 0, "跳过": 0, "失败": 0, "日志": str(log_path), "备份": str(backup_path) if backup_path else ""}
+    stats = {"成功": 0, "跳过": 0, "失败": 0, "残留": len(residual), "日志": str(log_path), "备份": str(backup_path) if backup_path else ""}
+    stats["备份阶段跳过"] = len((manifest or {}).get("skipped", []))
     by_rel = {rec["path"]: rec for rec in (manifest or {}).get("files", [])}
     with open(log_path, "w", newline="", encoding="utf-8-sig") as fcsv:
         w = csv.writer(fcsv)
         w.writerow(["相对路径", "状态", "原GpsStatus", "备份是否写入", "说明/出错信息"])
+        for skipped in (manifest or {}).get("skipped", []):
+            w.writerow([skipped["path"], "备份阶段跳过", "", "否", skipped["reason"]])
         for i, path in enumerate(files, 1):
             if stop_event is not None and stop_event.is_set():
                 w.writerow(["", "中止", "", "是" if backup_path else "否", "用户中止"])
@@ -393,6 +426,8 @@ def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=
                 w.writerow([rel, "跳过", "", "是" if backup_path else "否", "不是 JPG"])
                 progress(i, len(files)); continue
             try:
+                if rel in {item["path"] for item in (manifest or {}).get("skipped", [])}:
+                    raise OSError("备份阶段跳过：照片无法读取，未取得安全还原备份")
                 original = path.read_bytes()
                 new, info = strip_jpeg_bytes(original, strip_attitude)
                 if not (info["exif_gps"] or info["xmp_fields"]):
@@ -408,10 +443,18 @@ def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=
                     verify, verify_info = strip_jpeg_bytes(tmp.read_bytes(), strip_attitude)
                     if verify != new or verify_info["exif_gps"] or verify_info["xmp_fields"]:
                         raise JpegError("抹除后自检失败")
-                    shutil.copystat(path, tmp)
+                    src_stat = path.stat()
+                    os.utime(tmp, (src_stat.st_atime, src_stat.st_mtime))
                     os.replace(tmp, path)
                 finally:
-                    if tmp.exists(): tmp.unlink()
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except Exception:
+                            try:
+                                os.chmod(tmp, stat.S_IWRITE); tmp.unlink()
+                            except Exception as cleanup_ex:
+                                residual.append((tmp, str(cleanup_ex)))
                 stats["成功"] += 1
                 w.writerow([rel, "成功", info["gps_status"], "是" if backup_path else "否", "EXIF GPS %s；XMP 剔除 %d 项" % ("已删" if info["exif_gps"] else "无", info["xmp_fields"])])
             except Exception as ex:
@@ -419,7 +462,13 @@ def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=
                 w.writerow([rel, "失败", "", "是" if backup_path else "否", "%s: %s" % (type(ex).__name__, ex)])
                 log("失败：%s —— %s" % (rel, ex))
             fcsv.flush(); progress(i, len(files))
-    log("完成：成功 %d，无定位/跳过 %d，失败 %d" % (stats["成功"], stats["跳过"], stats["失败"]))
+    log("完成：成功 %d，无定位/跳过 %d，失败 %d，残留 %d" % (stats["成功"], stats["跳过"], stats["失败"], len(residual)))
+    stats["残留"] = len(residual)
+    stats["残留清单"] = [str(p) for p, _ in residual]
+    if stats["备份阶段跳过"]:
+        log("备份阶段跳过 %d 张，已按失败记账" % stats["备份阶段跳过"])
+    for path, reason in residual:
+        log("残留临时文件：%s —— %s" % (path, reason))
     return stats
 
 
@@ -441,8 +490,10 @@ def restore_gps(src_dir, backup_path, recursive=True, progress=None, log=None):
                 try:
                     if not path.is_file(): raise ValueError("照片不存在")
                     current = path.read_bytes()
-                    if hashlib.sha256(current).hexdigest() != rec.get("after_sha256", ""):
-                        # Older/just-created backups may not carry this field; derive stripped hash only then.
+                    current_hash = hashlib.sha256(current).hexdigest()
+                    if current_hash == rec.get("before_sha256", ""):
+                        raise ValueError("这张没有被抹除过，不需要还原")
+                    if current_hash != rec.get("after_sha256", ""):
                         raise ValueError("当前文件已被其他程序修改，跳过")
                     restored = bytearray(current)
                     for seg in rec.get("segments", []):
@@ -455,9 +506,17 @@ def restore_gps(src_dir, backup_path, recursive=True, progress=None, log=None):
                     tmp = path.with_name(path.name + ".tmp_part")
                     try:
                         with open(tmp, "wb") as f: f.write(restored); f.flush(); os.fsync(f.fileno())
-                        shutil.copystat(path, tmp); os.replace(tmp, path)
+                        src_stat = path.stat()
+                        os.utime(tmp, (src_stat.st_atime, src_stat.st_mtime)); os.replace(tmp, path)
                     finally:
-                        if tmp.exists(): tmp.unlink()
+                        if tmp.exists():
+                            try:
+                                tmp.unlink()
+                            except Exception:
+                                try:
+                                    os.chmod(tmp, stat.S_IWRITE); tmp.unlink()
+                                except Exception:
+                                    pass
                     stats["成功"] += 1; w.writerow([rec["path"], "成功", "逐字节还原"])
                 except Exception as ex:
                     stats["跳过"] += 1; w.writerow([rec["path"], "跳过", str(ex)])
@@ -2683,6 +2742,10 @@ def run_gui():
 
     root = tk.Tk()
     root.title("%s v%s" % (APP_NAME, APP_VERSION))
+    def gui_exception(exc_type, exc_value, exc_tb):
+        import traceback
+        messagebox.showerror(APP_NAME, "发生未处理错误，界面已恢复：\n%s" % "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    root.report_callback_exception = gui_exception
     k = max(1.0, root.winfo_fpixels("1i") / 96.0)
     root.geometry("%dx%d" % (760 * k, 540 * k))
     root.minsize(int(640 * k), int(420 * k))
@@ -2838,8 +2901,9 @@ def run_gui():
                         append_log("出错：%s" % val)
                         messagebox.showerror(APP_NAME, str(val))
                     else:
-                        msg = "完成：成功 %d，跳过 %d，失败 %d\n日志：%s" % (val["成功"], val["跳过"], val["失败"], val["日志"])
-                        (messagebox.showwarning if val["失败"] else messagebox.showinfo)(APP_NAME, msg)
+                        residual_count = val.get("残留", 0)
+                        msg = "完成：成功 %d，跳过 %d，失败 %d 张、残留 %d 个文件\n日志路径：%s" % (val["成功"], val["跳过"], val.get("失败", 0), residual_count, val["日志"])
+                        (messagebox.showwarning if val.get("失败", 0) or residual_count else messagebox.showinfo)(APP_NAME, msg)
         except queue.Empty:
             pass
         root.after(100, poll)
@@ -2853,9 +2917,12 @@ def run_gui():
         confirm = None
         if inplace:
             count = sum(1 for p in collect_files(src, rec) if p.suffix.lower() in JPEG_EXTS)
-            message = ("会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。\n\n"
+            if not v_backup.get():
+                if not messagebox.askyesno(APP_NAME + " - 警告：不可恢复", "已关闭定位备份，抹除后无法还原。仍要继续吗？"):
+                    return
+            message = ("警告：不可恢复！\n会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。\n\n"
                        "请输入照片目录的名字（不是完整路径）以确认：") % count
-            confirm = simpledialog.askstring(APP_NAME, message)
+            confirm = simpledialog.askstring(APP_NAME + " - 警告：不可恢复", message)
             if confirm is None:
                 return
             if confirm != Path(src).name:
@@ -2895,9 +2962,12 @@ def run_gui():
             messagebox.showwarning(APP_NAME, "请先选择照片目录"); return
         backup = filedialog.askopenfilename(title="选择定位备份", filetypes=[("ZIP", "*.zip")])
         if not backup: return
+        if not messagebox.askyesno(APP_NAME + " - 确认还原", "将直接修改原照片并写回定位信息，确定继续吗？"):
+            return
         try:
             res = restore_gps(src, backup, v_rec.get(), log=append_log)
-            messagebox.showinfo(APP_NAME, "还原完成：成功 %d，跳过 %d，失败 %d\n日志：%s" % (res["成功"], res["跳过"], res["失败"], res["日志"]))
+            msg = "还原完成：成功 %d，跳过 %d，失败 %d\n日志：%s" % (res["成功"], res["跳过"], res["失败"], res["日志"])
+            (messagebox.showwarning if res["失败"] else messagebox.showinfo)(APP_NAME, msg)
         except Exception as ex:
             messagebox.showerror(APP_NAME, str(ex))
     btn_start.configure(command=start)
@@ -3314,7 +3384,11 @@ def _print(s):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
-        run_gui()
+        try:
+            run_gui()
+        except Exception as ex:
+            _print("界面启动失败：%s" % ex)
+            return 1
         return 0
     ap = argparse.ArgumentParser(prog="uav_photo_tool", description="%s v%s" % (APP_NAME, APP_VERSION))
     sub = ap.add_subparsers(dest="cmd", required=True)
