@@ -10,7 +10,7 @@
 
 ### 1. 剔除定位
 
-把一个目录（可含子目录）里的 JPG 照片去掉定位信息，另存到新目录。**原片不动。**
+把一个目录（可含子目录）里的 JPG 照片去掉定位信息，默认另存到新目录，**原片不动**。也可明确选择「原地抹除」直接改原照片；该模式默认先写定位备份，之后可逐字节还原。定位一旦从照片中抹掉，不能仅靠照片本身找回，只能依靠备份。
 
 - 删除的内容：
   - EXIF 里的 GPS 信息；
@@ -23,6 +23,8 @@
   - 文件名和修改时间也保持不变。
 - 默认输出到同级目录 `<原目录名>_去定位`。输出目录不是空的就拒绝写入，避免覆盖。
 - 非 JPG 文件（如 `.MRK`、`Thumbs.db`）会跳过，并记进日志 CSV。
+
+**原地抹除（谨慎使用）**：命令行用 `strip-gps <照片目录> --in-place --confirm <目录名>`，确认名必须是目录名而不是完整路径；默认在第一张照片改动前写入并校验 `定位备份_<时间>.zip`，`--no-backup` 可关闭。每张照片先写同目录临时文件并自检，通过后才原子替换。用 `restore-gps <照片目录> --backup <定位备份.zip>` 还原；只有当前文件哈希仍等于抹除后的哈希才会写回，其他修改过的文件跳过。界面勾选「原地抹除」后会要求输入目录名确认。
 
 ### 2. 空三（需要 Metashape Pro）
 
@@ -128,6 +130,8 @@ exe 和 Python 源码都可以用命令行调用，方便批量处理：
 
 ```text
 uav_photo_tool.py strip-gps <输入目录> [输出目录] [--no-recursive] [--strip-attitude]
+uav_photo_tool.py strip-gps <照片目录> --in-place --confirm <目录名> [--no-backup] [--no-recursive] [--strip-attitude]
+uav_photo_tool.py restore-gps <照片目录> --backup <定位备份.zip>
 uav_photo_tool.py align <照片目录> [--metashape 路径] [--accuracy high|medium|low]
                         [--recursive] [--no-auto-strip] [--out 输出位置]
                         [--keypoints N] [--tiepoints N] [--log 日志文件]

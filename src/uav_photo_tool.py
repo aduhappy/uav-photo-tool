@@ -51,7 +51,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -307,6 +307,162 @@ def process_file(src, dst, strip_attitude=False):
             tmp.unlink()
     shutil.copystat(src, dst)
     return info
+
+
+def _jpeg_app1_segments(data):
+    """Return original APP1 Exif/XMP segments as (kind, offset, bytes)."""
+    segs, _ = parse_segments(data)
+    out = []
+    for marker, start, total in segs:
+        if marker != 0xE1:
+            continue
+        payload = data[start + 4:start + 4 + 64]
+        if payload.startswith(EXIF_HEADER):
+            kind = "exif"
+        elif payload.startswith(XMP_HEADER):
+            kind = "xmp"
+        else:
+            continue
+        out.append((kind, start, bytes(data[start:start + total])))
+    return out
+
+
+def _write_location_backup(src, files, stamp, strip_attitude=False):
+    """Create and read-back-verify the in-place restore backup before edits."""
+    backup = src / ("定位备份_%s.zip" % stamp)
+    tmp = backup.with_name(backup.name + ".tmp_part")
+    manifest = {"version": 1, "created": stamp, "files": []}
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as z:
+            for index, path in enumerate(files):
+                data = path.read_bytes()
+                entries = _jpeg_app1_segments(data)
+                stripped, _ = strip_jpeg_bytes(data, strip_attitude)
+                rec = {"path": str(path.relative_to(src)), "before_sha256": __import__("hashlib").sha256(data).hexdigest(),
+                       "after_sha256": __import__("hashlib").sha256(stripped).hexdigest(), "segments": []}
+                for seq, (kind, offset, segment) in enumerate(entries):
+                    name = "segments/%06d_%s_%03d.bin" % (index, kind, seq)
+                    z.writestr(name, segment)
+                    rec["segments"].append({"kind": kind, "offset": offset, "size": len(segment), "zip": name})
+                manifest["files"].append(rec)
+            z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+        with zipfile.ZipFile(tmp, "r") as z:
+            check = json.loads(z.read("manifest.json").decode("utf-8"))
+            for rec in check["files"]:
+                for seg in rec["segments"]:
+                    if len(z.read(seg["zip"])) != seg["size"]:
+                        raise ValueError("备份读回校验失败：%s" % rec["path"])
+        os.replace(tmp, backup)
+        return backup, manifest
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def run_strip_in_place(src_dir, recursive=True, strip_attitude=False, no_backup=False,
+                       confirm=None, progress=None, log=None, stop_event=None):
+    """Safely strip location metadata in place, one atomically replaced JPEG at a time."""
+    log = log or (lambda s: None)
+    progress = progress or (lambda i, n: None)
+    src = Path(src_dir)
+    if not src.is_dir():
+        raise ValueError("输入目录不存在：%s" % src)
+    if confirm != src.name:
+        raise ValueError("确认目录名不正确；必须输入：%s" % src.name)
+    files = collect_files(src, recursive)
+    jpegs = [p for p in files if p.suffix.lower() in JPEG_EXTS]
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = None
+    manifest = None
+    if not no_backup:
+        backup_path, manifest = _write_location_backup(src, jpegs, stamp, strip_attitude)
+        log("定位备份已写入并校验：%s" % backup_path)
+    log_path = src / ("原地抹除日志_%s.csv" % stamp)
+    stats = {"成功": 0, "跳过": 0, "失败": 0, "日志": str(log_path), "备份": str(backup_path) if backup_path else ""}
+    by_rel = {rec["path"]: rec for rec in (manifest or {}).get("files", [])}
+    with open(log_path, "w", newline="", encoding="utf-8-sig") as fcsv:
+        w = csv.writer(fcsv)
+        w.writerow(["相对路径", "状态", "原GpsStatus", "备份是否写入", "说明/出错信息"])
+        for i, path in enumerate(files, 1):
+            if stop_event is not None and stop_event.is_set():
+                w.writerow(["", "中止", "", "是" if backup_path else "否", "用户中止"])
+                break
+            rel = str(path.relative_to(src))
+            if path.suffix.lower() not in JPEG_EXTS:
+                stats["跳过"] += 1
+                w.writerow([rel, "跳过", "", "是" if backup_path else "否", "不是 JPG"])
+                progress(i, len(files)); continue
+            try:
+                original = path.read_bytes()
+                new, info = strip_jpeg_bytes(original, strip_attitude)
+                if not (info["exif_gps"] or info["xmp_fields"]):
+                    stats["跳过"] += 1
+                    w.writerow([rel, "无定位", info["gps_status"], "是" if backup_path else "否", "无定位信息"])
+                    progress(i, len(files)); continue
+                tmp = path.with_name(path.name + ".tmp_part")
+                try:
+                    with open(tmp, "wb") as f:
+                        f.write(new); f.flush(); os.fsync(f.fileno())
+                    if tmp.stat().st_size != len(original) or tmp.read_bytes() != new:
+                        raise JpegError("临时文件校验失败")
+                    verify, verify_info = strip_jpeg_bytes(tmp.read_bytes(), strip_attitude)
+                    if verify != new or verify_info["exif_gps"] or verify_info["xmp_fields"]:
+                        raise JpegError("抹除后自检失败")
+                    shutil.copystat(path, tmp)
+                    os.replace(tmp, path)
+                finally:
+                    if tmp.exists(): tmp.unlink()
+                stats["成功"] += 1
+                w.writerow([rel, "成功", info["gps_status"], "是" if backup_path else "否", "EXIF GPS %s；XMP 剔除 %d 项" % ("已删" if info["exif_gps"] else "无", info["xmp_fields"])])
+            except Exception as ex:
+                stats["失败"] += 1
+                w.writerow([rel, "失败", "", "是" if backup_path else "否", "%s: %s" % (type(ex).__name__, ex)])
+                log("失败：%s —— %s" % (rel, ex))
+            fcsv.flush(); progress(i, len(files))
+    log("完成：成功 %d，无定位/跳过 %d，失败 %d" % (stats["成功"], stats["跳过"], stats["失败"]))
+    return stats
+
+
+def restore_gps(src_dir, backup_path, recursive=True, progress=None, log=None):
+    """Restore only files whose current hash matches the backup's stripped hash."""
+    import hashlib
+    log = log or (lambda s: None); progress = progress or (lambda i, n: None)
+    src = Path(src_dir)
+    with zipfile.ZipFile(backup_path, "r") as z:
+        manifest = json.loads(z.read("manifest.json").decode("utf-8"))
+        records = manifest.get("files", [])
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = src / ("还原定位日志_%s.csv" % stamp)
+        stats = {"成功": 0, "跳过": 0, "失败": 0, "日志": str(log_path)}
+        with open(log_path, "w", newline="", encoding="utf-8-sig") as fcsv:
+            w = csv.writer(fcsv); w.writerow(["相对路径", "状态", "说明/出错信息"])
+            for i, rec in enumerate(records, 1):
+                path = src / rec["path"]
+                try:
+                    if not path.is_file(): raise ValueError("照片不存在")
+                    current = path.read_bytes()
+                    if hashlib.sha256(current).hexdigest() != rec.get("after_sha256", ""):
+                        # Older/just-created backups may not carry this field; derive stripped hash only then.
+                        raise ValueError("当前文件已被其他程序修改，跳过")
+                    restored = bytearray(current)
+                    for seg in rec.get("segments", []):
+                        blob = z.read(seg["zip"])
+                        off = int(seg["offset"])
+                        if len(blob) != int(seg["size"]) or off + len(blob) > len(restored): raise ValueError("备份段越界")
+                        restored[off:off + len(blob)] = blob
+                    if hashlib.sha256(restored).hexdigest() != rec["before_sha256"]:
+                        raise ValueError("还原后哈希校验失败")
+                    tmp = path.with_name(path.name + ".tmp_part")
+                    try:
+                        with open(tmp, "wb") as f: f.write(restored); f.flush(); os.fsync(f.fileno())
+                        shutil.copystat(path, tmp); os.replace(tmp, path)
+                    finally:
+                        if tmp.exists(): tmp.unlink()
+                    stats["成功"] += 1; w.writerow([rec["path"], "成功", "逐字节还原"])
+                except Exception as ex:
+                    stats["跳过"] += 1; w.writerow([rec["path"], "跳过", str(ex)])
+                progress(i, len(records))
+        return stats
 
 
 def run_strip(src_dir, dst_dir, recursive=True, strip_attitude=False, progress=None, log=None, stop_event=None):
@@ -2516,7 +2672,7 @@ def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy
 
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 
     if sys.platform == "win32":  # 高分屏下不模糊
         try:
@@ -2593,6 +2749,8 @@ def run_gui():
     v_dst = tk.StringVar()
     v_rec = tk.BooleanVar(value=True)
     v_att = tk.BooleanVar(value=False)
+    v_inplace = tk.BooleanVar(value=False)
+    v_backup = tk.BooleanVar(value=True)
     state = {"dst_auto": True, "worker": None, "stop": None}
     q = queue.Queue()
 
@@ -2623,10 +2781,17 @@ def run_gui():
     opts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
     ttk.Checkbutton(opts, text="包含子目录", variable=v_rec).pack(side="left")
     ttk.Checkbutton(opts, text="同时剔除姿态（Gimbal*/Flight*）", variable=v_att).pack(side="left", padx=(16, 0))
+    ttk.Checkbutton(opts, text="原地抹除（直接改原照片，不复制）", variable=v_inplace).pack(side="left", padx=(16, 0))
+    ttk.Checkbutton(opts, text="保留定位备份（可还原）", variable=v_backup).pack(side="left", padx=(16, 0))
+
+    def update_inplace_state(*_):
+        enabled = not v_inplace.get()
+        e_dst.configure(state="normal" if enabled else "disabled")
+    v_inplace.trace_add("write", update_inplace_state)
 
     ttk.Label(tab, foreground="#555", wraplength=int(700 * k),
               text="说明：剔除 EXIF GPS 和 DJI XMP 位置字段（经纬度、高度、RTK、激光测距目标）；"
-                   "相机标定参数保留；图像数据逐字节不变；原片不会被修改。").grid(
+                   "相机标定参数保留；图像数据逐字节不变；原地模式会先备份并要求输入目录名确认。").grid(
         row=3, column=0, columnspan=3, sticky="w", pady=(2, 6))
 
     bar = ttk.Frame(tab)
@@ -2640,6 +2805,8 @@ def run_gui():
     btn_start.grid(row=0, column=2)
     btn_stop = ttk.Button(bar, text="中止", state="disabled")
     btn_stop.grid(row=0, column=3, padx=(6, 0))
+    btn_restore = ttk.Button(bar, text="从备份还原")
+    btn_restore.grid(row=0, column=4, padx=(6, 0))
 
     logf = ttk.Frame(tab)
     logf.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
@@ -2682,26 +2849,38 @@ def run_gui():
         if not src:
             messagebox.showwarning(APP_NAME, "请先选择输入目录")
             return
-        if not dst:
-            dst = str(default_output_dir(src))
-            v_dst.set(dst)
-        err = check_dirs(src, dst)
-        if err:
-            messagebox.showwarning(APP_NAME, err)
-            return
-        txt.delete("1.0", "end")
-        pb.configure(value=0)
-        btn_start.configure(state="disabled")
-        btn_stop.configure(state="normal")
-        stop = threading.Event()
-        state["stop"] = stop
-        rec, att = v_rec.get(), v_att.get()
+        rec, att, inplace, backup = v_rec.get(), v_att.get(), v_inplace.get(), v_backup.get()
+        confirm = None
+        if inplace:
+            count = sum(1 for p in collect_files(src, rec) if p.suffix.lower() in JPEG_EXTS)
+            message = ("会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。\n\n"
+                       "请输入照片目录的名字（不是完整路径）以确认：") % count
+            confirm = simpledialog.askstring(APP_NAME, message)
+            if confirm is None:
+                return
+            if confirm != Path(src).name:
+                messagebox.showwarning(APP_NAME, "确认目录名不正确，未修改任何文件")
+                return
+        else:
+            if not dst:
+                dst = str(default_output_dir(src)); v_dst.set(dst)
+            err = check_dirs(src, dst)
+            if err:
+                messagebox.showwarning(APP_NAME, err); return
+        txt.delete("1.0", "end"); pb.configure(value=0)
+        btn_start.configure(state="disabled"); btn_stop.configure(state="normal")
+        stop = threading.Event(); state["stop"] = stop
 
         def work():
             try:
-                res = run_strip(src, dst, rec, att,
-                                progress=lambda i, n: q.put(("prog", (i, n))),
-                                log=lambda s: q.put(("log", s)), stop_event=stop)
+                if inplace:
+                    res = run_strip_in_place(src, rec, att, not backup, confirm,
+                                             progress=lambda i, n: q.put(("prog", (i, n))),
+                                             log=lambda s: q.put(("log", s)), stop_event=stop)
+                else:
+                    res = run_strip(src, dst, rec, att,
+                                    progress=lambda i, n: q.put(("prog", (i, n))),
+                                    log=lambda s: q.put(("log", s)), stop_event=stop)
                 q.put(("done", res))
             except Exception as ex:
                 q.put(("done", ex))
@@ -2710,8 +2889,20 @@ def run_gui():
         state["worker"] = t
         t.start()
 
+    def restore_start():
+        src = v_src.get().strip()
+        if not src:
+            messagebox.showwarning(APP_NAME, "请先选择照片目录"); return
+        backup = filedialog.askopenfilename(title="选择定位备份", filetypes=[("ZIP", "*.zip")])
+        if not backup: return
+        try:
+            res = restore_gps(src, backup, v_rec.get(), log=append_log)
+            messagebox.showinfo(APP_NAME, "还原完成：成功 %d，跳过 %d，失败 %d\n日志：%s" % (res["成功"], res["跳过"], res["失败"], res["日志"]))
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, str(ex))
     btn_start.configure(command=start)
     btn_stop.configure(command=lambda: state["stop"] and state["stop"].set())
+    btn_restore.configure(command=restore_start)
 
     # ---- 页签 2：空三 ----
     tab2 = ttk.Frame(nb, padding=10)
@@ -3127,11 +3318,18 @@ def main(argv=None):
         return 0
     ap = argparse.ArgumentParser(prog="uav_photo_tool", description="%s v%s" % (APP_NAME, APP_VERSION))
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("strip-gps", help="剔除定位信息并复制到新目录")
-    p.add_argument("src", help="输入目录（只读）")
-    p.add_argument("dst", nargs="?", help="输出目录（须为空，名字带 %s；默认 <源目录名>%s）" % (OUTPUT_SUFFIX, OUTPUT_SUFFIX))
+    p = sub.add_parser("strip-gps", help="剔除定位信息（默认复制，可选原地抹除）")
+    p.add_argument("src", help="输入目录")
+    p.add_argument("dst", nargs="?", help="复制模式输出目录（须为空，名字带 %s）" % OUTPUT_SUFFIX)
     p.add_argument("--no-recursive", action="store_true", help="不处理子目录")
     p.add_argument("--strip-attitude", action="store_true", help="同时剔除姿态 Gimbal*/Flight*")
+    p.add_argument("--in-place", action="store_true", help="原地抹除，直接修改照片（必须配 --confirm）")
+    p.add_argument("--confirm", help="原地模式确认目录名（不是完整路径）")
+    p.add_argument("--no-backup", action="store_true", help="原地模式不保留定位备份")
+    r = sub.add_parser("restore-gps", help="用定位备份逐字节还原照片")
+    r.add_argument("src", help="照片目录")
+    r.add_argument("--backup", required=True, help="定位备份 zip")
+    r.add_argument("--no-recursive", action="store_true", help="兼容参数，不处理目录外文件")
     a = sub.add_parser("align", help="调用 Metashape 空三并导出 Blocks Exchange XML")
     a.add_argument("photos", help="照片目录")
     a.add_argument("--metashape", help="metashape.exe / photoscan.exe 路径（默认用上次界面里记的或常见安装位置）")
@@ -3178,6 +3376,27 @@ def main(argv=None):
             return 10
         _print("已经是最新版本（当前 v%s，GitHub 最新 v%s）" % (APP_VERSION, info["latest"]))
         return 0
+    if args.cmd == "restore-gps":
+        try:
+            res = restore_gps(args.src, args.backup, not args.no_recursive, log=_print)
+        except (ValueError, OSError, zipfile.BadZipFile) as ex:
+            _print("拒绝执行：%s" % ex)
+            return 2
+        return 1 if res["失败"] else 0
+    if args.in_place:
+        if args.dst is not None or args.confirm != Path(args.src).name:
+            _print("拒绝执行：原地模式必须使用正确的 --confirm 目录名，且不能给输出目录")
+            return 2
+        try:
+            res = run_strip_in_place(args.src, not args.no_recursive, args.strip_attitude,
+                                     args.no_backup, args.confirm, log=_print)
+        except ValueError as ex:
+            _print("拒绝执行：%s" % ex)
+            return 2
+        return 1 if res["失败"] else 0
+    if args.confirm is not None or args.no_backup:
+        _print("拒绝执行：--confirm/--no-backup 只能用于 --in-place")
+        return 2
     dst = args.dst or str(default_output_dir(args.src))
     try:
         res = run_strip(args.src, dst, not args.no_recursive, args.strip_attitude,
