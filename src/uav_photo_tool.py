@@ -53,7 +53,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -2731,28 +2731,92 @@ def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy
 
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox, simpledialog
+    from tkinter import filedialog, messagebox
+    try:
+        import customtkinter as ctk  # D-23：界面库只在这里 import，命令行不依赖它
+    except ImportError:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror(APP_NAME, "界面需要 CustomTkinter（命令行功能不受影响）：\n"
+                                       "%s -m pip install -r requirements-gui.txt" % sys.executable)
+        r.destroy()
+        raise
 
-    if sys.platform == "win32":  # 高分屏下不模糊
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
+    # ---- 外观：浅色默认，可选跟随系统 / 深色（记在 config.json）；主色 Blue；中文用微软雅黑 ----
+    appearance_label = {"system": "跟随系统", "light": "浅色", "dark": "深色"}
+    appearance = load_config().get("appearance", "light")
+    if appearance not in appearance_label:
+        appearance = "light"
+    ctk.set_appearance_mode(appearance)
+    ctk.set_default_color_theme("blue")
+    ctk.ThemeManager.theme["CTkFont"]["family"] = "Microsoft YaHei UI"
+    secondary = dict(fg_color=("gray82", "gray28"), hover_color=("gray72", "gray36"), text_color=("gray10", "gray92"),
+                     text_color_disabled=("gray60", "gray50"))
+    hint_color = ("gray35", "gray65")
+    danger = ("#C62828", "#EF5350")  # Material Red 800 / 400
+    danger_hover = ("#B71C1C", "#E53935")
+    label_color = ctk.ThemeManager.theme["CTkLabel"]["text_color"]
+    label_color_disabled = ctk.ThemeManager.theme["CTkCheckBox"]["text_color_disabled"]
 
-    root = tk.Tk()
+    # CustomTkinter 自己做 DPI 感知和缩放（创建 CTk 时调 SetProcessDpiAwareness），这里不再重复设置
+    root = ctk.CTk()
     root.title("%s v%s" % (APP_NAME, APP_VERSION))
     def gui_exception(exc_type, exc_value, exc_tb):
         import traceback
         messagebox.showerror(APP_NAME, "发生未处理错误，界面已恢复：\n%s" % "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
     root.report_callback_exception = gui_exception
-    k = max(1.0, root.winfo_fpixels("1i") / 96.0)
-    root.geometry("%dx%d" % (760 * k, 540 * k))
-    root.minsize(int(640 * k), int(420 * k))
+    root.geometry("820x620")  # CTk 按屏幕缩放自动放大
+    root.minsize(700, 540)
 
-    # ---- 菜单：帮助 → 检查更新 / 项目主页 ----
+    def button(parent, text, command=None, primary=False, **kw):
+        kw.setdefault("width", 72 if text == "浏览…" else 88)
+        return ctk.CTkButton(parent, text=text, command=command, **({} if primary else secondary), **kw)
+
+    def spinbox(parent, var, from_, to, increment, width):
+        """代替 ttk.Spinbox：输入框 + −/+ 按钮（上下方向键同样加减），范围和步长同原来。"""
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        e = ctk.CTkEntry(f, textvariable=var, width=width, justify="right")
+
+        def step(d):
+            try:
+                v = float(var.get())
+            except ValueError:
+                v = from_
+            v = min(max(v + d, from_), to)
+            var.set("%g" % round(v, 6))
+
+        b1 = button(f, "−", lambda: step(-increment), width=26)
+        b2 = button(f, "+", lambda: step(increment), width=26)
+        e.bind("<Up>", lambda ev: step(increment))
+        e.bind("<Down>", lambda ev: step(-increment))
+        e.pack(side="left")
+        b1.pack(side="left", padx=(4, 0))
+        b2.pack(side="left", padx=(2, 0))
+        f.parts = (e, b1, b2)
+        return f
+
+    def set_enabled(w, on):
+        if isinstance(w, ctk.CTkLabel):
+            w.configure(text_color=label_color if on else label_color_disabled)
+        else:
+            w.configure(state="normal" if on else "disabled")
+
+    def log_box(parent, height):
+        return ctk.CTkTextbox(parent, height=height, wrap="none", font=ctk.CTkFont(size=12))
+
+    def nbsp(s):  # Tk 只在空格处折行，中文长句会整段挤到下一行；换成不换行空格后按字折行
+        return s.replace(" ", " ")
+
+    def hint(parent, text=""):
+        lbl = ctk.CTkLabel(parent, text=nbsp(text), text_color=hint_color, wraplength=640, justify="left", anchor="w")
+        parent.bind("<Configure>", lambda ev: lbl.configure(
+            wraplength=max(300, int(ev.width / lbl._get_widget_scaling()) - 24)), add="+")
+        return lbl
+
+    # ---- 菜单：外观（跟随系统 / 浅色 / 深色）；帮助 → 检查更新 / 项目主页 ----
     import webbrowser
     var_auto_update = tk.BooleanVar(value=load_config().get("check_update_on_start", True))
+    var_appearance = tk.StringVar(value=appearance)
 
     def start_update_check(manual=False):
         q = queue.Queue()
@@ -2787,25 +2851,35 @@ def run_gui():
         cfg["check_update_on_start"] = bool(var_auto_update.get())
         save_config(cfg)
 
+    def set_appearance():
+        mode = var_appearance.get()
+        ctk.set_appearance_mode(mode)
+        cfg = load_config()
+        cfg["appearance"] = mode
+        save_config(cfg)
+
     menubar = tk.Menu(root)
+    m_look = tk.Menu(menubar, tearoff=0)
+    for mode in ("system", "light", "dark"):
+        m_look.add_radiobutton(label=appearance_label[mode], value=mode, variable=var_appearance, command=set_appearance)
+    menubar.add_cascade(label="外观", menu=m_look)
     m_help = tk.Menu(menubar, tearoff=0)
     m_help.add_command(label="检查更新", command=lambda: start_update_check(True))
     m_help.add_checkbutton(label="启动时自动检查更新", variable=var_auto_update, command=toggle_auto_update)
     m_help.add_separator()
     m_help.add_command(label="项目主页（GitHub）", command=lambda: webbrowser.open(HOMEPAGE_URL))
     m_help.add_command(label="关于", command=lambda: messagebox.showinfo(
-        APP_NAME, "%s v%s\n开源许可：MIT\n%s" % (APP_NAME, APP_VERSION, HOMEPAGE_URL)))
+        APP_NAME, "%s v%s\n开源许可：MIT\n界面库：CustomTkinter（MIT）\n%s" % (APP_NAME, APP_VERSION, HOMEPAGE_URL)))
     menubar.add_cascade(label="帮助", menu=m_help)
     root.config(menu=menubar)
     if var_auto_update.get():
         root.after(1500, start_update_check)
 
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, padx=8, pady=8)
+    nb = ctk.CTkTabview(root, anchor="nw")
+    nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     # ---- 页签 1：剔除定位 ----
-    tab = ttk.Frame(nb, padding=10)
-    nb.add(tab, text="剔除定位")
+    tab = nb.add("剔除定位")
     tab.columnconfigure(1, weight=1)
 
     v_src = tk.StringVar()
@@ -2831,54 +2905,52 @@ def run_gui():
             v_dst.set(os.path.normpath(d))
             state["dst_auto"] = False
 
-    ttk.Label(tab, text="输入目录：").grid(row=0, column=0, sticky="w", pady=3)
-    ttk.Entry(tab, textvariable=v_src).grid(row=0, column=1, sticky="ew", pady=3)
-    ttk.Button(tab, text="浏览…", command=pick_src).grid(row=0, column=2, padx=(6, 0), pady=3)
-    ttk.Label(tab, text="输出目录：").grid(row=1, column=0, sticky="w", pady=3)
-    e_dst = ttk.Entry(tab, textvariable=v_dst)
+    ctk.CTkLabel(tab, text="输入目录：").grid(row=0, column=0, sticky="w", pady=3)
+    ctk.CTkEntry(tab, textvariable=v_src).grid(row=0, column=1, sticky="ew", pady=3)
+    button(tab, "浏览…", pick_src).grid(row=0, column=2, padx=(6, 0), pady=3)
+    ctk.CTkLabel(tab, text="输出目录：").grid(row=1, column=0, sticky="w", pady=3)
+    e_dst = ctk.CTkEntry(tab, textvariable=v_dst)
     e_dst.grid(row=1, column=1, sticky="ew", pady=3)
     e_dst.bind("<Key>", lambda ev: state.__setitem__("dst_auto", False))
-    ttk.Button(tab, text="浏览…", command=pick_dst).grid(row=1, column=2, padx=(6, 0), pady=3)
+    button(tab, "浏览…", pick_dst).grid(row=1, column=2, padx=(6, 0), pady=3)
 
-    opts = ttk.Frame(tab)
+    opts = ctk.CTkFrame(tab, fg_color="transparent")
     opts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
-    ttk.Checkbutton(opts, text="包含子目录", variable=v_rec).pack(side="left")
-    ttk.Checkbutton(opts, text="同时剔除姿态（Gimbal*/Flight*）", variable=v_att).pack(side="left", padx=(16, 0))
-    ttk.Checkbutton(opts, text="原地抹除（直接改原照片，不复制）", variable=v_inplace).pack(side="left", padx=(16, 0))
-    ttk.Checkbutton(opts, text="保留定位备份（可还原）", variable=v_backup).pack(side="left", padx=(16, 0))
+    ctk.CTkCheckBox(opts, text="包含子目录", variable=v_rec).grid(row=0, column=0, sticky="w", pady=2)
+    ctk.CTkCheckBox(opts, text="同时剔除姿态（Gimbal*/Flight*）", variable=v_att).grid(
+        row=0, column=1, sticky="w", padx=(16, 0), pady=2)
+    ctk.CTkCheckBox(opts, text="原地抹除（直接改原照片，不复制）", variable=v_inplace, text_color=danger,
+                    fg_color=danger, hover_color=danger_hover).grid(row=1, column=0, sticky="w", pady=2)
+    ctk.CTkCheckBox(opts, text="保留定位备份（可还原）", variable=v_backup).grid(
+        row=1, column=1, sticky="w", padx=(16, 0), pady=2)
 
     def update_inplace_state(*_):
         enabled = not v_inplace.get()
         e_dst.configure(state="normal" if enabled else "disabled")
     v_inplace.trace_add("write", update_inplace_state)
 
-    ttk.Label(tab, foreground="#555", wraplength=int(700 * k),
-              text="说明：剔除 EXIF GPS 和 DJI XMP 位置字段（经纬度、高度、RTK、激光测距目标）；"
+    hint(tab, text="说明：剔除 EXIF GPS 和 DJI XMP 位置字段（经纬度、高度、RTK、激光测距目标）；"
                    "相机标定参数保留；图像数据逐字节不变；原地模式会先备份并要求输入目录名确认。").grid(
         row=3, column=0, columnspan=3, sticky="w", pady=(2, 6))
 
-    bar = ttk.Frame(tab)
+    bar = ctk.CTkFrame(tab, fg_color="transparent")
     bar.grid(row=4, column=0, columnspan=3, sticky="ew")
     bar.columnconfigure(0, weight=1)
-    pb = ttk.Progressbar(bar, mode="determinate")
+    pb = ctk.CTkProgressBar(bar, mode="determinate")
+    pb.set(0)
     pb.grid(row=0, column=0, sticky="ew")
-    lbl_prog = ttk.Label(bar, text="", width=12)
+    lbl_prog = ctk.CTkLabel(bar, text="", width=100)
     lbl_prog.grid(row=0, column=1, padx=6)
-    btn_start = ttk.Button(bar, text="开始")
+    btn_start = button(bar, "开始", primary=True)
     btn_start.grid(row=0, column=2)
-    btn_stop = ttk.Button(bar, text="中止", state="disabled")
+    btn_stop = button(bar, "中止", state="disabled")
     btn_stop.grid(row=0, column=3, padx=(6, 0))
-    btn_restore = ttk.Button(bar, text="从备份还原")
+    btn_restore = button(bar, "从备份还原", width=100)
     btn_restore.grid(row=0, column=4, padx=(6, 0))
 
-    logf = ttk.Frame(tab)
-    logf.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+    txt = log_box(tab, 220)
+    txt.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
     tab.rowconfigure(5, weight=1)
-    txt = tk.Text(logf, height=12, wrap="none")
-    sb = ttk.Scrollbar(logf, orient="vertical", command=txt.yview)
-    txt.configure(yscrollcommand=sb.set)
-    txt.pack(side="left", fill="both", expand=True)
-    sb.pack(side="right", fill="y")
 
     def append_log(s):
         txt.insert("end", s + "\n")
@@ -2892,7 +2964,7 @@ def run_gui():
                     append_log(val)
                 elif kind == "prog":
                     i, n = val
-                    pb.configure(maximum=max(n, 1), value=i)
+                    pb.set(i / max(n, 1))
                     lbl_prog.configure(text="%d / %d" % (i, n))
                 elif kind == "done":
                     btn_start.configure(state="normal")
@@ -2908,6 +2980,43 @@ def run_gui():
             pass
         root.after(100, poll)
 
+    def ask_inplace_confirm(count):
+        """原地抹除确认框（警示色）：须输入照片目录名；取消/关窗返回 None，确认返回输入的文字（同 askstring）。"""
+        dlg = ctk.CTkToplevel(root)
+        dlg.title(APP_NAME + " - 警告：不可恢复")
+        dlg.resizable(False, False)
+        dlg.transient(root)
+        result = {"text": None}
+        v_name = tk.StringVar()
+        ctk.CTkLabel(dlg, text="⚠ 警告：不可恢复！", text_color=danger,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=20, pady=(18, 4))
+        ctk.CTkLabel(dlg, text="会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。" % count, text_color=danger,
+                     font=ctk.CTkFont(weight="bold"), wraplength=440, justify="left").pack(anchor="w", padx=20, pady=4)
+        ctk.CTkLabel(dlg, text="请输入照片目录的名字（不是完整路径）以确认：").pack(anchor="w", padx=20, pady=(8, 2))
+        ent = ctk.CTkEntry(dlg, textvariable=v_name, width=440, border_color=danger)
+        ent.pack(padx=20, pady=(0, 12))
+
+        def ok():
+            result["text"] = v_name.get()
+            dlg.destroy()
+
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 18))
+        button(row, "取消", dlg.destroy).pack(side="right")
+        ctk.CTkButton(row, text="确认抹除", width=100, command=ok, fg_color=danger,
+                      hover_color=danger_hover).pack(side="right", padx=(0, 8))
+        ent.bind("<Return>", lambda ev: ok())
+        dlg.bind("<Escape>", lambda ev: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.after(150, lambda: (dlg.lift(), dlg.focus_force(), ent.focus_set()))
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        root.wait_window(dlg)
+        return result["text"]
+
     def start():
         src, dst = v_src.get().strip(), v_dst.get().strip()
         if not src:
@@ -2920,9 +3029,7 @@ def run_gui():
             if not v_backup.get():
                 if not messagebox.askyesno(APP_NAME + " - 警告：不可恢复", "已关闭定位备份，抹除后无法还原。仍要继续吗？"):
                     return
-            message = ("警告：不可恢复！\n会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。\n\n"
-                       "请输入照片目录的名字（不是完整路径）以确认：") % count
-            confirm = simpledialog.askstring(APP_NAME + " - 警告：不可恢复", message)
+            confirm = ask_inplace_confirm(count)
             if confirm is None:
                 return
             if confirm != Path(src).name:
@@ -2934,7 +3041,7 @@ def run_gui():
             err = check_dirs(src, dst)
             if err:
                 messagebox.showwarning(APP_NAME, err); return
-        txt.delete("1.0", "end"); pb.configure(value=0)
+        txt.delete("1.0", "end"); pb.set(0)
         btn_start.configure(state="disabled"); btn_stop.configure(state="normal")
         stop = threading.Event(); state["stop"] = stop
 
@@ -2975,8 +3082,7 @@ def run_gui():
     btn_restore.configure(command=restore_start)
 
     # ---- 页签 2：空三 ----
-    tab2 = ttk.Frame(nb, padding=10)
-    nb.add(tab2, text="空三")
+    tab2 = nb.add("空三")
     tab2.columnconfigure(1, weight=1)
     v_ms = tk.StringVar(value=find_metashape())
     v_pdir = tk.StringVar()
@@ -3007,49 +3113,44 @@ def run_gui():
 
     rows = (("Metashape 程序：", v_ms, pick_ms), ("照片目录：", v_pdir, pick_pdir), ("输出位置（可空）：", v_out, pick_out))
     for r, (label, var, cmd) in enumerate(rows):
-        ttk.Label(tab2, text=label).grid(row=r, column=0, sticky="w", pady=3)
-        ttk.Entry(tab2, textvariable=var).grid(row=r, column=1, sticky="ew", pady=3)
-        ttk.Button(tab2, text="浏览…", command=cmd).grid(row=r, column=2, padx=(6, 0), pady=3)
+        ctk.CTkLabel(tab2, text=label).grid(row=r, column=0, sticky="w", pady=3)
+        ctk.CTkEntry(tab2, textvariable=var).grid(row=r, column=1, sticky="ew", pady=3)
+        button(tab2, "浏览…", cmd).grid(row=r, column=2, padx=(6, 0), pady=3)
 
-    o1 = ttk.Frame(tab2)
+    o1 = ctk.CTkFrame(tab2, fg_color="transparent")
     o1.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 2))
-    ttk.Checkbutton(o1, text="包含子目录：每个含照片的子目录单独一个工程", variable=v_arec).pack(side="left")
-    ttk.Checkbutton(o1, text="照片带定位时先自动去定位", variable=v_auto).pack(side="left", padx=(16, 0))
-    o2 = ttk.Frame(tab2)
+    ctk.CTkCheckBox(o1, text="包含子目录：每个含照片的子目录单独一个工程", variable=v_arec).pack(side="left")
+    ctk.CTkCheckBox(o1, text="照片带定位时先自动去定位", variable=v_auto).pack(side="left", padx=(16, 0))
+    o2 = ctk.CTkFrame(tab2, fg_color="transparent")
     o2.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
-    ttk.Label(o2, text="精度：").pack(side="left")
-    ttk.Combobox(o2, textvariable=v_acc, values=("高", "中", "低"), width=4, state="readonly").pack(side="left")
-    ttk.Label(o2, text="    关键点上限：").pack(side="left")
-    ttk.Spinbox(o2, textvariable=v_kp, from_=1000, to=200000, increment=1000, width=8).pack(side="left")
-    ttk.Label(o2, text="    连接点上限：").pack(side="left")
-    ttk.Spinbox(o2, textvariable=v_tp, from_=0, to=100000, increment=1000, width=8).pack(side="left")
+    ctk.CTkLabel(o2, text="精度：").pack(side="left")
+    ctk.CTkOptionMenu(o2, variable=v_acc, values=["高", "中", "低"], width=70).pack(side="left")
+    ctk.CTkLabel(o2, text="    关键点上限：").pack(side="left")
+    spinbox(o2, v_kp, 1000, 200000, 1000, 80).pack(side="left")
+    ctk.CTkLabel(o2, text="    连接点上限：").pack(side="left")
+    spinbox(o2, v_tp, 0, 100000, 1000, 80).pack(side="left")
 
-    ttk.Label(tab2, foreground="#555", wraplength=int(700 * k),
-              text="说明：需要 Metashape Pro（标准版不能运行脚本）。输出到「<照片目录名>_空三」：工程 .psx、"
-                   "不带坐标系的 Blocks Exchange XML、空三报告.txt、Metashape 日志。结果是局部坐标、尺度任意。"
-                   "输出位置留空时放在照片目录旁边；照片在只读盘上时请指定输出位置。").grid(
+    hint(tab2, text="说明：需要 Metashape Pro（标准版不能运行脚本）。输出到「<照片目录名>_空三」：工程 .psx、"
+                    "不带坐标系的 Blocks Exchange XML、空三报告.txt、Metashape 日志。结果是局部坐标、尺度任意。"
+                    "输出位置留空时放在照片目录旁边；照片在只读盘上时请指定输出位置。").grid(
         row=5, column=0, columnspan=3, sticky="w", pady=(2, 6))
 
-    bar2 = ttk.Frame(tab2)
+    bar2 = ctk.CTkFrame(tab2, fg_color="transparent")
     bar2.grid(row=6, column=0, columnspan=3, sticky="ew")
     bar2.columnconfigure(0, weight=1)
-    pb2 = ttk.Progressbar(bar2, mode="determinate", maximum=1000)
+    pb2 = ctk.CTkProgressBar(bar2, mode="determinate")
+    pb2.set(0)
     pb2.grid(row=0, column=0, sticky="ew")
-    lbl2 = ttk.Label(bar2, text="", width=24)
+    lbl2 = ctk.CTkLabel(bar2, text="", width=190)
     lbl2.grid(row=0, column=1, padx=6)
-    btn2_start = ttk.Button(bar2, text="开始")
+    btn2_start = button(bar2, "开始", primary=True)
     btn2_start.grid(row=0, column=2)
-    btn2_stop = ttk.Button(bar2, text="取消", state="disabled")
+    btn2_stop = button(bar2, "取消", state="disabled")
     btn2_stop.grid(row=0, column=3, padx=(6, 0))
 
-    logf2 = ttk.Frame(tab2)
-    logf2.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+    txt2 = log_box(tab2, 180)
+    txt2.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
     tab2.rowconfigure(7, weight=1)
-    txt2 = tk.Text(logf2, height=10, wrap="none")
-    sb2 = ttk.Scrollbar(logf2, orient="vertical", command=txt2.yview)
-    txt2.configure(yscrollcommand=sb2.set)
-    txt2.pack(side="left", fill="both", expand=True)
-    sb2.pack(side="right", fill="y")
 
     def poll2():
         try:
@@ -3059,7 +3160,7 @@ def run_gui():
                     txt2.insert("end", val + "\n")
                     txt2.see("end")
                 elif kind == "prog":
-                    pb2.configure(value=int(val[0] * 1000))
+                    pb2.set(int(val[0] * 1000) / 1000)
                     lbl2.configure(text=val[1][:30])
                 elif kind == "done":
                     btn2_start.configure(state="normal")
@@ -3106,7 +3207,7 @@ def run_gui():
         save_config(cfg)
         acc = {"高": "high", "中": "medium", "低": "low"}[v_acc.get()]
         txt2.delete("1.0", "end")
-        pb2.configure(value=0)
+        pb2.set(0)
         lbl2.configure(text="")
         btn2_start.configure(state="disabled")
         btn2_stop.configure(state="normal")
@@ -3137,8 +3238,7 @@ def run_gui():
     root.after(200, poll2)
 
     # ---- 页签 3：控制点（D-16、D-17） ----
-    tab3 = ttk.Frame(nb, padding=10)
-    nb.add(tab3, text="控制点")
+    tab3 = nb.add("控制点")
     tab3.columnconfigure(1, weight=1)
     cfg3 = load_config()
     v3_mode = tk.StringVar(value="transfer")
@@ -3180,37 +3280,37 @@ def run_gui():
         ("输出位置（可空）：", v3_out, lambda: pick_dir(v3_out, "选择输出位置（留空 = 默认位置）"), None),
     )
     mode_widgets = []
-    mf = ttk.Frame(tab3)
+    mf = ctk.CTkFrame(tab3, fg_color="transparent")
     mf.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    ttk.Label(mf, text="模式：").pack(side="left")
-    ttk.Radiobutton(mf, text="迁移（新一期，零刺点）", value="transfer", variable=v3_mode).pack(side="left")
-    ttk.Radiobutton(mf, text="建参考期（新场地第一次）", value="init", variable=v3_mode).pack(side="left", padx=(16, 0))
+    ctk.CTkLabel(mf, text="模式：").pack(side="left")
+    ctk.CTkRadioButton(mf, text="迁移（新一期，零刺点）", value="transfer", variable=v3_mode).pack(side="left")
+    ctk.CTkRadioButton(mf, text="建参考期（新场地第一次）", value="init", variable=v3_mode).pack(side="left", padx=(16, 0))
     for r, (label, var, cmd, mode) in enumerate(rows3, 1):
-        w1 = ttk.Label(tab3, text=label)
+        w1 = ctk.CTkLabel(tab3, text=label)
         w1.grid(row=r, column=0, sticky="w", pady=2)
-        w2 = ttk.Entry(tab3, textvariable=var)
+        w2 = ctk.CTkEntry(tab3, textvariable=var)
         w2.grid(row=r, column=1, sticky="ew", pady=2)
-        w3 = ttk.Button(tab3, text="浏览…", command=cmd)
+        w3 = button(tab3, "浏览…", cmd)
         w3.grid(row=r, column=2, padx=(6, 0), pady=2)
         if mode:
             mode_widgets.append((mode, (w1, w2, w3)))
-    o3 = ttk.Frame(tab3)
+    o3 = ctk.CTkFrame(tab3, fg_color="transparent")
     o3.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 2))
-    ttk.Label(o3, text="控制点精度（米）：").pack(side="left")
-    ttk.Spinbox(o3, textvariable=v3_acc, from_=0.001, to=1.0, increment=0.005, width=7).pack(side="left")
-    cb_auto3 = ttk.Checkbutton(o3, text="照片带定位时先自动去定位", variable=v3_auto)
+    ctk.CTkLabel(o3, text="控制点精度（米）：").pack(side="left")
+    spinbox(o3, v3_acc, 0.001, 1.0, 0.005, 70).pack(side="left")
+    cb_auto3 = ctk.CTkCheckBox(o3, text="照片带定位时先自动去定位", variable=v3_auto)
     cb_auto3.pack(side="left", padx=(16, 0))
     mode_widgets.append(("transfer", (cb_auto3,)))
-    o3b = ttk.Frame(tab3)
+    o3b = ctk.CTkFrame(tab3, fg_color="transparent")
     o3b.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 2))
-    ttk.Label(o3b, text="排除的控制点（可空，如 1,2）：").pack(side="left")
-    ttk.Entry(o3b, textvariable=v3_excl, width=12).pack(side="left")
-    lbl3_shift = ttk.Label(o3b, text="细化挪动上限（px）：")
+    ctk.CTkLabel(o3b, text="排除的控制点（可空，如 1,2）：").pack(side="left")
+    ctk.CTkEntry(o3b, textvariable=v3_excl, width=100).pack(side="left")
+    lbl3_shift = ctk.CTkLabel(o3b, text="细化挪动上限（px）：")
     lbl3_shift.pack(side="left", padx=(16, 0))
-    sp3_shift = ttk.Spinbox(o3b, textvariable=v3_shift, from_=5, to=500, increment=5, width=6)
+    sp3_shift = spinbox(o3b, v3_shift, 5, 500, 5, 60)
     sp3_shift.pack(side="left")
-    mode_widgets.append(("transfer", (lbl3_shift, sp3_shift)))
-    lbl3_help = ttk.Label(tab3, foreground="#555", wraplength=int(700 * k))
+    mode_widgets.append(("transfer", (lbl3_shift,) + sp3_shift.parts))
+    lbl3_help = hint(tab3)
     lbl3_help.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2, 4))
     helps = {
         "transfer": "迁移：新一期照片和参考期一起匹配，自动放控制点、细化、平差、按 D-17 判定。参考期的照片要留在原位置。"
@@ -3224,31 +3324,27 @@ def run_gui():
         m = v3_mode.get()
         for mode, ws in mode_widgets:
             for w in ws:
-                w.configure(state="normal" if mode == m else "disabled")
-        lbl3_help.configure(text=helps[m])
+                set_enabled(w, mode == m)
+        lbl3_help.configure(text=nbsp(helps[m]))
 
     v3_mode.trace_add("write", on_mode)
     on_mode()
 
-    bar3 = ttk.Frame(tab3)
+    bar3 = ctk.CTkFrame(tab3, fg_color="transparent")
     bar3.grid(row=11, column=0, columnspan=3, sticky="ew")
     bar3.columnconfigure(0, weight=1)
-    pb3 = ttk.Progressbar(bar3, mode="determinate", maximum=1000)
+    pb3 = ctk.CTkProgressBar(bar3, mode="determinate")
+    pb3.set(0)
     pb3.grid(row=0, column=0, sticky="ew")
-    lbl3 = ttk.Label(bar3, text="", width=34)
+    lbl3 = ctk.CTkLabel(bar3, text="", width=230)
     lbl3.grid(row=0, column=1, padx=6)
-    btn3_start = ttk.Button(bar3, text="开始")
+    btn3_start = button(bar3, "开始", primary=True)
     btn3_start.grid(row=0, column=2)
-    btn3_stop = ttk.Button(bar3, text="取消", state="disabled")
+    btn3_stop = button(bar3, "取消", state="disabled")
     btn3_stop.grid(row=0, column=3, padx=(6, 0))
-    logf3 = ttk.Frame(tab3)
-    logf3.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    txt3 = log_box(tab3, 110)
+    txt3.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
     tab3.rowconfigure(12, weight=1)
-    txt3 = tk.Text(logf3, height=6, wrap="none")
-    sb3 = ttk.Scrollbar(logf3, orient="vertical", command=txt3.yview)
-    txt3.configure(yscrollcommand=sb3.set)
-    txt3.pack(side="left", fill="both", expand=True)
-    sb3.pack(side="right", fill="y")
 
     def poll3():
         try:
@@ -3258,7 +3354,7 @@ def run_gui():
                     txt3.insert("end", val + "\n")
                     txt3.see("end")
                 elif kind == "prog":
-                    pb3.configure(value=int(val[0] * 1000))
+                    pb3.set(int(val[0] * 1000) / 1000)
                     lbl3.configure(text=val[1][:30])
                 elif kind == "done":
                     btn3_start.configure(state="normal")
@@ -3332,7 +3428,7 @@ def run_gui():
             cfg["gcp_csv"] = csvp
         save_config(cfg)
         txt3.delete("1.0", "end")
-        pb3.configure(value=0)
+        pb3.set(0)
         lbl3.configure(text="")
         btn3_start.configure(state="disabled")
         btn3_stop.configure(state="normal")
@@ -3364,7 +3460,8 @@ def run_gui():
     btn3_stop.configure(command=stop3)
     root.after(200, poll3)
 
-    # 后续功能在这里加新页签：nb.add(ttk.Frame(nb), text="...")
+    # 后续功能在这里加新页签：tab = nb.add("...")
+    nb.set("剔除定位")
     root.after(100, poll)
     root.mainloop()
 

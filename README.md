@@ -159,16 +159,20 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
 
 ## 从源码运行和打包
 
-- 源码只有一个文件 `src/uav_photo_tool.py`，只用 Python 标准库（含 tkinter）。需要 Python 3.8 或更高版本。
+- 源码只有一个文件 `src/uav_photo_tool.py`。需要 Python 3.8 或更高版本（带 tkinter）。处理逻辑和命令行只用 Python 标准库，不装任何东西就能跑命令行；图形界面另外要装界面库 CustomTkinter（版本钉在 `requirements-gui.txt`）：
 
   ```powershell
+  python -m pip install -r requirements-gui.txt   # 只有界面需要
   python src/uav_photo_tool.py            # 启动界面
+  python src/uav_photo_tool.py --help     # 命令行，不需要 CustomTkinter
   ```
 
-- 打包成单文件 exe 需要先装 PyInstaller，输出在 `发布\` 目录：
+  界面支持浅色（默认）/ 深色 / 跟随系统，在菜单「外观」里切换，会记住。
+
+- 打包成单文件 exe 需要先装 PyInstaller 和 CustomTkinter（脚本开头会检查版本，并把 CustomTkinter 的主题资源打进 exe），输出在 `发布\` 目录；打好的 exe 拷到别的电脑直接用，不用装任何东西：
 
   ```powershell
-  python -m pip install pyinstaller
+  python -m pip install pyinstaller -r requirements-gui.txt
   pwsh -File scripts/build_exe.ps1 -Python python
   ```
 
@@ -178,8 +182,11 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
   python scripts/test_strip_gps.py <原片目录> <去定位输出目录> [--pixels]
   python scripts/test_align.py <空三输出目录> [--expect-aligned N] [--metashape 路径]
   python scripts/test_gcp.py <控制点输出目录> [--expect-aligned N] [--max-rms 0.02] [--metashape 路径]
+  python scripts/test_gui.py --mode invoke --out <结果目录> --data <测试照片副本根> --metashape 路径 --ref <参考期.psx> --appdata <临时目录>   # 界面：进程内点每个按钮
   ```
 
 ## 许可
 
 [MIT](LICENSE)。Metashape 是 Agisoft 的商业软件，本工具不包含它，只调用你电脑上已安装的版本。
+
+界面使用 [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)（Copyright (c) 2023 Tom Schimansky，MIT 许可），打包进 exe 的还有它的依赖 [darkdetect](https://github.com/albertosottile/darkdetect)（BSD-3-Clause）和 [packaging](https://github.com/pypa/packaging)（Apache-2.0 或 BSD-2-Clause）。
