@@ -84,6 +84,21 @@
 
 **导出的 XML** 写的是 ContextCapture 自己的局部米制坐标系（`Local:unit=meter`），区块和每个控制点都挂了坐标系，所以导入 CC 后单位显示为「米」。被排除的点在 XML 里标成检查点，CC 平差时不会用它们。「空三」页签的输出不受影响，仍然不带坐标系。
 
+**批量迁移**：`scripts/batch_gcp_transfer.ps1` 会把一个上级目录下的每一期照片挨个迁移，按目录名自动选参考期（名字带「梯田」用梯田参考期，带「植被」用植被参考期），最后出一张汇总表（CSV，Excel 可直接打开）。已有结果的期次自动跳过，中途停了重新运行会接着做。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\batch_gcp_transfer.ps1 `
+    -Tool <工具 exe> -Source <照片上级目录> -Out <输出目录> `
+    -RefTerrace <梯田参考期.psx> -RefVeg <植被参考期.psx> `
+    [-Skip 名字1,名字2] [-ExcludeTerrace 4] [-ExcludeVeg ...] [-Plan]
+```
+
+- `-Plan`：只列出每一期会用哪个参考期，不实际运行，建议先跑一次看看。
+- `-Skip`：不处理的期次，比如参考期本身。
+- `-ExcludeTerrace` / `-ExcludeVeg`：给梯田 / 植被的每一期统一排除某些控制点（改作检查点，误差照报）。
+- 想重跑某一期，删掉输出目录里这一期的 `<名>_去定位_控制点` 再运行即可，已去定位的照片会直接复用。
+- 每期都会在输出目录里存一份去定位后的照片，空间按原照片大小估算。
+
 ## 下载
 
 到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的 `uav-photo-tool_v*.exe`，双击运行即可。
