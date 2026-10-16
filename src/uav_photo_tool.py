@@ -4,6 +4,8 @@
 功能页签：
   1. 剔除定位：批量剔除 JPG 里的定位信息（EXIF GPS + DJI XMP 位置字段），另存到新目录。
   2. 空三：调用用户电脑上的 Metashape Pro 对齐照片，导出不带坐标系的 Blocks Exchange XML。
+  3. 控制点（D-16、D-17）：①迁移：新一期照片和已有控制点的参考期联合匹配，零刺点自动放点、细化、平差、判定；
+     ②建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 是否对调，再细化、平差、判定。
 
 规则：
   - 字节级原位等长改写，输出大小 = 原文件，SOS 之后的数据逐字节不变，不解码图像。
@@ -19,8 +21,11 @@
   python uav_photo_tool.py align <照片目录> [--metashape 路径] [--accuracy high|medium|low]
                                  [--recursive] [--no-auto-strip] [--out 输出位置]
                                  [--keypoints N] [--tiepoints N]
+  python uav_photo_tool.py gcp-transfer <照片目录> --ref <参考期.psx> [--out 输出位置] [--accuracy 0.01]
+  python uav_photo_tool.py gcp-init <空三.psx> --csv <控制点.csv> [--cc <CC导出.xml/.xmlz>] [--out 输出位置]
   python uav_photo_tool.py check-update
 不带参数启动图形界面（菜单「帮助」里可以检查更新）。
+退出码：0 成功（控制点＝自动通过）/ 1 有失败 / 2 拒绝执行 / 3 已取消 / 4 控制点需人工核对 / 10 有新版本（check-update）。
 """
 
 import argparse
@@ -39,10 +44,11 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -1073,6 +1079,1092 @@ def run_align(photo_dir, metashape, out_base=None, recursive=False, auto_strip=T
 
 
 # ---------------------------------------------------------------------------
+# 控制点：迁移 / 建参考期（D-16、D-17；T3 卡 🔒 节的定义和阈值写在下面的常量里，不要改）
+# ---------------------------------------------------------------------------
+
+GCP_SUFFIX = "_控制点"
+DEFAULT_GCP_ACCURACY = 0.01  # 米；控制点精度，也是判定阈值的基数
+GCP_PASS_FACTOR = 2.0        # D-17：三维误差 ≤ 2×控制点精度
+GCP_MAX_PX_RMS = 3.0         # D-17：像素 RMS ≤ 3
+GCP_MIN_PHOTOS = 3           # D-17：投影 ≥ 3 张
+GCP_REJECT_MIN_PX = 3.0      # 自动剔除：像素残差 > max(3 px, 3×该点中位数)
+GCP_REJECT_FACTOR = 3.0
+GCP_REJECT_ROUNDS = 2        # 最多 2 轮
+GCP_EDGE_MARGIN = 20         # 蓝旗离图像边缘 ≥ 20 px
+GCP_SWAP_RATIO = 10.0        # 「原样」「X/Y 对调」两种 RMS 相差 > 10 倍才判定对调
+# Blocks Exchange（CC 导出）的像素坐标 + 0.5 = Metashape 的像素坐标：Metashape 导出 Blocks Exchange 时
+# 主点写成 w/2 + cx - 0.5（本机 1.7.2 实测 cx=36.78908 → 2676.28908），两边约定差半个像素。
+CC_PIXEL_OFFSET = 0.5
+GCP_MODE_LABEL = {"transfer": "迁移（零刺点）", "init": "建参考期"}
+
+# 内嵌脚本：运行在 Metashape 自带的 Python 里（1.7 是 3.8），只许用 Python 3.8 语法。
+# 进度文件一行一个 JSON 事件；最后一行 {"ev": "done"} 是完成标记；{"ev": "error", "user": true} 是给用户看的错误。
+GCP_SCRIPT = r'''# -*- coding: utf-8 -*-
+# 由「无人机照片工具」生成（控制点页签），在 Metashape 内嵌的 Python 里运行。只用 Python 3.8 语法，兼容 Metashape 1.7 / 2.x。
+# transfer：参考期 + 新一期联合匹配 -> 只对齐新照片 -> 放蓝旗 -> 细化（参考期还在，以它的绿旗为模板）-> 去掉参考期
+#           -> 投影改固定 -> updateTransform -> optimizeCameras -> 自动剔除。
+# init：空三工程 + CSV（+ CC 刺点）-> 原样 / X/Y 对调各 updateTransform 一次取 RMS 小的 -> 放蓝旗 -> 细化
+#           -> 投影改固定 -> updateTransform -> optimizeCameras -> 自动剔除。
+import json
+import math
+import os
+import sys
+import time
+import traceback
+
+P = json.load(open(sys.argv[-1], "r", encoding="utf-8"))
+_pf = open(P["progress"], "a", encoding="utf-8")
+LOCAL_WKT = 'LOCAL_CS["Local Coordinates (m)",LOCAL_DATUM["Local Datum",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]]]'
+
+
+def ev(kind, **kw):
+    kw["ev"] = kind
+    kw["t"] = round(time.time(), 1)
+    _pf.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    _pf.flush()
+
+
+class Prog(object):
+    def __init__(self, stage):
+        self.stage = stage
+        self.last = -1
+
+    def __call__(self, p):
+        p = int(p)
+        if p != self.last:
+            self.last = p
+            ev("progress", stage=self.stage, pct=p)
+
+
+class UserError(Exception):
+    """给用户看的错误：说清楚是什么问题、怎么办。"""
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def to_local(chunk, v):
+    return chunk.crs.project(chunk.transform.matrix.mulp(v))
+
+
+def refs_off(cams):
+    # D-07：相机的位置、姿态参考全部关掉，只靠影像和控制点
+    for c in cams:
+        r = c.reference
+        r.enabled = False
+        if hasattr(r, "location_enabled"):
+            r.location_enabled = False
+        if hasattr(r, "rotation_enabled"):
+            r.rotation_enabled = False
+
+
+def n_tiepoints(chunk):
+    tp = getattr(chunk, "tie_points", None)  # 2.x
+    if tp is None:
+        tp = getattr(chunk, "point_cloud", None)  # 1.x
+    return len(tp.points) if tp is not None and tp.points is not None else 0
+
+
+def set_accuracy(chunk, markers):
+    acc = Metashape.Vector([P["accuracy"]] * 3)
+    chunk.marker_location_accuracy = acc
+    for m in markers:
+        m.reference.accuracy = acc
+        m.reference.enabled = True
+
+
+def residuals(m):
+    """[(相机, 像素残差或 None)]，只算已对齐相机上的投影。"""
+    out = []
+    pos = m.position
+    for c, pr in m.projections.items():
+        if c.transform is None:
+            continue
+        q = c.project(pos) if pos is not None else None
+        out.append((c, (q - pr.coord).norm() if q is not None else None))
+    return out
+
+
+def marker_rows(chunk, markers, stats=None):
+    rows = []
+    for m in markers:
+        res = residuals(m)
+        px = [e for _, e in res if e is not None]
+        row = {"name": m.label, "n": len(res), "d": None, "d3": None,
+               "px_rms": math.sqrt(sum(e * e for e in px) / len(px)) if px else None,
+               "px_max": max(px) if px else None}
+        if m.position is not None and m.reference.location is not None and chunk.transform.matrix is not None:
+            d = to_local(chunk, m.position) - m.reference.location
+            row["d"] = [d.x, d.y, d.z]
+            row["d3"] = d.norm()
+        if stats is not None:
+            row.update(stats.get(m.label, {}))
+        rows.append(row)
+    return rows
+
+
+def rms3d(rows):
+    v = [r["d3"] for r in rows if r["d3"] is not None]
+    return math.sqrt(sum(x * x for x in v) / len(v)) if v else None
+
+
+def place_blue(cams, markers, stats):
+    """放蓝旗（未固定投影）：投影在相机前方、离图像边缘 >= edge_margin 才放；已有投影的照片不动。
+    返回 {点名: {相机 key: (x, y)}}，细化后用来算挪动量。"""
+    margin = P["edge_margin"]
+    pred = {}
+    for m in markers:
+        pred[m.label] = {}
+        if m.position is None:
+            continue
+        for c in cams:
+            if m.projections[c] is not None:
+                continue
+            if c.transform.inv().mulp(m.position).z <= 0:
+                continue
+            q = c.project(m.position)
+            if q is None:
+                continue
+            w, h = c.sensor.width, c.sensor.height
+            if not (margin <= q.x <= w - margin and margin <= q.y <= h - margin):
+                continue
+            m.projections[c] = Metashape.Marker.Projection(q, False)
+            pred[m.label][c.key] = (q.x, q.y)
+        stats[m.label]["placed"] = len(pred[m.label])
+    return pred
+
+
+def refine(chunk, markers, pred, stats):
+    use = [m for m in markers if pred.get(m.label)]
+    if use:
+        chunk.refineMarkers(markers=use, progress=Prog("refine"))
+    by_key = dict((c.key, c) for c in chunk.cameras)
+    for m in markers:
+        shifts = []
+        removed = 0
+        for k, xy in pred.get(m.label, {}).items():
+            pr = m.projections[by_key[k]]
+            if pr is None:
+                removed += 1
+            else:
+                shifts.append(math.hypot(pr.coord.x - xy[0], pr.coord.y - xy[1]))
+        s = stats[m.label]
+        s["refine_removed"] = removed
+        s["refine_kept"] = len(shifts)
+        s["refine_median_px"] = median(shifts)
+        s["refine_max_px"] = max(shifts) if shifts else None
+
+
+def pin_all(markers):
+    for m in markers:
+        for c, pr in list(m.projections.items()):
+            if not pr.pinned:
+                m.projections[c] = Metashape.Marker.Projection(pr.coord, True)
+
+
+def optimize(chunk):
+    chunk.updateTransform()
+    kw = dict(fit_f=True, fit_cx=True, fit_cy=True, fit_b1=False, fit_b2=False, fit_k1=True, fit_k2=True,
+              fit_k3=True, fit_k4=False, fit_p1=True, fit_p2=True)
+    try:
+        chunk.optimizeCameras(fit_corrections=False, adaptive_fitting=False, tiepoint_covariance=False,
+                              progress=Prog("adjust"), **kw)
+    except TypeError:
+        chunk.optimizeCameras(**kw)
+
+
+def reject(chunk, markers, stats):
+    """每个控制点里像素残差 > max(3 px, 3×该点中位数) 的投影删掉后重新优化，最多 2 轮。"""
+    for rnd in range(P["reject_rounds"]):
+        removed = 0
+        detail = {}
+        for m in markers:
+            res = [(c, e) for c, e in residuals(m) if e is not None]
+            if not res:
+                continue
+            thr = max(P["reject_min_px"], P["reject_factor"] * median([e for _, e in res]))
+            for c, e in res:
+                if e > thr:
+                    m.projections[c] = None
+                    stats[m.label]["rejected"] += 1
+                    detail[m.label] = detail.get(m.label, 0) + 1
+                    removed += 1
+        ev("reject", round=rnd + 1, removed=removed, detail=detail)
+        if not removed:
+            break
+        optimize(chunk)
+
+
+def finish(doc):
+    ev("stage", stage="save")
+    doc.save()
+    # 只读重开工程再导出；未对齐的相机从导出里去掉（D-12）
+    ev("stage", stage="export")
+    try:
+        doc2 = Metashape.Document()
+        doc2.open(P["psx"], read_only=True)
+        chunk = doc2.chunk
+    except TypeError:
+        chunk = doc.chunk
+    drop = [c for c in chunk.cameras if c.transform is None]
+    if drop:
+        chunk.remove(drop)
+    fmt = getattr(Metashape, "CamerasFormatBlocksExchange", None)
+    if fmt is None:
+        fmt = Metashape.CamerasFormat.CamerasFormatBlocksExchange
+    try:
+        chunk.exportCameras(P["xml_raw"], format=fmt, save_markers=True)
+    except TypeError:
+        chunk.exportCameras(P["xml_raw"], format=fmt)
+    ev("exported", path=P["xml_raw"], cameras=len(chunk.cameras), dropped=len(drop))
+
+
+def open_copy(src, what):
+    """只读打开原工程，马上另存为输出工程，之后只改副本。
+    chunk 必须在另存之后再取：1.7.2 里另存前拿到的 chunk 对象另存后就脱离文档了，改了也存不进去。"""
+    doc = Metashape.Document()
+    try:
+        doc.open(src, read_only=True)
+    except TypeError:
+        raise UserError("这个版本的 Metashape 不能只读打开工程；为了不改动%s，停止" % what)
+    except Exception as ex:
+        raise UserError("打不开%s：%s（%s）" % (what, src, ex))
+    doc.save(P["psx"])
+    ch = doc.chunk
+    if ch is None:
+        raise UserError("%s里没有 chunk：%s" % (what, src))
+    if len(doc.chunks) > 1:
+        ev("warn", msg="%s有 %d 个 chunk，只用当前激活的「%s」" % (what, len(doc.chunks), ch.label))
+    return doc, ch
+
+
+def run_transfer():
+    ev("stage", stage="open")
+    doc, ch = open_copy(P["ref"], "参考期工程")
+    if ch.crs is None or "LOCAL_CS" not in ch.crs.wkt:
+        raise UserError("参考期工程的坐标系不是 Local（米），请用「建参考期」做出来的工程。现在是：%s"
+                        % (ch.crs.name if ch.crs is not None else "无"))
+    if ch.transform.matrix is None:
+        raise UserError("参考期工程还没有用控制点定过坐标（chunk 没有变换），请先用「建参考期」处理")
+    old = list(ch.cameras)
+    old_aligned = [c for c in old if c.transform is not None]
+    markers = [m for m in ch.markers if m.reference.location is not None]
+    if len(markers) < 3:
+        raise UserError("参考期工程里带坐标的控制点只有 %d 个，至少要 3 个" % len(markers))
+    if len(old_aligned) < 2:
+        raise UserError("参考期工程里已对齐的照片只有 %d 张" % len(old_aligned))
+    missing = [c.photo.path for c in old_aligned if not os.path.isfile(c.photo.path)]
+    if missing:
+        raise UserError("参考期工程的照片有 %d 张找不到（如 %s）。联合匹配要用参考期照片，请让它们留在工程记录的位置"
+                        % (len(missing), missing[0]))
+    old_labels = set(c.label for c in old)
+    same = [p for p in P["photos"] if os.path.splitext(os.path.basename(p))[0] in old_labels]
+    if same:
+        raise UserError("照片目录里有 %d 张和参考期照片同名（如 %s），是不是选成了参考期自己的照片？"
+                        % (len(same), os.path.basename(same[0])))
+    nopos = [m.label for m in markers if m.position is None]
+    if nopos:
+        ev("warn", msg="参考期里这些控制点没有刺点位置，放不了蓝旗：%s" % "、".join(nopos))
+    ev("ref", cameras=len(old), aligned=len(old_aligned), markers=[m.label for m in markers])
+    before = dict((c.key, to_local(ch, c.center)) for c in old_aligned)
+
+    ev("stage", stage="add")
+    old_keys = set(c.key for c in old)
+    ch.addPhotos(P["photos"])
+    new = [c for c in ch.cameras if c.key not in old_keys]
+    if len(new) != len(P["photos"]):
+        raise RuntimeError("addPhotos added %d cameras, expected %d" % (len(new), len(P["photos"])))
+    refs_off(ch.cameras)
+
+    # 联合匹配：参考期工程一般没存特征点，必须 reset_matches=True 重新匹配全部照片
+    ev("stage", stage="match")
+    t0 = time.time()
+    ch.matchPhotos(downscale=P["downscale"], generic_preselection=True, reference_preselection=False,
+                   keypoint_limit=P["keypoint_limit"], tiepoint_limit=P["tiepoint_limit"], reset_matches=True,
+                   progress=Prog("match"))
+    t_match = time.time() - t0
+    ev("stage", stage="align")
+    t1 = time.time()
+    ch.alignCameras(cameras=new, reset_alignment=False, progress=Prog("align"))
+    t_align = time.time() - t1
+    aligned = [c for c in new if c.transform is not None]
+    moved = [(to_local(ch, c.center) - before[c.key]).norm() for c in old_aligned if c.transform is not None]
+    lost = [c.label for c in old_aligned if c.transform is None]
+    ev("aligned", aligned=len(aligned), total=len(new), unaligned=[os.path.basename(c.photo.path) for c in new
+                                                                    if c.transform is None],
+       ref_moved_max=max(moved) if moved else None, ref_lost=lost, tiepoints=n_tiepoints(ch),
+       secs_match=round(t_match, 1), secs_align=round(t_align, 1))
+    if not aligned:
+        raise UserError("新一期照片一张都没有对齐到参考期上：场景变化太大，或照片不是同一场地")
+
+    stats = dict((m.label, {"placed": 0, "rejected": 0}) for m in markers)
+    ev("stage", stage="place")
+    pred = place_blue(aligned, markers, stats)
+    ev("placed", counts=dict((k, len(v)) for k, v in pred.items()))
+    # 细化必须在去掉参考期相机之前做：refineMarkers 以参考期的绿旗为模板
+    ev("stage", stage="refine")
+    refine(ch, markers, pred, stats)
+    ev("refined", stats=stats)
+
+    ev("stage", stage="adjust")
+    ch.remove(old)
+    used = set(c.sensor.key for c in ch.cameras)
+    orphan = [s for s in ch.sensors if s.key not in used]
+    if orphan:
+        try:
+            ch.remove(orphan)
+        except Exception:
+            pass
+    pin_all(markers)
+    set_accuracy(ch, markers)
+    refs_off(ch.cameras)
+    optimize(ch)
+    ev("stage", stage="reject")
+    reject(ch, markers, stats)
+    rows = marker_rows(ch, markers, stats)
+    ev("rows", rows=rows, rms3d=rms3d(rows), cameras=len(ch.cameras), tiepoints=n_tiepoints(ch))
+    finish(doc)
+
+
+def run_init():
+    ev("stage", stage="open")
+    doc, ch = open_copy(P["psx_in"], "空三工程")
+    cams = list(ch.cameras)
+    aligned = [c for c in cams if c.transform is not None]
+    ev("aligned", aligned=len(aligned), total=len(cams),
+       unaligned=[os.path.basename(c.photo.path) for c in cams if c.transform is None], tiepoints=n_tiepoints(ch))
+    if len(aligned) < 2:
+        raise UserError("空三工程里已对齐的照片只有 %d 张，请先在「空三」页签跑通" % len(aligned))
+    ch.crs = Metashape.CoordinateSystem(LOCAL_WKT)
+    refs_off(cams)
+    csv = P["csv"]
+
+    if P["cc"] is not None:
+        if len(ch.markers):
+            ev("warn", msg="空三工程里原有 %d 个标记点，按 CC 刺点重建（原工程不动）" % len(ch.markers))
+            ch.remove(list(ch.markers))
+        by_label = dict((c.label, c) for c in cams)
+        off = P["cc_offset"]
+        n_ok = 0
+        miss = []
+        for name, meas in P["cc"].items():
+            m = ch.addMarker()
+            m.label = name
+            for lab, x, y in meas:
+                c = by_label.get(lab)
+                if c is None or c.transform is None:
+                    miss.append(lab)
+                    continue
+                m.projections[c] = Metashape.Marker.Projection(Metashape.Vector([x + off, y + off]), True)
+                n_ok += 1
+        ev("cc_loaded", markers=len(P["cc"]), measurements=n_ok, missing=miss, offset=off)
+
+    markers = [m for m in ch.markers if m.label in csv]
+    labels = set(m.label for m in markers)
+    stats = {}
+    for m in markers:
+        pins = sum(1 for c, pr in m.projections.items() if pr.pinned and c.transform is not None)
+        stats[m.label] = {"pins": pins, "placed": 0, "rejected": 0}
+    ok = [m.label for m in markers if stats[m.label]["pins"] >= 2]
+    ev("markers", used=[m.label for m in markers], ok=ok, csv_unused=[k for k in csv if k not in labels],
+       extra=[m.label for m in ch.markers if m.label not in csv])
+    if len(ok) < 3:
+        raise UserError("能用的控制点只有 %d 个（%s）：至少要 3 个点、每个点在已对齐照片上刺 >= 2 张。"
+                        "没有 CC 刺点时，请先在 Metashape 里刺好、保存，再用本工具" % (len(ok), "、".join(ok) or "无"))
+    set_accuracy(ch, markers)
+
+    # X/Y 判断：原样、对调各做一次 updateTransform，取 RMS 小的
+    ev("stage", stage="swap")
+    var = {}
+    for key in ("asis", "swap"):
+        for m in markers:
+            x, y, z = csv[m.label]
+            m.reference.location = Metashape.Vector([y, x, z] if key == "swap" else [x, y, z])
+        ch.updateTransform()
+        rows = marker_rows(ch, markers)
+        var[key] = {"rms3d": rms3d(rows), "rows": rows}
+    a, b = var["asis"]["rms3d"], var["swap"]["rms3d"]
+    use_swap = b < a
+    ratio = max(a, b) / max(min(a, b), 1e-12)
+    for m in markers:
+        x, y, z = csv[m.label]
+        m.reference.location = Metashape.Vector([y, x, z] if use_swap else [x, y, z])
+    ch.updateTransform()
+    dx, dy = [], []
+    for m in markers:
+        if m.position is None:
+            continue
+        for c, pr in m.projections.items():
+            q = c.project(m.position) if c.transform is not None else None
+            if pr.pinned and q is not None:
+                dx.append(q.x - pr.coord.x)
+                dy.append(q.y - pr.coord.y)
+    ev("swap", asis=var["asis"], swap=var["swap"], use_swap=use_swap, ratio=ratio,
+       confident=ratio > P["swap_ratio"], pin_mean_dx=sum(dx) / len(dx) if dx else None,
+       pin_mean_dy=sum(dy) / len(dy) if dy else None, pin_n=len(dx))
+
+    ev("stage", stage="place")
+    pred = place_blue(aligned, markers, stats)
+    ev("placed", counts=dict((k, len(v)) for k, v in pred.items()))
+    ev("stage", stage="refine")
+    refine(ch, markers, pred, stats)
+    ev("refined", stats=stats)
+    ev("stage", stage="adjust")
+    pin_all(markers)
+    optimize(ch)
+    ev("stage", stage="reject")
+    reject(ch, markers, stats)
+    rows = marker_rows(ch, markers, stats)
+    ev("rows", rows=rows, rms3d=rms3d(rows), cameras=len(ch.cameras), tiepoints=n_tiepoints(ch))
+    finish(doc)
+
+
+app = None
+try:
+    try:
+        import Metashape
+    except ImportError:
+        import PhotoScan as Metashape
+    app = Metashape.app
+    ev("start", version=str(app.version), python=sys.version.split()[0])
+    print("Metashape version: %s" % app.version)
+    if not hasattr(Metashape.Chunk, "refineMarkers"):
+        raise UserError("这个版本的 Metashape 没有「细化标记点」（refineMarkers），请用 1.6 及以上的 Pro 版")
+    if P["mode"] == "transfer":
+        run_transfer()
+    else:
+        run_init()
+    ev("done")
+except UserError as ex:
+    ev("error", msg=str(ex), user=True)
+except Exception:
+    ev("error", msg=traceback.format_exc())
+finally:
+    _pf.close()
+    if app is not None:
+        app.quit()
+'''
+
+_GCP_SPAN = {
+    "transfer": {"open": (0, 2, "打开参考期"), "add": (2, 3, "导入照片"), "match": (3, 65, "联合匹配"),
+                 "align": (65, 85, "对齐新照片"), "place": (85, 86, "放蓝旗"), "refine": (86, 93, "细化标记点"),
+                 "adjust": (93, 96, "平差"), "reject": (96, 97, "自动剔除"), "save": (97, 98, "保存工程"),
+                 "export": (98, 99, "导出 XML"), "fix": (99, 100, "修正 XML")},
+    "init": {"open": (0, 3, "打开空三工程"), "swap": (3, 8, "判断 X/Y"), "place": (8, 10, "放蓝旗"),
+             "refine": (10, 70, "细化标记点"), "adjust": (70, 88, "平差"), "reject": (88, 94, "自动剔除"),
+             "save": (94, 96, "保存工程"), "export": (96, 98, "导出 XML"), "fix": (98, 100, "修正 XML")},
+}
+
+
+def _run_ms_script(metashape, script_text, params, tmp, on_event, stop_event=None, startup_timeout=STARTUP_TIMEOUT,
+                   stall_timeout=STALL_TIMEOUT, exit_timeout=EXIT_TIMEOUT):
+    """把内嵌脚本和参数写进 tmp，子进程跑 `metashape -r 脚本 参数.json`；进度文件里每来一个事件就交给 on_event(e)。
+    返回 (事件列表, 退出码)。取消抛 AlignCancelled；启动超时、卡死、完成后不退出抛 RuntimeError（Metashape 已被结束）。
+    控制台输出在 tmp/console.txt。"""
+    tmp = Path(tmp)
+    script = tmp / "metashape_script.py"
+    pfile = tmp / "params.json"
+    prog_path = tmp / "progress.jsonl"
+    script.write_text(script_text, encoding="utf-8")
+    pfile.write_text(json.dumps(dict(params, progress=str(prog_path)), ensure_ascii=False, indent=1), encoding="utf-8")
+    prog_path.write_text("", encoding="utf-8")
+    events = []
+    t_start = time.time()
+    with open(tmp / "console.txt", "wb") as fcon:
+        proc = subprocess.Popen([metashape, "-r", str(script), str(pfile)], stdin=subprocess.DEVNULL,
+                                stdout=fcon, stderr=subprocess.STDOUT, cwd=str(tmp),
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            offset, partial, stage = 0, "", ""
+            started, done_at, last_change = False, None, time.time()
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    _kill_tree(proc)
+                    raise AlignCancelled()
+                with open(prog_path, "r", encoding="utf-8") as fp:
+                    fp.seek(offset)
+                    data = fp.read()
+                    offset = fp.tell()
+                if data:
+                    last_change = time.time()
+                    partial += data
+                    lines = partial.split("\n")
+                    partial = lines.pop()
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        events.append(e)
+                        kind = e.get("ev")
+                        if kind == "start":
+                            started = True
+                        elif kind == "stage":
+                            stage = e["stage"]
+                        elif kind == "done":
+                            done_at = time.time()
+                        on_event(e)
+                if proc.poll() is not None:
+                    if data == "" and offset == os.path.getsize(prog_path):
+                        break
+                    continue
+                now = time.time()
+                if not started and now - t_start > startup_timeout:
+                    _kill_tree(proc)
+                    raise RuntimeError("Metashape 启动 %d 秒后还没开始执行脚本，已强制结束。可能原因：弹出了许可证/激活/更新对话框，"
+                                       "或者这是标准版（标准版不能运行脚本）。请先手动打开 Metashape 确认能正常进入主界面。" % startup_timeout)
+                if done_at is None and now - last_change > stall_timeout:
+                    _kill_tree(proc)
+                    raise RuntimeError("Metashape 已经 %d 秒没有进度（停在「%s」），判为卡死，已强制结束。" % (stall_timeout, stage))
+                if done_at is not None and now - done_at > exit_timeout:
+                    _kill_tree(proc)
+                    raise RuntimeError("Metashape 完成后 %d 秒还没退出（可能卡在对话框），已强制结束。" % exit_timeout)
+                time.sleep(0.5)
+        except BaseException:
+            if proc.poll() is None:
+                _kill_tree(proc)
+            raise
+    return events, proc.returncode
+
+
+def read_gcp_csv(path):
+    """读控制点 CSV：每行 点名,X,Y,Z（米，局部坐标）；可以有表头（表头里写了 X/Y/Z 就按表头取列）；
+    逗号、制表符、分号或空格分隔；UTF-8 或 GBK。返回 {点名: (x, y, z)}（文件顺序）；格式不对抛 ValueError。"""
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError("控制点 CSV 不存在：%s" % p)
+    raw = p.read_bytes()
+    text = None
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            pass
+    if text is None:
+        raise ValueError("控制点 CSV 既不是 UTF-8 也不是 GBK 编码：%s" % p)
+    cols = (1, 2, 3)
+    pts = {}
+    first = True
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = re.split(r"\s*[,\t;，]\s*", s) if re.search(r"[,\t;，]", s) else s.split()
+        parts = [x.strip().strip('"').strip() for x in parts]
+        if first:
+            first = False
+            low = [x.lower() for x in parts]
+            if not _is_number(parts[1] if len(parts) > 1 else ""):
+                if all(k in low for k in ("x", "y", "z")):
+                    cols = (low.index("x"), low.index("y"), low.index("z"))
+                continue  # 表头
+        if len(parts) <= max(cols):
+            raise ValueError("控制点 CSV 第 %d 行只有 %d 列，要求「点名,X,Y,Z」：%s" % (i, len(parts), s))
+        try:
+            xyz = tuple(float(parts[k]) for k in cols)
+        except ValueError:
+            raise ValueError("控制点 CSV 第 %d 行的坐标不是数字：%s" % (i, s))
+        name = parts[0]
+        if not name:
+            raise ValueError("控制点 CSV 第 %d 行没有点名：%s" % (i, s))
+        if name in pts:
+            raise ValueError("控制点 CSV 里点名「%s」重复（第 %d 行）" % (name, i))
+        pts[name] = xyz
+    if len(pts) < 3:
+        raise ValueError("控制点 CSV 里只有 %d 个点，至少要 3 个：%s" % (len(pts), p))
+    return pts
+
+
+def _is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def read_cc_marks(path):
+    """读 ContextCapture 导出的 Blocks Exchange（.xml，或 zip 打包的 .xmlz）里的控制点刺点。
+    PhotoId 经 <Photo><Id> 换成照片文件名（不带扩展名，= Metashape 相机名）。像素坐标原样返回（CC 约定），
+    换算（+CC_PIXEL_OFFSET）在 Metashape 脚本里做。返回 ({点名: [(相机名, x, y), ...]}, 信息 dict)。"""
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError("CC 刺点文件不存在：%s" % p)
+    zf = None
+    try:
+        if zipfile.is_zipfile(p):
+            zf = zipfile.ZipFile(p)
+            names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+            if not names:
+                raise ValueError("CC 刺点文件是压缩包，但里面没有 .xml：%s" % p)
+            fp = zf.open(names[0])
+        else:
+            fp = open(p, "rb")
+        photos, cps = {}, []
+        with fp:
+            for _, el in ET.iterparse(fp, events=("end",)):
+                if el.tag == "Photo":
+                    pid, ip = el.findtext("Id"), el.findtext("ImagePath") or ""
+                    if pid is not None:
+                        photos[pid.strip()] = os.path.splitext(re.split(r"[\\/]", ip.strip())[-1])[0]
+                    el.clear()
+                elif el.tag == "TiePoint":
+                    el.clear()
+                elif el.tag == "ControlPoint":
+                    meas = [((m.findtext("PhotoId") or "").strip(), float(m.findtext("x")), float(m.findtext("y")))
+                            for m in el.iter("Measurement")]
+                    cps.append(((el.findtext("Name") or "").strip(), meas))
+                    el.clear()
+    except (ET.ParseError, TypeError, ValueError, zipfile.BadZipFile) as ex:
+        if isinstance(ex, ValueError) and str(ex).startswith("CC 刺点文件"):
+            raise
+        raise ValueError("CC 刺点文件解析失败（要 ContextCapture 导出的 Blocks Exchange .xml/.xmlz）：%s（%s）" % (p, ex))
+    finally:
+        if zf is not None:
+            zf.close()
+    marks, unknown = {}, 0
+    for name, meas in cps:
+        lst = marks.setdefault(name, [])
+        for pid, x, y in meas:
+            if pid in photos:
+                lst.append((photos[pid], x, y))
+            else:
+                unknown += 1
+    n = sum(len(v) for v in marks.values())
+    if not n:
+        raise ValueError("CC 刺点文件里没有控制点刺点（<ControlPoint> 下的 <Measurement>）：%s" % p)
+    return marks, {"photos": len(photos), "points": len(marks), "measurements": n, "unknown_photo": unknown}
+
+
+def judge_gcp(rows, accuracy):
+    """D-17：每个控制点 三维误差 ≤ 2×精度 且 像素 RMS ≤ 3 且 投影 ≥ 3 张 → 通过；全部通过才算自动通过。
+    给 rows 每项加 "ok"、"why"；返回 (是否自动通过, [(点名, [原因…]), …])。"""
+    bad = []
+    lim = GCP_PASS_FACTOR * accuracy
+    for r in rows:
+        why = []
+        if r.get("d3") is None:
+            why.append("算不出三维位置（有效投影不足 2 张）")
+        elif r["d3"] > lim:
+            why.append("三维误差 %.1f mm > %.1f mm" % (r["d3"] * 1000, lim * 1000))
+        if r.get("px_rms") is None:
+            why.append("没有像素残差")
+        elif r["px_rms"] > GCP_MAX_PX_RMS:
+            why.append("像素 RMS %.2f > %g" % (r["px_rms"], GCP_MAX_PX_RMS))
+        if r.get("n", 0) < GCP_MIN_PHOTOS:
+            why.append("只有 %d 张照片 < %d" % (r.get("n", 0), GCP_MIN_PHOTOS))
+        r["ok"] = not why
+        r["why"] = why
+        if why:
+            bad.append((r["name"], why))
+    return bool(rows) and not bad, bad
+
+
+def count_bx_control_points(xml_path):
+    """数 Blocks Exchange 里的 <ControlPoint> 和其下 <Measurement>。"""
+    n_cp = n_meas = 0
+    stack = []
+    for event, el in ET.iterparse(str(xml_path), events=("start", "end")):
+        if event == "start":
+            stack.append(el.tag)
+            continue
+        stack.pop()
+        if el.tag == "ControlPoint":
+            n_cp += 1
+            el.clear()
+        elif el.tag == "Measurement" and "ControlPoint" in stack:
+            n_meas += 1
+        elif el.tag in ("Photo", "TiePoint"):
+            el.clear()
+    return n_cp, n_meas
+
+
+def _check_gcp_accuracy(accuracy):
+    try:
+        acc = float(accuracy)
+    except (TypeError, ValueError):
+        raise ValueError("控制点精度要填数字（米），例如 0.01")
+    if not 0 < acc < 10:
+        raise ValueError("控制点精度要大于 0（单位米，例如 0.01）")
+    return acc
+
+
+def _check_psx(psx, what):
+    p = Path(os.path.abspath(psx)) if psx else None
+    if p is None or not p.is_file():
+        raise ValueError("%s不存在：%s" % (what, psx))
+    if p.suffix.lower() != ".psx":
+        raise ValueError("%s要选 Metashape 工程 .psx：%s" % (what, p))
+    if not (p.parent / (p.stem + ".files")).is_dir():
+        raise ValueError("%s不完整：旁边缺 %s.files 目录：%s" % (what, p.stem, p))
+    return p
+
+
+def _gcp_result(mode, out_dir, metashape, accuracy, **kw):
+    res = {"mode": mode, "status": "失败", "reason": "", "out_dir": str(out_dir), "metashape": metashape,
+           "accuracy": accuracy, "version": "", "returncode": None, "done": False, "start": datetime.datetime.now(),
+           "secs": None, "note": "", "warnings": [], "photos_dir": "", "ref": "", "psx_in": "", "csv": "", "cc": "",
+           "total": None, "aligned": None, "unaligned": [], "tiepoints": None, "ref_moved_max": None, "ref_lost": [],
+           "placed": {}, "swap": None, "cc_info": None, "cc_loaded": None, "markers_info": None, "rows": [],
+           "rms3d": None, "rejects": [], "bad": [], "xml": "", "xml_info": None, "xml_cp": None, "fix_stats": None}
+    res.update(kw)
+    return res
+
+
+def _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts):
+    """跑一次控制点脚本并收尾：修正 XML、检查、判定、写报告。返回 res（status：自动通过/需人工核对/失败/已取消）。"""
+    mode = res["mode"]
+    out_dir = Path(res["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    psx = out_dir / (name + ".psx")
+    xml_final = out_dir / (name + "_BlocksExchange.xml")
+    xml_raw = out_dir / (name + "_BlocksExchange.未修正.xml.tmp")
+    params = dict(params, mode=mode, psx=str(psx), xml_raw=str(xml_raw), accuracy=res["accuracy"],
+                  edge_margin=GCP_EDGE_MARGIN, reject_min_px=GCP_REJECT_MIN_PX, reject_factor=GCP_REJECT_FACTOR,
+                  reject_rounds=GCP_REJECT_ROUNDS, swap_ratio=GCP_SWAP_RATIO)
+    span = _GCP_SPAN[mode]
+    t_start = time.time()
+    tmp = Path(tempfile.mkdtemp(prefix="uav_gcp_"))
+    events = []
+
+    def on_event(e):
+        kind = e.get("ev")
+        if kind == "start":
+            res["version"] = e.get("version", "")
+            log("Metashape 版本 %s（内嵌 Python %s）" % (res["version"], e.get("python", "")))
+        elif kind == "stage":
+            a, b, label = span.get(e["stage"], (0, 0, e["stage"]))
+            progress(a / 100.0, label)
+            log("%s…" % label)
+        elif kind == "progress":
+            a, b, label = span.get(e["stage"], (0, 0, e["stage"]))
+            pct = e.get("pct", 0)
+            progress((a + (b - a) * pct / 100.0) / 100.0, "%s %d%%" % (label, pct))
+        elif kind == "warn":
+            res["warnings"].append(e["msg"])
+            log("注意：%s" % e["msg"])
+        elif kind == "ref":
+            log("参考期：%d 张照片（已对齐 %d），控制点 %s" % (e["cameras"], e["aligned"], "、".join(e["markers"])))
+        elif kind == "aligned":
+            res["aligned"], res["total"], res["unaligned"] = e["aligned"], e["total"], e["unaligned"]
+            res["tiepoints"] = e.get("tiepoints")
+            if mode == "transfer":
+                res["ref_moved_max"], res["ref_lost"] = e.get("ref_moved_max"), e.get("ref_lost") or []
+                mv = res["ref_moved_max"]
+                log("新照片对齐 %d/%d（匹配 %.0f 秒，对齐 %.0f 秒）；参考期相机最大位移 %s%s" % (
+                    e["aligned"], e["total"], e["secs_match"], e["secs_align"],
+                    "%.3f mm" % (mv * 1000) if mv is not None else "-",
+                    "，参考期有 %d 张掉了对齐" % len(res["ref_lost"]) if res["ref_lost"] else ""))
+            else:
+                log("空三工程：已对齐 %d/%d 张" % (e["aligned"], e["total"]))
+            if e["unaligned"]:
+                log("未对齐：%s" % "、".join(e["unaligned"]))
+        elif kind == "cc_loaded":
+            res["cc_loaded"] = e
+            log("CC 刺点：%d 个点、%d 处搬进工程（像素坐标 +%.1f 换算），照片对不上 %d 处"
+                % (e["markers"], e["measurements"], e["offset"], len(e["missing"])))
+        elif kind == "markers":
+            res["markers_info"] = e
+            log("控制点：参与 %s；刺点够用（≥2 张）的 %d 个" % ("、".join(e["used"]), len(e["ok"])))
+            if e["csv_unused"]:
+                log("注意：CSV 里这些点在工程里没有刺点，没参与：%s" % "、".join(e["csv_unused"]))
+            if e["extra"]:
+                log("注意：工程里这些标记点 CSV 里没有，不参与：%s" % "、".join(e["extra"]))
+        elif kind == "swap":
+            res["swap"] = e
+            log("X/Y 判断：原样 RMS3D %.4f m，对调 RMS3D %.4f m，相差 %.1f 倍 → %s" % (
+                e["asis"]["rms3d"], e["swap"]["rms3d"], e["ratio"], _swap_verdict(e)))
+        elif kind == "placed":
+            res["placed"] = e["counts"]
+            log("放蓝旗：%s" % "，".join("%s 号 %d 张" % kv for kv in e["counts"].items()))
+        elif kind == "reject":
+            res["rejects"].append(e)
+            log("自动剔除第 %d 轮：删掉 %d 处%s" % (e["round"], e["removed"], "（%s）" % "，".join(
+                "%s 号 %d" % kv for kv in e["detail"].items()) if e["detail"] else ""))
+        elif kind == "rows":
+            res["rows"], res["rms3d"] = e["rows"], e["rms3d"]
+            res["tiepoints"] = e.get("tiepoints", res["tiepoints"])
+        elif kind == "exported":
+            log("已导出 Blocks Exchange（%d 张相机，去掉未对齐 %d 张）" % (e["cameras"], e["dropped"]))
+        elif kind == "done":
+            res["done"] = True
+        elif kind == "error":
+            log("Metashape 脚本出错：\n%s" % e.get("msg", ""))
+
+    log("—— 控制点 · %s" % GCP_MODE_LABEL[mode])
+    log("输出：%s" % out_dir)
+    progress(0.0, "启动 Metashape")
+    try:
+        events, rc = _run_ms_script(metashape, GCP_SCRIPT, params, tmp, on_event, stop_event, **timeouts)
+        res["returncode"] = rc
+        errs = [e for e in events if e.get("ev") == "error"]
+        if errs:
+            if errs[-1].get("user"):
+                raise RuntimeError(errs[-1]["msg"])
+            msg = (errs[-1].get("msg", "").strip().splitlines() or ["未知错误"])[-1]
+            raise RuntimeError("Metashape 脚本出错：%s（完整信息见 metashape_日志.txt）" % msg)
+        if rc != 0:
+            raise RuntimeError("Metashape 异常退出，退出码 %s（0x%08X）" % (rc, rc & 0xFFFFFFFF))
+        if not res["done"]:
+            raise RuntimeError("Metashape 退出了，但进度文件里没有完成标记（脚本没有跑完）")
+        if not xml_raw.is_file():
+            raise RuntimeError("Metashape 没有导出 Blocks Exchange XML")
+        progress(0.99, "修正 XML")
+        log("按 D-10 去掉 XML 里的坐标系定义（坐标值保留）…")
+        res["fix_stats"] = fix_blocks_exchange(xml_raw, xml_final)
+        xml_raw.unlink()
+        res["xml"] = str(xml_final)
+        problems, info = check_blocks_exchange(xml_final, res["aligned"])
+        res["xml_info"] = info
+        if problems:
+            raise RuntimeError("XML 没通过检查：" + "；".join(problems))
+        res["xml_cp"] = count_bx_control_points(xml_final)
+        log("XML 检查通过：%d 张照片、%d 个连接点、%d 个控制点（%d 处刺点），没有坐标系定义"
+            % (info["photos"], info["tiepoints"], res["xml_cp"][0], res["xml_cp"][1]))
+        passed, res["bad"] = judge_gcp(res["rows"], res["accuracy"])
+        res["status"] = "自动通过" if passed else "需人工核对"
+        for r in res["rows"]:
+            log("  %s 号：%d 张，三维误差 %s，像素 RMS %s%s" % (
+                r["name"], r["n"], "%.1f mm" % (r["d3"] * 1000) if r["d3"] is not None else "-",
+                "%.2f" % r["px_rms"] if r["px_rms"] is not None else "-", "" if r["ok"] else "  ← " + "；".join(r["why"])))
+        log("RMS3D %s；判定：%s" % ("%.1f mm" % (res["rms3d"] * 1000) if res["rms3d"] is not None else "-", res["status"]))
+        progress(1.0, res["status"])
+    except (AlignCancelled, KeyboardInterrupt):
+        res["status"] = "已取消"
+        res["reason"] = "用户取消，Metashape 已被强制结束；本目录里的工程不完整，不要使用"
+        log("已取消")
+        (out_dir / "已取消.txt").write_text("用户在 %s 取消了这次控制点处理，本目录里的结果不完整，不要使用。\n"
+                                          % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    except Exception as ex:
+        res["status"] = "失败"
+        res["reason"] = str(ex)
+        log("失败：%s" % ex)
+    finally:
+        res["secs"] = time.time() - t_start
+        if xml_raw.exists() and res["status"] not in ("自动通过", "需人工核对"):
+            try:
+                xml_raw.unlink()
+            except OSError:
+                pass
+        _write_metashape_log(out_dir / "metashape_日志.txt", res, events, tmp / "console.txt")
+        _write_gcp_report(out_dir / "控制点报告.txt", res)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return res
+
+
+def _swap_verdict(sw):
+    if not sw["confident"]:
+        return "两种差别不到 %g 倍，判不准，按 RMS 小的「%s」用；请核对 CSV 的 X/Y" % (
+            GCP_SWAP_RATIO, "X/Y 对调" if sw["use_swap"] else "原样")
+    return "CSV 的 X/Y 对调了，已按对调后的坐标用" if sw["use_swap"] else "CSV 的 X/Y 没问题，按原样用"
+
+
+def _fmt(v, scale=1.0, f="%.1f"):
+    return f % (v * scale) if v is not None else "-"
+
+
+def _write_gcp_report(path, res):
+    mode = res["mode"]
+    lines = ["控制点报告（%s v%s）" % (APP_NAME, APP_VERSION), "", "判定：%s" % res["status"]]
+    if res["status"] == "需人工核对":
+        lines.append("需人工核对的点（在 Metashape 里打开 .psx 看这些点的投影）：")
+        lines += ["  %s 号：%s" % (n, "；".join(why)) for n, why in res["bad"]]
+    if res["reason"]:
+        lines.append("原因：%s" % res["reason"])
+    if res["status"] == "自动通过" and res["unaligned"]:
+        lines.append("注意：有 %d 张照片没对齐，没有参与（清单见下）" % len(res["unaligned"]))
+    lines += ["", "模式：%s" % GCP_MODE_LABEL[mode]]
+    if mode == "transfer":
+        lines += ["照片目录：%s" % res["photos_dir"], "参考期工程：%s（只读，没改）" % res["ref"]]
+    else:
+        lines += ["空三工程：%s（只读，没改）" % res["psx_in"], "控制点 CSV：%s" % res["csv"],
+                  "CC 刺点：%s" % (res["cc"] or "无（用工程里已刺的点）")]
+    lines += ["输出目录：%s" % res["out_dir"],
+              "Metashape：%s（版本 %s）" % (res["metashape"], res["version"] or "未知"),
+              "开始时间：%s；耗时 %.0f 秒" % (res["start"].strftime("%Y-%m-%d %H:%M:%S"), res["secs"] or 0),
+              "判据（D-17）：每点 三维误差 ≤ %.1f mm（%g×控制点精度 %.3f m）、像素 RMS ≤ %g、照片 ≥ %d 张 → 通过；全部通过＝自动通过"
+              % (GCP_PASS_FACTOR * res["accuracy"] * 1000, GCP_PASS_FACTOR, res["accuracy"], GCP_MAX_PX_RMS, GCP_MIN_PHOTOS),
+              "自动剔除：像素残差 > max(%g px, %g×该点中位数) 的投影删掉后重新平差，最多 %d 轮；蓝旗离图像边缘 ≥ %d px"
+              % (GCP_REJECT_MIN_PX, GCP_REJECT_FACTOR, GCP_REJECT_ROUNDS, GCP_EDGE_MARGIN),
+              "平差：updateTransform + optimizeCameras（f, cx, cy, k1～k3, p1, p2）；坐标系 Local（米）"]
+    if mode == "transfer":
+        lines.append("匹配：精度高（downscale=1）、通用预选 开、参考预选 关、关键点 %d、连接点 %d、reset_matches=True"
+                     % (DEFAULT_KEYPOINTS, DEFAULT_TIEPOINTS))
+    if res["note"]:
+        lines.append("去定位：%s" % res["note"])
+    for w in res["warnings"]:
+        lines.append("注意：%s" % w)
+    lines.append("")
+    if res["aligned"] is not None:
+        if mode == "transfer":
+            lines.append("对齐：新照片 %d/%d；参考期相机最大位移 %s mm%s" % (
+                res["aligned"], res["total"], _fmt(res["ref_moved_max"], 1000, "%.3f"),
+                "；参考期有 %d 张掉了对齐" % len(res["ref_lost"]) if res["ref_lost"] else ""))
+        else:
+            lines.append("对齐：空三工程 %d/%d" % (res["aligned"], res["total"]))
+        lines.append("未对齐照片：%s" % ("无" if not res["unaligned"] else "%d 张" % len(res["unaligned"])))
+        lines += ["  " + u for u in res["unaligned"]]
+    if res["cc_info"]:
+        ci = res["cc_info"]
+        lines.append("CC 刺点文件：%d 个点、%d 处刺点（PhotoId 对不上 <Photo> 的 %d 处）" % (
+            ci["points"], ci["measurements"], ci["unknown_photo"]))
+    if res["cc_loaded"]:
+        cl = res["cc_loaded"]
+        lines.append("CC 刺点搬进工程：%d 处（照片在工程里找不到或没对齐的 %d 处）；像素坐标 +%.1f 换成 Metashape 约定"
+                     % (cl["measurements"], len(cl["missing"]), cl["offset"]))
+    mi = res["markers_info"]
+    if mi and mi["csv_unused"]:
+        lines.append("CSV 里没有刺点、没参与的点：%s" % "、".join(mi["csv_unused"]))
+    sw = res["swap"]
+    if sw:
+        lines.append("X/Y 判断：原样 RMS3D %.4f m，对调 RMS3D %.4f m，相差 %.1f 倍 → %s" % (
+            sw["asis"]["rms3d"], sw["swap"]["rms3d"], sw["ratio"], _swap_verdict(sw)))
+        if sw.get("pin_mean_dx") is not None:
+            lines.append("  刺点平均像素残差（选定方案、只用刺点）：dx %+.2f、dy %+.2f（%d 处）" % (
+                sw["pin_mean_dx"], sw["pin_mean_dy"], sw["pin_n"]))
+    for rj in res["rejects"]:
+        lines.append("自动剔除第 %d 轮：删掉 %d 处" % (rj["round"], rj["removed"]))
+    if res["rows"]:
+        lines += ["", "RMS3D：%s mm（%d 个点）" % (_fmt(res["rms3d"], 1000), len(res["rows"])), "逐点："]
+        lines.append("  点名  照片数  放蓝旗  细化挪动中位数px  细化删掉  自动剔除  dx/dy/dz(mm)  三维误差mm  像素RMS  像素最大  结论")
+        for r in res["rows"]:
+            d = r["d"] or [None] * 3
+            lines.append("  %-4s  %5d  %6s  %14s  %8s  %8s  %s  %10s  %7s  %8s  %s" % (
+                r["name"], r["n"], r.get("placed", "-"), _fmt(r.get("refine_median_px"), 1, "%.2f"),
+                r.get("refine_removed", "-"), r.get("rejected", "-"),
+                "/".join(_fmt(v, 1000) for v in d), _fmt(r["d3"], 1000), _fmt(r["px_rms"], 1, "%.2f"),
+                _fmt(r["px_max"], 1, "%.2f"), "通过" if r.get("ok") else "不通过：" + "；".join(r.get("why") or ["-"])))
+    if res["xml"]:
+        fs, xi = res["fix_stats"], res["xml_info"]
+        lines += ["", "Blocks Exchange：%s" % res["xml"],
+                  "  按 D-10 去掉坐标系定义：删 <SpatialReferenceSystems> %d 个、<SRSId> %d 个、<Pose> 下的 <Metadata> %d 个；坐标值保留"
+                  % (fs["SpatialReferenceSystems"], fs["SRSId"], fs["Pose/Metadata"])]
+        if xi:
+            lines.append("  照片 %d 张、连接点 %d 个；控制点 %d 个、刺点 %d 处；ImagePath 缺失 %d 个" % (
+                xi["photos"], xi["tiepoints"], res["xml_cp"][0], res["xml_cp"][1], len(xi["missing_images"])))
+        if res["unaligned"]:
+            lines.append("  未对齐的照片没有写进 XML")
+    lines += ["", "说明：坐标是控制点 CSV 的局部坐标（米）。.psx 可以直接在 Metashape 里打开核对；"
+                  "%s" % ("这个工程可以当以后各期的参考期用（「迁移」模式选它）。" if mode == "init" else
+                          "「需人工核对」时请看上面列出的点，不要直接拿去用。")]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _gcp_out_dir(base, name):
+    out = Path(base) / (name + GCP_SUFFIX)
+    if not _dir_empty_or_missing(out):
+        raise ValueError("控制点输出目录不是空的，拒绝写入（不覆盖）：%s" % out)
+    return out
+
+
+def run_gcp_transfer(photo_dir, ref_psx, metashape, out_base=None, accuracy=DEFAULT_GCP_ACCURACY, auto_strip=True,
+                     progress=None, log=None, stop_event=None, **timeouts):
+    """模式一「迁移」：照片目录 + 参考期 .psx → <照片目录名>_控制点\\。不满足条件抛 ValueError（不动任何文件）。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    err = check_metashape(metashape)
+    if err:
+        raise ValueError(err)
+    acc = _check_gcp_accuracy(accuracy)
+    ref = _check_psx(ref_psx, "参考期工程")
+    if not photo_dir or not Path(photo_dir).is_dir():
+        raise ValueError("照片目录不存在：%s" % photo_dir)
+    src = Path(os.path.abspath(photo_dir))  # 不用 resolve()：映射的网络盘会被换成 UNC 路径
+    photos = list_jpegs(src)
+    if not photos:
+        raise ValueError("照片目录里没有 JPG（不含子目录）：%s" % src)
+    out_base = Path(os.path.abspath(out_base)) if out_base else None
+    log("照片目录：%s（%d 张）；参考期：%s" % (src, len(photos), ref))
+
+    located = []  # D-07：逐张检查定位
+    for i, p in enumerate(photos, 1):
+        if stop_event is not None and stop_event.is_set():
+            raise AlignCancelled()
+        try:
+            if photo_has_location(p):
+                located.append(p)
+        except Exception as ex:
+            raise ValueError("读不了照片 %s：%s" % (p, ex))
+        if i % 20 == 0 or i == len(photos):
+            progress(0.0, "检查定位 %d/%d" % (i, len(photos)))
+    note = "照片本来就不带定位"
+    if located:
+        log("有 %d/%d 张照片带定位（如 %s）" % (len(located), len(photos), located[0].name))
+        if not auto_strip:
+            raise ValueError("有 %d 张照片还带定位（如 %s），不许直接用（D-07）。\n请勾选「照片带定位时先自动去定位」，"
+                             "或先用「剔除定位」页签处理。" % (len(located), located[0]))
+        strip_dst = (out_base or src.parent) / (src.name + OUTPUT_SUFFIX)
+        out_dir = _gcp_out_dir(strip_dst.parent, strip_dst.name)
+        err = check_dirs(src, strip_dst)
+        if err:
+            raise ValueError("自动去定位做不了：%s" % err)
+        log("先自动去定位 → %s" % strip_dst)
+        st = run_strip(src, strip_dst, recursive=False, log=log, stop_event=stop_event,
+                       progress=lambda i, n: progress(0.0, "去定位 %d/%d" % (i, n)))
+        if stop_event is not None and stop_event.is_set():
+            raise AlignCancelled()
+        if st["失败"]:
+            raise ValueError("自动去定位有 %d 张失败，停止，详见 %s" % (st["失败"], st["日志"]))
+        work = strip_dst
+        photos = list_jpegs(work)
+        still = [p for p in photos if photo_has_location(p)]
+        if still:
+            raise ValueError("去定位后仍有 %d 张带定位（如 %s），停止" % (len(still), still[0]))
+        note = "原照片带定位，已先自动去定位：%s → %s" % (src, strip_dst)
+    else:
+        work = src
+        out_dir = _gcp_out_dir(out_base or src.parent, src.name)
+
+    res = _gcp_result("transfer", out_dir, metashape, acc, note=note, photos_dir=str(work), ref=str(ref))
+    params = {"ref": str(ref), "photos": [str(p) for p in photos], "downscale": ACCURACY_DOWNSCALE["high"],
+              "keypoint_limit": DEFAULT_KEYPOINTS, "tiepoint_limit": DEFAULT_TIEPOINTS}
+    return _gcp_run(res, params, work.name, metashape, log, progress, stop_event, **timeouts)
+
+
+def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy=DEFAULT_GCP_ACCURACY,
+                 progress=None, log=None, stop_event=None, **timeouts):
+    """模式二「建参考期」：空三 .psx + 控制点 CSV（+ CC 刺点）→ <名>_控制点\\（可作参考期）。
+    不满足条件抛 ValueError（不动任何文件）。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    err = check_metashape(metashape)
+    if err:
+        raise ValueError(err)
+    acc = _check_gcp_accuracy(accuracy)
+    src = _check_psx(psx, "空三工程")
+    pts = read_gcp_csv(csv_path)
+    log("控制点 CSV：%s（%d 个点）" % (csv_path, len(pts)))
+    cc, cc_info, unknown = None, None, []
+    if cc_path:
+        marks, cc_info = read_cc_marks(cc_path)
+        unknown = [k for k in marks if k not in pts]
+        cc = dict((k, v) for k, v in marks.items() if k in pts)
+        log("CC 刺点：%d 个点、%d 处（%s）" % (cc_info["points"], cc_info["measurements"], cc_path))
+        if unknown:
+            log("注意：CC 里这些点名 CSV 里没有，不用：%s" % "、".join(unknown))
+        if not cc:
+            raise ValueError("CC 刺点的点名（%s）和控制点 CSV 的点名一个都对不上" % "、".join(list(marks)[:8]))
+    name = src.stem
+    out_dir = _gcp_out_dir(Path(os.path.abspath(out_base)) if out_base else src.parent.parent, name)
+    res = _gcp_result("init", out_dir, metashape, acc, psx_in=str(src), csv=str(csv_path),
+                      cc=str(cc_path) if cc_path else "", cc_info=cc_info)
+    if unknown:
+        res["warnings"].append("CC 里这些点名 CSV 里没有，没用：%s" % "、".join(unknown))
+    params = {"psx_in": str(src), "csv": dict((k, list(v)) for k, v in pts.items()),
+              "cc": dict((k, [list(m) for m in v]) for k, v in cc.items()) if cc is not None else None,
+              "cc_offset": CC_PIXEL_OFFSET}
+    return _gcp_run(res, params, name, metashape, log, progress, stop_event, **timeouts)
+
+
+# ---------------------------------------------------------------------------
 # 图形界面
 # ---------------------------------------------------------------------------
 
@@ -1437,6 +2529,213 @@ def run_gui():
     btn2_stop.configure(command=stop2)
     root.after(200, poll2)
 
+    # ---- 页签 3：控制点（D-16、D-17） ----
+    tab3 = ttk.Frame(nb, padding=10)
+    nb.add(tab3, text="控制点")
+    tab3.columnconfigure(1, weight=1)
+    cfg3 = load_config()
+    v3_mode = tk.StringVar(value="transfer")
+    v3_ms = tk.StringVar(value=find_metashape())
+    v3_ref = tk.StringVar(value=cfg3.get("gcp_ref", ""))
+    v3_pdir = tk.StringVar()
+    v3_psx = tk.StringVar()
+    v3_csv = tk.StringVar(value=cfg3.get("gcp_csv", ""))
+    v3_cc = tk.StringVar()
+    v3_out = tk.StringVar()
+    v3_acc = tk.StringVar(value=str(DEFAULT_GCP_ACCURACY))
+    v3_auto = tk.BooleanVar(value=True)
+    st3 = {"stop": None}
+    q3 = queue.Queue()
+
+    def pick_file(var, title, types):
+        f = filedialog.askopenfilename(title=title, filetypes=types)
+        if f:
+            var.set(os.path.normpath(f))
+
+    def pick_dir(var, title):
+        d = filedialog.askdirectory(title=title)
+        if d:
+            var.set(os.path.normpath(d))
+
+    psx_types = [("Metashape 工程", "*.psx")]
+    rows3 = (
+        ("Metashape 程序：", v3_ms, lambda: pick_file(v3_ms, "选择 Metashape Pro 程序（metashape.exe）",
+                                                   [("Metashape", "metashape.exe photoscan.exe"), ("程序", "*.exe")]), None),
+        ("参考期工程 .psx：", v3_ref, lambda: pick_file(v3_ref, "选择参考期工程（已有控制点，只读）", psx_types), "transfer"),
+        ("新一期照片目录：", v3_pdir, lambda: pick_dir(v3_pdir, "选择新一期照片目录"), "transfer"),
+        ("空三工程 .psx：", v3_psx, lambda: pick_file(v3_psx, "选择「空三」页签产出的 .psx（只读）", psx_types), "init"),
+        ("控制点 CSV：", v3_csv, lambda: pick_file(v3_csv, "选择控制点 CSV（点名,X,Y,Z，米）",
+                                                [("CSV", "*.csv *.txt"), ("全部", "*.*")]), "init"),
+        ("CC 刺点（可空）：", v3_cc, lambda: pick_file(v3_cc, "选择 ContextCapture 导出的 Blocks Exchange（含控制点刺点）",
+                                                   [("Blocks Exchange", "*.xml *.xmlz"), ("全部", "*.*")]), "init"),
+        ("输出位置（可空）：", v3_out, lambda: pick_dir(v3_out, "选择输出位置（留空 = 默认位置）"), None),
+    )
+    mode_widgets = []
+    mf = ttk.Frame(tab3)
+    mf.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    ttk.Label(mf, text="模式：").pack(side="left")
+    ttk.Radiobutton(mf, text="迁移（新一期，零刺点）", value="transfer", variable=v3_mode).pack(side="left")
+    ttk.Radiobutton(mf, text="建参考期（新场地第一次）", value="init", variable=v3_mode).pack(side="left", padx=(16, 0))
+    for r, (label, var, cmd, mode) in enumerate(rows3, 1):
+        w1 = ttk.Label(tab3, text=label)
+        w1.grid(row=r, column=0, sticky="w", pady=2)
+        w2 = ttk.Entry(tab3, textvariable=var)
+        w2.grid(row=r, column=1, sticky="ew", pady=2)
+        w3 = ttk.Button(tab3, text="浏览…", command=cmd)
+        w3.grid(row=r, column=2, padx=(6, 0), pady=2)
+        if mode:
+            mode_widgets.append((mode, (w1, w2, w3)))
+    o3 = ttk.Frame(tab3)
+    o3.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 2))
+    ttk.Label(o3, text="控制点精度（米）：").pack(side="left")
+    ttk.Spinbox(o3, textvariable=v3_acc, from_=0.001, to=1.0, increment=0.005, width=7).pack(side="left")
+    cb_auto3 = ttk.Checkbutton(o3, text="照片带定位时先自动去定位", variable=v3_auto)
+    cb_auto3.pack(side="left", padx=(16, 0))
+    mode_widgets.append(("transfer", (cb_auto3,)))
+    lbl3_help = ttk.Label(tab3, foreground="#555", wraplength=int(700 * k))
+    lbl3_help.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 4))
+    helps = {
+        "transfer": "迁移：新一期照片和参考期一起匹配，自动放控制点、细化、平差、按 D-17 判定。参考期的照片要留在原位置。"
+                    "输出「<照片目录名>_控制点」：.psx、Blocks Exchange XML（局部坐标）、控制点报告.txt。一次约 5 分钟。",
+        "init": "建参考期：用「空三」页签的 .psx + 控制点 CSV；有 CC 刺点就选上（没有就先在 Metashape 里给 ≥3 个点各刺 ≥2 张并保存）。"
+                "会自动判断 CSV 的 X/Y 是否对调。输出的 .psx 以后当参考期用。",
+    }
+
+    def on_mode(*_):
+        m = v3_mode.get()
+        for mode, ws in mode_widgets:
+            for w in ws:
+                w.configure(state="normal" if mode == m else "disabled")
+        lbl3_help.configure(text=helps[m])
+
+    v3_mode.trace_add("write", on_mode)
+    on_mode()
+
+    bar3 = ttk.Frame(tab3)
+    bar3.grid(row=10, column=0, columnspan=3, sticky="ew")
+    bar3.columnconfigure(0, weight=1)
+    pb3 = ttk.Progressbar(bar3, mode="determinate", maximum=1000)
+    pb3.grid(row=0, column=0, sticky="ew")
+    lbl3 = ttk.Label(bar3, text="", width=24)
+    lbl3.grid(row=0, column=1, padx=6)
+    btn3_start = ttk.Button(bar3, text="开始")
+    btn3_start.grid(row=0, column=2)
+    btn3_stop = ttk.Button(bar3, text="取消", state="disabled")
+    btn3_stop.grid(row=0, column=3, padx=(6, 0))
+    logf3 = ttk.Frame(tab3)
+    logf3.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    tab3.rowconfigure(11, weight=1)
+    txt3 = tk.Text(logf3, height=6, wrap="none")
+    sb3 = ttk.Scrollbar(logf3, orient="vertical", command=txt3.yview)
+    txt3.configure(yscrollcommand=sb3.set)
+    txt3.pack(side="left", fill="both", expand=True)
+    sb3.pack(side="right", fill="y")
+
+    def poll3():
+        try:
+            while True:
+                kind, val = q3.get_nowait()
+                if kind == "log":
+                    txt3.insert("end", val + "\n")
+                    txt3.see("end")
+                elif kind == "prog":
+                    pb3.configure(value=int(val[0] * 1000))
+                    lbl3.configure(text=val[1][:30])
+                elif kind == "done":
+                    btn3_start.configure(state="normal")
+                    btn3_stop.configure(state="disabled")
+                    if isinstance(val, AlignCancelled):
+                        lbl3.configure(text="已取消")
+                        messagebox.showwarning(APP_NAME, "已取消。输出目录里的结果不完整，不要使用。")
+                    elif isinstance(val, Exception):
+                        lbl3.configure(text="失败")
+                        txt3.insert("end", "出错：%s\n" % val)
+                        txt3.see("end")
+                        messagebox.showerror(APP_NAME, str(val))
+                    else:
+                        r = val
+                        lbl3.configure(text=r["status"])
+                        head = "判定：%s" % r["status"]
+                        body = ["输出：%s" % r["out_dir"]]
+                        if r["aligned"] is not None:
+                            body.insert(0, "对齐：%d/%d%s" % (r["aligned"], r["total"],
+                                                            "（%d 张没对齐）" % len(r["unaligned"]) if r["unaligned"] else ""))
+                        if r["rms3d"] is not None:
+                            body.insert(1, "RMS3D：%.1f mm（%d 个点）" % (r["rms3d"] * 1000, len(r["rows"])))
+                        if r["swap"] and (r["swap"]["use_swap"] or not r["swap"]["confident"]):
+                            body.insert(0, "X/Y：%s" % _swap_verdict(r["swap"]))
+                        if r["status"] == "自动通过" and not r["unaligned"]:
+                            messagebox.showinfo(APP_NAME, "\n".join([head] + body))
+                        elif r["status"] in ("自动通过", "需人工核对"):
+                            extra = ["%s 号：%s" % (n, "；".join(w)) for n, w in r["bad"]]
+                            if extra:
+                                extra.insert(0, "\n需人工核对的点（详见 控制点报告.txt）：")
+                            messagebox.showwarning(APP_NAME + " - " + r["status"], "\n".join([head] + body + extra))
+                        else:
+                            messagebox.showerror(APP_NAME, "%s\n%s\n\n%s" % (head, r["reason"], "\n".join(body)))
+        except queue.Empty:
+            pass
+        root.after(200, poll3)
+
+    def start3():
+        mode = v3_mode.get()
+        ms = v3_ms.get().strip()
+        err = check_metashape(ms)
+        if err:
+            messagebox.showwarning(APP_NAME, err)
+            return
+        try:
+            acc = _check_gcp_accuracy(v3_acc.get().strip())
+        except ValueError as ex:
+            messagebox.showwarning(APP_NAME, str(ex))
+            return
+        ref, pdir, psx, csvp, ccp, out = (v.get().strip() for v in (v3_ref, v3_pdir, v3_psx, v3_csv, v3_cc, v3_out))
+        if mode == "transfer" and (not ref or not pdir):
+            messagebox.showwarning(APP_NAME, "请选择参考期工程和新一期照片目录")
+            return
+        if mode == "init" and (not psx or not csvp):
+            messagebox.showwarning(APP_NAME, "请选择空三工程和控制点 CSV")
+            return
+        cfg = load_config()
+        cfg["metashape"] = ms
+        if mode == "transfer":
+            cfg["gcp_ref"] = ref
+        else:
+            cfg["gcp_csv"] = csvp
+        save_config(cfg)
+        txt3.delete("1.0", "end")
+        pb3.configure(value=0)
+        lbl3.configure(text="")
+        btn3_start.configure(state="disabled")
+        btn3_stop.configure(state="normal")
+        stop = threading.Event()
+        st3["stop"] = stop
+        auto = v3_auto.get()
+        kw = dict(progress=lambda f, s: q3.put(("prog", (f, s))), log=lambda s: q3.put(("log", s)), stop_event=stop)
+
+        def work():
+            try:
+                if mode == "transfer":
+                    res = run_gcp_transfer(pdir, ref, ms, out or None, acc, auto, **kw)
+                else:
+                    res = run_gcp_init(psx, csvp, ms, ccp or None, out or None, acc, **kw)
+                if res["status"] == "已取消":
+                    raise AlignCancelled()
+                q3.put(("done", res))
+            except Exception as ex:
+                q3.put(("done", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop3():
+        if st3["stop"] is not None:
+            st3["stop"].set()
+            lbl3.configure(text="正在取消…")
+
+    btn3_start.configure(command=start3)
+    btn3_stop.configure(command=stop3)
+    root.after(200, poll3)
+
     # 后续功能在这里加新页签：nb.add(ttk.Frame(nb), text="...")
     root.after(100, poll)
     root.mainloop()
@@ -1476,10 +2775,25 @@ def main(argv=None):
     a.add_argument("--keypoints", type=int, default=DEFAULT_KEYPOINTS, help="关键点上限，默认 %d" % DEFAULT_KEYPOINTS)
     a.add_argument("--tiepoints", type=int, default=DEFAULT_TIEPOINTS, help="连接点上限，默认 %d" % DEFAULT_TIEPOINTS)
     a.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
+    g = sub.add_parser("gcp-transfer", help="控制点·迁移：从参考期把控制点自动放到新一期照片上并平差（退出码 0 自动通过 / 4 需人工核对）")
+    g.add_argument("photos", help="新一期照片目录（带定位时自动先去定位）")
+    g.add_argument("--ref", required=True, help="参考期工程 .psx（只读，不会被修改）")
+    g2 = sub.add_parser("gcp-init", help="控制点·建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 对调（退出码 0 自动通过 / 4 需人工核对）")
+    g2.add_argument("psx", help="「空三」页签产出的 .psx（只读，不会被修改）")
+    g2.add_argument("--csv", required=True, help="控制点 CSV：点名,X,Y,Z（米）")
+    g2.add_argument("--cc", help="ContextCapture 导出的 Blocks Exchange（.xml/.xmlz），里面的控制点刺点；不给就用工程里已刺的点")
+    for x in (g, g2):
+        x.add_argument("--out", help="输出位置（默认：迁移＝照片目录所在的上级目录；建参考期＝空三输出目录所在的上级目录）")
+        x.add_argument("--accuracy", type=float, default=DEFAULT_GCP_ACCURACY, help="控制点精度（米），默认 %g" % DEFAULT_GCP_ACCURACY)
+        x.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
+        x.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
+    g.add_argument("--no-auto-strip", action="store_true", help="照片带定位时不自动去定位（会拒绝执行）")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
     args = ap.parse_args(argv)
     if args.cmd == "align":
         return _cli_align(args)
+    if args.cmd in ("gcp-transfer", "gcp-init"):
+        return _cli_gcp(args)
     if args.cmd == "check-update":
         try:
             info = check_update()
@@ -1526,6 +2840,34 @@ def _cli_align(args):
     if any(r["status"] == "已取消" for r in res):
         return 3
     return 0 if all(r["status"] == "成功" for r in res) else 1
+
+
+def _cli_gcp(args):
+    """退出码：0 自动通过 / 4 需人工核对 / 1 失败 / 2 拒绝执行 / 3 已取消。"""
+    flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+    def log(s):
+        _print(s)
+        if flog:
+            flog.write(s + "\n")
+            flog.flush()
+
+    ms = args.metashape or find_metashape()
+    try:
+        if args.cmd == "gcp-transfer":
+            res = run_gcp_transfer(args.photos, args.ref, ms, args.out, args.accuracy, not args.no_auto_strip, log=log)
+        else:
+            res = run_gcp_init(args.psx, args.csv, ms, args.cc, args.out, args.accuracy, log=log)
+    except ValueError as ex:
+        log("拒绝执行：%s" % ex)
+        return 2
+    except (AlignCancelled, KeyboardInterrupt):
+        log("已取消")
+        return 3
+    finally:
+        if flog:
+            flog.close()
+    return {"自动通过": 0, "需人工核对": 4, "已取消": 3}.get(res["status"], 1)
 
 
 if __name__ == "__main__":
