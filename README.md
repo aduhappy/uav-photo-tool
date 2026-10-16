@@ -42,7 +42,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的 `无人机照片工具_v*.exe`，双击运行即可。
+到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的 `uav-photo-tool_v*.exe`，双击运行即可。
 
 软件启动时会在后台查一次有没有新版本，有的话会弹窗提示并给出下载链接，不会自动下载或替换。不想要这个提示，可以在菜单「帮助 → 启动时自动检查更新」里关掉。
 
