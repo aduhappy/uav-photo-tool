@@ -13,6 +13,10 @@
 #   规则增删后重扫、改了规则不重扫就拒绝开始；然后真跑两期，第一期出结论后、第二期运行中点「取消」，查第一期结果保留、
 #   第二期已取消、汇总表两行、界面不卡（200 ms 定时器最大间隔）；扫描后、运行中各截浅色/深色一张。
 #   环境变量 UAV_T7_NO_RUN=1 时只测到重扫为止（不起 Metashape）。
+# batch8 模式（T8：照片处理方式、原地确认框、跳过名单、上次已取消的期重跑、关窗口二次确认）：--data 指向放着
+#   0802上午梯田、26.08.01植被 两期**真副本**的上级目录（原地模式会改它们，绝不能是 junction 或原片），--ref/--ref2 同上；
+#   环境变量 UAV_T8_PHASE=1 跑全套（会真起 Metashape），UAV_T8_PHASE=2 + --keep-appdata 测重启后跳过名单还在、
+#   照片处理方式回到复制，并截浅/深色图（phase 1 末尾清空了跳过名单，先跑一次 UAV_T8_PHASE=2a 填好再重启）。phase 1 最后一步点关窗口，窗口由软件自己关，harness_batch8.json 里没有 done。
 # 结果：<结果目录>/harness_<mode>.json（checks 每条 [名称, 通过, 细节]），shots 模式另有 <结果目录>/截图/*.bmp。
 import os
 import sys
@@ -21,7 +25,7 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):  # 打包版里
     import argparse
     import shutil
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("invoke", "shots", "batch"), default="invoke")
+    ap.add_argument("--mode", choices=("invoke", "shots", "batch", "batch8"), default="invoke")
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default="")
     ap.add_argument("--metashape", required=True)
@@ -29,12 +33,14 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):  # 打包版里
     ap.add_argument("--ref2", default="", help="batch 模式：植被参考期 .psx（--ref 是梯田）")
     ap.add_argument("--appdata", required=True)
     ap.add_argument("--seed-only", action="store_true", help="只建 --appdata，不跑界面（给打包版测试用）")
+    ap.add_argument("--keep-appdata", action="store_true", help="不重建 --appdata（测重启后记住的设置）")
     _a = ap.parse_args()
-    shutil.rmtree(_a.appdata, ignore_errors=True)
-    os.makedirs(os.path.join(_a.appdata, "无人机照片工具"))
-    import json as _json
-    with open(os.path.join(_a.appdata, "无人机照片工具", "config.json"), "w", encoding="utf-8") as _f:
-        _json.dump({"metashape": _a.metashape, "gcp_ref": _a.ref, "gcp_csv": "C:\记住的.csv"}, _f, ensure_ascii=False)
+    if not _a.keep_appdata:
+        shutil.rmtree(_a.appdata, ignore_errors=True)
+        os.makedirs(os.path.join(_a.appdata, "无人机照片工具"))
+        import json as _json
+        with open(os.path.join(_a.appdata, "无人机照片工具", "config.json"), "w", encoding="utf-8") as _f:
+            _json.dump({"metashape": _a.metashape, "gcp_ref": _a.ref, "gcp_csv": "C:\记住的.csv"}, _f, ensure_ascii=False)
     if _a.seed_only:
         sys.exit(0)
     os.environ.update(APPDATA=_a.appdata, UAV_T6_MODE=_a.mode, UAV_T6_OUT=_a.out, UAV_T6_DATA=_a.data,
@@ -59,7 +65,7 @@ DATA = os.environ.get("UAV_T6_DATA", "")
 MS = os.environ.get("UAV_T6_MS", "")
 REF = os.environ.get("UAV_T6_REF", "")
 REF2 = os.environ.get("UAV_T6_REF2", "")
-VERSION = os.environ.get("UAV_T6_VERSION", "0.8")
+VERSION = os.environ.get("UAV_T6_VERSION", "0.9")
 os.makedirs(OUT, exist_ok=True)
 
 R = {"mode": MODE, "frozen": bool(getattr(sys, "frozen", False)), "boxes": [], "checks": [], "browser": []}
@@ -441,7 +447,8 @@ def steps_batch(root, nb):
     ctk.set_appearance_mode("light")
 
     # 筛选只影响显示，不清勾选
-    e_f = [e for e in find(t4, ctk.CTkEntry) if e.master is not rf and e not in (e_root, e_out, e_ms)][0]
+    of4 = [f for f in find(t4, ctk.CTkFrame) if f.master is t4 and int(f.grid_info().get("row", -1)) == 4]  # T8 加的选项行
+    e_f = [e for e in find(t4, ctk.CTkEntry) if e.master is not rf and e.master not in of4 and e not in (e_root, e_out, e_ms)][0]
     set_entry(e_f, "植被")
     yield 0.3
     tb = by_name()
@@ -569,6 +576,233 @@ def steps_batch(root, nb):
     check("日志文件在", glob.glob(os.path.join(out, "批量迁移日志_*.txt")) != [])
 
 
+def steps_batch8(root, nb):
+    """T8「批量迁移」：照片处理方式（复制/原地）、原地确认框、跳过名单、上次已取消的期重跑、关窗口二次确认。
+    UAV_T8_PHASE=1：--data 下要有两期照片的**真副本**（0802上午梯田、26.08.01植被；原地模式会改它们）；
+    跳过名单填 0802上午梯田 → 扫描；原地确认框 错名/取消/对名；对名后跑 26.08.01植被、匹配中取消；
+    重扫显示「待运行（上次已取消）」→ 再跑到完、旧结果目录改名保留；最后清空跳过名单、复制模式跑 0802上午梯田，
+    运行中点关窗口 → 二次确认 → 停在当前这一期后自动关窗。
+    UAV_T8_PHASE=2（不重建 APPDATA）：重启后跳过名单还在、照片处理方式回到复制；扫描后截浅/深色图。"""
+    phase = os.environ.get("UAV_T8_PHASE", "1")
+    cfg_path = os.path.join(os.environ["APPDATA"], "无人机照片工具", "config.json")
+    cfg = lambda: json.load(open(cfg_path, encoding="utf-8"))
+    out = os.environ.get("UAV_T8_OUT2") or os.path.join(OUT, "batch_out")
+    shots = os.path.join(OUT, "截图")
+    os.makedirs(shots, exist_ok=True)
+    root.geometry("+40+40")
+    check("窗口标题", root.title().endswith("v" + VERSION), root.title())
+    nb.set("批量迁移")
+    t4 = nb.tab("批量迁移")
+    yield 0.5
+    e_root, e_out, e_ms = (entry_row(t4, r) for r in range(3))
+    rf = [f for f in find(t4, ctk.CTkFrame) if f.master is t4 and int(f.grid_info().get("row", -1)) == 3][0]
+    of4 = [f for f in find(t4, ctk.CTkFrame) if f.master is t4 and int(f.grid_info().get("row", -1)) == 4][0]
+    radios = {r.cget("value"): r for r in find(of4, ctk.CTkRadioButton)}
+    e_skip = find(of4, ctk.CTkEntry)[0]
+    lst = find(t4, ctk.CTkScrollableFrame)[0]
+    check("照片处理方式两个单选", sorted(radios) == ["copy", "inplace"] and "复制" in radios["copy"].cget("text")
+          and "原照片上抹除" in radios["inplace"].cget("text"), {k: r.cget("text") for k, r in radios.items()})
+    mode_var = radios["copy"].cget("variable")
+    check("启动时照片处理方式是「复制」", root.getvar(str(mode_var)) == "copy", root.getvar(str(mode_var)))
+
+    def rules():
+        es = sorted(find(rf, ctk.CTkEntry), key=lambda e: (int(e.grid_info()["row"]), int(e.grid_info()["column"])))
+        return [es[i:i + 3] for i in range(0, len(es), 3)]
+
+    def table():
+        rows = {}
+        for cb in find(lst, ctk.CTkCheckBox):
+            gi = cb.grid_info()
+            if not gi:
+                continue
+            r = int(gi["row"])
+            cells = [w.cget("text") for w in sorted(cb.master.grid_slaves(row=r), key=lambda w: int(w.grid_info()["column"]))
+                     if isinstance(w, ctk.CTkLabel)]
+            rows[cells[1]] = {"cb": cb, "on": bool(cb.get()), "cells": cells}
+        return rows
+
+    def snapshot():
+        return {os.path.relpath(p, DATA): (os.path.getsize(p), os.stat(p).st_mtime_ns)
+                for p in glob.glob(os.path.join(DATA, "**", "*"), recursive=True) if os.path.isfile(p)}
+
+    if phase == "2a":  # 只填跳过名单并扫描（记进 config）后退出，给 phase 2 测重启
+        set_entry(e_skip, "0802上午梯田")
+        btn(t4, "扫描").invoke()
+        yield 0.8
+        check("2a：跳过名单记进 config", cfg().get("batch_skip") == "0802上午梯田", cfg().get("batch_skip"))
+        return
+    if phase == "2":
+        check("重启后跳过名单还在（config 里记着）", e_skip.get() == "0802上午梯田" and cfg().get("batch_skip") == "0802上午梯田",
+              (e_skip.get(), cfg().get("batch_skip")))
+        check("config 里没有照片处理方式", not any("mode" in k or "inplace" in k for k in cfg()), sorted(cfg()))
+        btn(t4, "扫描").invoke()
+        yield 0.8
+        tb = table()
+        R["scan_phase2"] = {k: [v["on"]] + v["cells"] for k, v in tb.items()}
+        check("重启后扫描：0802上午梯田 跳过名单、不勾", tb["0802上午梯田"]["cells"][5] == "跳过：在跳过名单里"
+              and not tb["0802上午梯田"]["on"], R["scan_phase2"])
+        # 参考期框显示尾部 + 悬停提示完整路径
+        e_psx = rules()[1][1]
+        R["psx_xview"] = list(e_psx._entry.xview())
+        check("参考期输入框显示路径尾部（文件名）", R["psx_xview"][1] >= 0.999, R["psx_xview"])
+        e_psx._entry.event_generate("<Enter>", x=5, y=5)
+        yield 0.3
+        tips = [w for w in e_psx.winfo_children() if isinstance(w, tkinter.Toplevel)] + \
+               [w for w in e_psx._entry.winfo_children() if isinstance(w, tkinter.Toplevel)]
+        texts = [c.cget("text") for t in tips for c in t.winfo_children()]
+        check("悬停参考期框弹出完整路径", REF2 in texts, texts)
+        e_psx._entry.event_generate("<Leave>", x=5, y=5)
+        radios["inplace"].invoke()
+        for mode, cn in (("light", "浅色"), ("dark", "深色")):
+            ctk.set_appearance_mode(mode)
+            yield 1.0
+            p = os.path.join(shots, "批量迁移_T8_%s.bmp" % cn)
+            grab_bmp(p, root)
+            R.setdefault("shots", []).append(p)
+        ctk.set_appearance_mode("light")
+        radios["copy"].invoke()
+        return
+
+    set_entry(e_root, DATA)
+    set_entry(e_out, out)
+    set_entry(rules()[0][1], REF)
+    set_entry(rules()[1][1], REF2)
+    check("跳过名单默认空", e_skip.get() == "", e_skip.get())
+    set_entry(e_skip, "0802上午梯田")
+    btn(t4, "扫描").invoke()
+    yield 0.8
+    tb = table()
+    R["scan1"] = {k: [v["on"]] + v["cells"] for k, v in tb.items()}
+    check("跳过名单里的期：「跳过：在跳过名单里」、默认不勾", tb["0802上午梯田"]["cells"][5] == "跳过：在跳过名单里"
+          and not tb["0802上午梯田"]["on"] and tb["26.08.01植被"]["cells"][5] == "待运行" and tb["26.08.01植被"]["on"],
+          R["scan1"])
+    check("跳过名单记进 config", cfg().get("batch_skip") == "0802上午梯田", cfg().get("batch_skip"))
+    radios["inplace"].invoke()
+    check("选原地后 config 里没记照片处理方式", not any("mode" in k or "inplace" in k for k in cfg()), sorted(cfg()))
+
+    # 原地确认框：错名 / 取消 → 什么都不动、不建输出目录；对名 → 开跑
+    before = snapshot()
+    bs, bc = btn(t4, "开始"), btn(t4, "取消")
+    for answer, why in (("26.08.01植被", "错名（填了期次名）"), (DATA, "错名（完整路径）"), (None, "取消")):
+        n0 = len(R["boxes"])
+        R.pop("dialog", None)
+        root.after(800, lambda a=answer: fill_dialog(root, a))
+        bs.invoke()
+        yield 0.5
+        new = R["boxes"][n0:]
+        check("原地确认框 %s → 不开始、原片不动、不建输出目录" % why,
+              bs.cget("state") == "normal" and snapshot() == before and not os.path.exists(out)
+              and (answer is None and not new or answer is not None and new and "确认名不正确" in new[-1][2]), new)
+    d = R.get("dialog") or {}
+    R["dialog_batch"] = d
+    check("确认框写明期数、张数、备份位置，警示色", any("1 期、共 97 张" in t and "备份" in t for t in d.get("texts", []))
+          and "#C62828" in str(d.get("colors")) and any("上级目录的名字" in t for t in d.get("texts", [])), d)
+
+    # 对名 → 跑 26.08.01植被，匹配中取消
+    def st(n):
+        return table()[n]["cells"][5]
+
+    gaps = {"last": time.time(), "max": 0.0}
+
+    def probe():
+        now = time.time()
+        gaps["max"] = max(gaps["max"], now - gaps["last"])
+        gaps["last"] = now
+        if not R.get("stop_probe"):
+            root.after(200, probe)
+
+    n0 = len(R["boxes"])
+    root.after(800, lambda: fill_dialog(root, os.path.basename(DATA)))
+    bs.invoke()
+    gaps["last"] = time.time()
+    root.after(200, probe)
+    check("对名后开跑", bs.cget("state") == "disabled" and bc.cget("state") == "normal")
+    lbl4 = [l for l in find(t4, ctk.CTkLabel) if int(l.cget("width")) == 260][0]
+    t4box = find(t4, ctk.CTkTextbox)[0]
+    yield (lambda: "匹配" in "\n".join(t4box.get("1.0", "end").splitlines()[-15:]) or bs.cget("state") == "normal"), 1200
+    R["progress_label"] = lbl4.cget("text")
+    check("进度显示「第 i/N 期」", R["progress_label"].startswith("第 1/1 期"), R["progress_label"])
+    yield 15
+    zips1 = sorted(glob.glob(os.path.join(DATA, "26.08.01植被", "定位备份_*.zip")))
+    check("原地模式：没有 _去定位 目录，备份在照片目录里", not glob.glob(os.path.join(out, "*_去定位")) and len(zips1) == 1,
+          (glob.glob(os.path.join(out, "*")), zips1))
+    bc.invoke()
+    yield wait_idle(bs)
+    R["after_cancel"] = st("26.08.01植被")
+    check("取消后这一期「已取消」", R["after_cancel"] == "已取消", R["after_cancel"])
+    new = R["boxes"][n0:]
+    R["cancel_box"] = new
+    check("取消弹窗提示重扫会显示待运行（上次已取消）、备份要留", new and "待运行（上次已取消）" in new[-1][2]
+          and "定位备份" in new[-1][2], new)
+
+    # 重扫 → 待运行（上次已取消）、默认勾上 → 再跑到完；旧结果目录改名保留
+    btn(t4, "扫描").invoke()
+    yield 0.8
+    tb = table()
+    check("重扫：上次被取消的期显示「待运行（上次已取消）」且勾上", tb["26.08.01植被"]["cells"][5] == "待运行（上次已取消）"
+          and tb["26.08.01植被"]["on"], tb["26.08.01植被"]["cells"])
+    old = glob.glob(os.path.join(out, "26.08.01植被*_控制点"))
+    n0 = len(R["boxes"])
+    root.after(800, lambda: fill_dialog(root, os.path.basename(DATA)))
+    bs.invoke()
+    yield 3
+    yield (lambda: bs.cget("state") == "normal"), 3600
+    R["stop_probe"] = True
+    R["ui_max_gap_s"] = round(gaps["max"], 2)
+    R["rerun_status"] = st("26.08.01植被")
+    check("重跑做完（自动通过/需人工核对 + RMS3D）", R["rerun_status"].split(" ")[0] in ("自动通过", "需人工核对")
+          and "mm" in R["rerun_status"], R["rerun_status"])
+    kept = glob.glob(os.path.join(out, "26.08.01植被_控制点_上次已取消_*"))
+    R["kept"] = kept
+    check("旧结果目录改名保留（_上次已取消_<时间>），里面的报告和 已取消.txt 还在", len(kept) == 1 and
+          os.path.isfile(os.path.join(kept[0], "控制点报告.txt")) and os.path.isfile(os.path.join(kept[0], "已取消.txt"))
+          and old == [os.path.join(out, "26.08.01植被_控制点")], (old, kept))
+    zips = sorted(glob.glob(os.path.join(DATA, "26.08.01植被", "定位备份_*.zip")))
+    R["zips"] = zips
+    check("重跑后仍没有 _去定位 目录", not glob.glob(os.path.join(out, "*_去定位")), glob.glob(os.path.join(out, "*")))
+    new = R["boxes"][n0:]
+    R["done_box"] = new
+    check("完成弹窗", new and "批量迁移完成" in new[-1][1] and "汇总表" in new[-1][2], new)
+    check("运行期间界面不卡（< 2 s）", gaps["max"] < 2.0, gaps["max"])
+    sums = sorted(glob.glob(os.path.join(out, "批量迁移汇总_*.csv")))
+    import csv as _csv
+    rows1 = list(_csv.DictReader(open(sums[0], encoding="utf-8-sig")))
+    rows = list(_csv.DictReader(open(sums[-1], encoding="utf-8-sig")))
+    R["summary_rows"] = [rows1, rows]
+    check("第一次（被取消）汇总表新两列：照片处理=原地抹除、定位备份=那份 zip", len(sums) == 2 and rows1
+          and rows1[-1]["状态"] == "已取消" and rows1[-1]["照片处理"] == "原地抹除" and rows1[-1]["定位备份"] == zips1[0],
+          rows1)
+    # 取消时如果抹除已经做完，重跑时原片已无定位 → 不再写备份；取消落在抹除中途 → 重跑再写一份（两份都要留）
+    again = rows and rows[-1]["照片处理"] == "原地抹除"
+    check("重跑那次汇总表：照片处理 %s、定位备份和备份文件数对得上" % (rows[-1]["照片处理"] if rows else "?"),
+          rows and rows[-1]["照片处理"] in ("原地抹除", "原片无定位") and zips1[0] in zips
+          and len(zips) == (2 if again else 1) and (rows[-1]["定位备份"] == (zips[-1] if again else "")), (rows, zips))
+
+    # 关窗口二次确认：清空跳过名单、复制模式跑 0802上午梯田，运行中点关窗口
+    radios["copy"].invoke()
+    set_entry(e_skip, "")
+    btn(t4, "扫描").invoke()
+    yield 0.8
+    tb = table()
+    if tb["26.08.01植被"]["on"]:
+        tb["26.08.01植被"]["cb"].toggle()
+    check("清空跳过名单后 0802上午梯田 待运行", table()["0802上午梯田"]["cells"][5] == "待运行", table()["0802上午梯田"]["cells"])
+    bs.invoke()
+    yield (lambda: st("0802上午梯田") == "运行中"), 120
+    yield 3
+    n0 = len(R["boxes"])
+    R["close_test"] = "started"
+    save()
+    root.tk.call(root.protocol("WM_DELETE_WINDOW"))
+    R["close_box"] = R["boxes"][n0:]
+    R["close_label"] = lbl4.cget("text")
+    check("跑批时点关窗口 → 二次确认，写明停在当前这一期", R["close_box"] and R["close_box"][0][0] == "askyesno"
+          and "当前这一期" in R["close_box"][0][2], R["close_box"])
+    check("确认后显示正在停止、窗口还在", root.winfo_exists() and "停" in R["close_label"], R["close_label"])
+    save()
+    yield 3600  # 当前这一期停好后程序自己关窗口；关窗后这里不会再执行
+
+
 def fill_dialog(root, answer):
     tops = [w for w in root.winfo_children() if isinstance(w, ctk.CTkToplevel) and w.winfo_exists()]
     if not tops:
@@ -587,7 +821,7 @@ def fill_dialog(root, answer):
 
 def drive(root):
     nb = find(root, ctk.CTkTabview)[0]
-    gen = {"shots": steps_shots, "batch": steps_batch}.get(MODE, steps_invoke)(root, nb)
+    gen = {"shots": steps_shots, "batch": steps_batch, "batch8": steps_batch8}.get(MODE, steps_invoke)(root, nb)
 
     def tick(cond=None, deadline=0):
         if cond is not None and not cond() and time.time() < deadline:

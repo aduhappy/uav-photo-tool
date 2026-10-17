@@ -54,7 +54,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -2734,8 +2734,10 @@ BATCH_NOT_PERIOD = (OUTPUT_SUFFIX, ALIGN_SUFFIX, GCP_SUFFIX)  # 名字这样结�
 BATCH_DEFAULT_RULES = ({"key": "梯田", "psx": "", "exclude": ""}, {"key": "植被", "psx": "", "exclude": ""})
 BATCH_EXIT_TEXT = {0: "自动通过", 1: "失败", 2: "拒绝", 3: "已取消", 4: "需人工核对"}
 BATCH_CSV_FIELDS = ("序号", "期次", "类型", "照片数", "参考期", "排除点", "状态", "退出码", "判定", "RMS3D", "对齐",
-                    "耗时分钟", "报告")
+                    "耗时分钟", "报告", "照片处理", "定位备份")  # 最后两列 T8（D-26）加
 BATCH_WAIT_POLL = 30  # 秒：本机有别的 Metashape 在跑时，隔这么久再看一次
+BATCH_PHOTO_MODES = ("copy", "inplace")  # D-26：复制去定位照片到输出目录（默认）/ 直接在原照片上抹除定位
+BATCH_RERUN_LABEL = {"cancelled": "已取消", "failed": "失败"}
 
 
 def _name_sort_key():
@@ -2780,6 +2782,126 @@ def batch_find_report(out_dir, name):
         if r.is_file():
             return r
     return None
+
+
+def batch_result_state(out_dir, name):
+    """D-27：这一期在输出目录里的结果。返回 (状态, 报告, 结果目录)：
+    done（判定 自动通过/需人工核对）/ cancelled（判定 已取消 或有 已取消.txt）/ failed（判定 失败）/ None（没有报告）。
+    报告里没有可识别的判定时照 T7 算 done（不动它）。"""
+    rep = batch_find_report(out_dir, name)
+    if rep is None:
+        return None, None, None
+    verdict = batch_read_report(rep)["判定"]
+    if (rep.parent / "已取消.txt").exists() or verdict == "已取消":
+        return "cancelled", rep, rep.parent
+    if verdict == "失败":
+        return "failed", rep, rep.parent
+    return "done", rep, rep.parent
+
+
+def batch_set_aside(result_dir, state, log=None):
+    """重跑前把上次已取消/失败的结果目录改名 <原名>_上次<已取消|失败>_<时间> 保留，不删除。返回新路径。"""
+    log = log or (lambda s: None)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    new = result_dir.with_name("%s_上次%s_%s" % (result_dir.name, BATCH_RERUN_LABEL[state], stamp))
+    k = 2
+    while new.exists():
+        new = result_dir.with_name("%s_上次%s_%s_%d" % (result_dir.name, BATCH_RERUN_LABEL[state], stamp, k))
+        k += 1
+    try:
+        os.rename(str(result_dir), str(new))
+    except OSError as ex:
+        raise ValueError("上次%s的结果目录改名失败（可能有文件被占用）：%s —— %s" % (BATCH_RERUN_LABEL[state], result_dir, ex))
+    log("  上次%s的结果已改名保留：%s → %s" % (BATCH_RERUN_LABEL[state], result_dir.name, new.name))
+    return new
+
+
+def _dir_writable(d):
+    """真的建一个临时文件再删掉来试（只读盘、ACL 拒绝写入时 os.access 在 Windows 上查不出来）。"""
+    probe = Path(d) / (".uav写入检查_%d_%d.tmp_part" % (os.getpid(), threading.get_ident()))
+    try:
+        fd = os.open(str(probe), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.unlink(str(probe))
+    except OSError:
+        pass
+    return True
+
+
+def check_batch_in_place(root, items, confirm):
+    """D-26 原地模式开跑前检查：确认名 = 照片上级目录的名字；上级目录和要跑的各期照片目录都能写。
+    不满足抛 ValueError，什么都不动（不建输出目录）。"""
+    root = Path(os.path.abspath(root)) if root else None
+    if root is None or not root.is_dir():
+        raise ValueError("照片上级目录不存在：%s" % root)
+    if not root.name:
+        raise ValueError("照片上级目录是盘符根（%s），原地模式不接受，请选到具体目录" % root)
+    if confirm != root.name:
+        raise ValueError("确认名不正确：原地模式必须输入照片上级目录的名字「%s」（不是完整路径）" % root.name)
+    dirs = [root] + [Path(it["dir"]) for it in items if it["status"].startswith("待运行")]
+    for d in dirs:
+        if not _dir_writable(d):
+            raise ValueError("照片目录不可写（只读盘或没有写权限），原地模式整批拒绝，什么都没动：%s" % d)
+
+
+class BatchItemFailed(Exception):
+    """批量里这一期失败（如原地抹除有照片没抹成），不跑迁移。"""
+
+
+def _batch_strip_in_place(photo_dir, n_expected, info, log, progress, stop_event):
+    """D-26 原地模式的一期：原目录里有带定位的照片就调 T5 run_strip_in_place（留备份、不剔姿态、只处理这一层），
+    有一张失败就抛 BatchItemFailed；全部没定位就跳过。info 里填「照片处理」「定位备份」（中途出错也填到已知的为止）。"""
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    src = Path(photo_dir)
+    photos = list_jpegs(src)
+    located, unreadable = [], []
+    for i, p in enumerate(photos, 1):
+        if stopped():
+            raise AlignCancelled()
+        try:
+            if photo_has_location(p):
+                located.append(p)
+        except Exception as ex:
+            unreadable.append("%s（%s）" % (p.name, ex))
+        if i % 20 == 0 or i == len(photos):
+            progress(0.0, "检查定位 %d/%d" % (i, len(photos)))
+    if unreadable:
+        raise BatchItemFailed("有 %d 张照片读不了，不抹除、不跑迁移：%s" % (len(unreadable), "；".join(unreadable[:5])))
+    if not located:
+        log("  原片无定位（%d 张都不带定位），跳过抹除" % len(photos))
+        info["照片处理"] = "原片无定位"
+        return
+    log("  原地抹除：%d/%d 张带定位，直接改原照片（先写定位备份）→ %s" % (len(located), len(photos), src))
+    info["照片处理"] = "原地抹除"
+    try:
+        st = run_strip_in_place(src, recursive=False, strip_attitude=False, no_backup=False, confirm=src.name,
+                                progress=lambda i, n: progress(0.0, "原地抹除 %d/%d" % (i, n)), log=log,
+                                stop_event=stop_event)
+    except Exception as ex:  # 备份写不进去等：照片还没动
+        raise BatchItemFailed("原地抹除没做成，这一期不跑迁移：%s: %s" % (type(ex).__name__, ex))
+    backup = info["定位备份"] = st.get("备份", "")
+    if stopped():
+        log("  原地抹除中途取消：已抹的照片留着；定位备份 %s 要留着（重跑会再写一份，两份都要留）" % backup)
+        raise AlignCancelled()
+    if st["失败"]:
+        why = []
+        try:
+            with open(st["日志"], encoding="utf-8-sig", newline="") as f:
+                why = ["%s：%s" % (r[0], r[4]) for r in csv.reader(f) if len(r) >= 5 and r[1] == "失败"]
+        except OSError:
+            pass
+        raise BatchItemFailed("原地抹除有 %d 张失败，这一期不跑迁移（详见 %s）：%s" % (
+            st["失败"], st["日志"], "；".join(why[:5]) or "原因见日志"))
+    still = [p for p in list_jpegs(src) if photo_has_location(p)]  # 交给 run_gcp_transfer 前确认已无定位，否则它会复制
+    if still:
+        raise BatchItemFailed("原地抹除后仍有 %d 张带定位（如 %s），这一期不跑迁移" % (len(still), still[0].name))
+    n_now = len(list_jpegs(src))
+    if n_now != n_expected:
+        raise BatchItemFailed("原地抹除后照片数变了（%d → %d），这一期不跑迁移" % (n_expected, n_now))
+    log("  原地抹除完成：抹除 %d 张、本来无定位 %d 张；定位备份 %s" % (st["成功"], st["跳过"], backup))
 
 
 def batch_read_report(path):
@@ -2846,7 +2968,8 @@ def check_batch_rules(rules):
 
 
 def batch_scan(root, rules, out_dir, skip=()):
-    """扫描：每期一个 dict（序号、期次、规则、照片数、参考期、排除点、状态 = 待运行 / 已有结果 / 跳过：原因）。"""
+    """扫描：每期一个 dict（序号、期次、规则、照片数、参考期、排除点、状态 = 待运行 / 待运行（上次已取消|失败）/
+    已有结果 / 跳过：原因）。"""
     if not root or not Path(root).is_dir():
         raise ValueError("照片上级目录不存在：%s" % root)
     items = []
@@ -2855,18 +2978,18 @@ def batch_scan(root, rules, out_dir, skip=()):
         it = {"idx": i, "name": name, "dir": str(d), "n": n, "rule": rule["key"] if rule else "", "ref": "", "exclude": "",
               "status": "待运行", "report": ""}
         if name in skip:
-            it["status"] = "跳过：在 --skip 里"
+            it["status"] = "跳过：在跳过名单里"
         elif rule is None:
             it["status"] = "跳过：没有匹配的规则"
         elif not rule["psx"]:
             it["status"] = "跳过：规则「%s」没填参考期" % rule["key"]
         else:
             it["ref"], it["exclude"] = rule["psx"], rule["exclude"]
-        rep = batch_find_report(out_dir, name) if out_dir else None
+        state, rep, _ = batch_result_state(out_dir, name) if out_dir else (None, None, None)
         if rep:
             it["report"] = str(rep)
             if it["status"] == "待运行":
-                it["status"] = "已有结果"
+                it["status"] = "已有结果" if state == "done" else "待运行（上次%s）" % BATCH_RERUN_LABEL[state]
         items.append(it)
     return items
 
@@ -2911,31 +3034,45 @@ def _fmt_minutes(secs):
 
 
 def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None, on_item=None, stop_event=None,
-                  summary=None, wait_poll=BATCH_WAIT_POLL, **timeouts):
-    """按顺序处理 items（batch_scan 的结果里选中的那些）：状态不是「待运行」的照写一行；待运行的串行调 run_gcp_transfer。
+                  summary=None, wait_poll=BATCH_WAIT_POLL, photo_mode="copy", root=None, confirm=None, **timeouts):
+    """按顺序处理 items（batch_scan 的结果里选中的那些）：状态不是「待运行…」的照写一行；待运行的串行调 run_gcp_transfer。
     每期写一次汇总 CSV。on_item(item, 阶段, 文字)：阶段 wait/start/done。取消时当前这一期按 stop_event 停下，
-    剩下的不开始。返回 {"rows", "summary", "cancelled", "exit", "counts"}；
-    exit：0 全部自动通过或跳过 / 4 有需人工核对 / 1 有失败 / 3 取消。"""
+    剩下的不开始。photo_mode：copy（默认，复制去定位照片到输出目录）/ inplace（D-26，直接在原照片上抹除定位，
+    须给 root 和 confirm = 上级目录名；检查不过抛 ValueError、什么都不动）。上次已取消/失败的期重跑前把旧结果目录改名保留（D-27）。
+    返回 {"rows", "summary", "cancelled", "exit", "counts"}；exit：0 全部自动通过或跳过 / 4 有需人工核对 / 1 有失败 / 3 取消。"""
     log = log or (lambda s: None)
     progress = progress or (lambda f, s: None)
     on_item = on_item or (lambda it, phase, text: None)
     stopped = lambda: stop_event is not None and stop_event.is_set()
+    if photo_mode not in BATCH_PHOTO_MODES:
+        raise ValueError("照片处理方式只能是 %s：%s" % ("/".join(BATCH_PHOTO_MODES), photo_mode))
+    in_place = photo_mode == "inplace"
+    if in_place:
+        check_batch_in_place(root, items, confirm)  # 在建输出目录之前：不过就什么都不动
     out_dir = Path(os.path.abspath(out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = Path(summary) if summary else out_dir / ("批量迁移汇总_%s.csv" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     rows, cancelled = [], False
-    log("—— 批量迁移：选中 %d 期，其中待运行 %d 期%s" % (len(items), sum(it["status"] == "待运行" for it in items),
+    log("—— 批量迁移：选中 %d 期，其中待运行 %d 期%s" % (len(items), sum(it["status"].startswith("待运行") for it in items),
                                                 "（只列计划）" if plan else ""))
+    log("照片处理方式：%s" % ("直接在原照片上抹除定位（不复制，定位备份写在各期照片目录里）" if in_place
+                        else "复制一份去定位照片到输出目录（原片不动）"))
     log("输出目录：%s" % out_dir)
     write_batch_summary(summary, rows)
     for pos, it in enumerate(items, 1):
         tag = "[%d/%d · 序号 %d] %s" % (pos, len(items), it["idx"], it["name"])
         row = _batch_row(it)
-        if it["status"] == "待运行" and not plan:
-            rep = batch_find_report(out_dir, it["name"])  # 开跑前再看一次：上一期跑的时候别的电脑可能已经做完
-            if rep:
+        stripped = out_dir / (it["name"] + OUTPUT_SUFFIX)
+        has_stripped = stripped.is_dir() and any(stripped.iterdir())
+        prev = None  # 上次已取消/失败的结果：(状态, 结果目录)
+        if it["status"].startswith("待运行") and not plan:
+            # 开跑前再看一次：上一期跑的时候别的电脑可能已经做完
+            state, rep, rdir = batch_result_state(out_dir, it["name"])
+            if state == "done":
                 it["status"], it["report"] = "已有结果", str(rep)
-        if it["status"] != "待运行":
+            elif state:
+                prev = (state, rdir)
+        if not it["status"].startswith("待运行"):
             row["状态"] = "跳过：已有结果" if it["status"] == "已有结果" else it["status"]
             if it["report"]:
                 _fill_from_report(row, it["report"])
@@ -2943,8 +3080,10 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
             on_item(it, "done", it["status"])
         elif plan:
             row["状态"] = "计划运行"
-            log("%s（%s，%d 张）→ 会用参考期 %s%s" % (tag, it["rule"], it["n"], row["参考期"],
-                                               "，排除点 %s" % it["exclude"] if it["exclude"] else ""))
+            row["照片处理"] = "用已有去定位" if has_stripped else "原地抹除" if in_place else "复制"
+            log("%s（%s，%d 张）→ 会用参考期 %s%s；照片：%s%s" % (
+                tag, it["rule"], it["n"], row["参考期"], "，排除点 %s" % it["exclude"] if it["exclude"] else "",
+                row["照片处理"], "；%s，旧结果目录会改名保留后重跑" % it["status"] if it["status"] != "待运行" else ""))
         else:
             waited = False
             while not stopped() and other_metashape_running():
@@ -2952,7 +3091,7 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
                     log("%s：本机已有别的 Metashape 在跑，等它结束（每 %d 秒看一次）… %s" % (
                         tag, wait_poll, datetime.datetime.now().strftime("%H:%M")))
                     on_item(it, "wait", "等待其他 Metashape")
-                    progress(0.0, "等待其他 Metashape")
+                    progress(0.0, "第 %d/%d 期 · 等待其他 Metashape" % (pos, len(items)))
                     waited = True
                 if stop_event is not None:
                     stop_event.wait(wait_poll)
@@ -2960,14 +3099,16 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
                     time.sleep(wait_poll)
             if stopped():
                 cancelled = True
-                on_item(it, "done", "待运行")
+                on_item(it, "done", it["status"])
                 log("已取消：%s 及之后的 %d 期都没有开始" % (it["name"], len(items) - pos + 1))
                 break
             log("%s → 开始（参考期 %s%s） %s" % (tag, row["参考期"], "，排除点 %s" % it["exclude"] if it["exclude"] else "",
                                          datetime.datetime.now().strftime("%H:%M")))
             on_item(it, "start", "运行中")
+            iprog = lambda f, s, pos=pos: progress(f, "第 %d/%d 期 · %s" % (pos, len(items), s))
             t0 = time.time()
             res, code = None, 1
+            info = {"照片处理": "", "定位备份": ""}
             with open(out_dir / ("%s_运行日志.txt" % it["name"]), "a", encoding="utf-8") as flog:
                 def plog(s):
                     log(s)
@@ -2975,25 +3116,38 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
                     flog.flush()
 
                 try:
+                    if prev:
+                        batch_set_aside(prev[1], prev[0], plog)
                     # 上次已经去定位过（输出目录里有 <名>_去定位），就直接用它，避免工具因去定位目录非空而拒绝
                     photo_dir = it["dir"]
-                    stripped = out_dir / (it["name"] + OUTPUT_SUFFIX)
-                    if stripped.is_dir() and any(stripped.iterdir()):
+                    if has_stripped:
                         n = _count_jpegs(stripped)
                         if n != it["n"]:
                             raise ValueError("上次去定位没做完（%s 里 %d 张，原目录 %d 张）：删掉这个目录后重跑" % (
                                 stripped, n, it["n"]))
                         photo_dir = str(stripped)
+                        info["照片处理"] = "用已有去定位"
                         plog("  用已去定位的照片：%s" % stripped)
+                    elif in_place:
+                        _batch_strip_in_place(it["dir"], it["n"], info, plog, iprog, stop_event)
                     res = run_gcp_transfer(photo_dir, it["ref"], metashape, out_dir, log=plog, stop_event=stop_event,
-                                           progress=progress, exclude=it["exclude"], **timeouts)
+                                           progress=iprog, exclude=it["exclude"], **timeouts)
                     code = {"自动通过": 0, "需人工核对": 4, "已取消": 3}.get(res["status"], 1)
                 except ValueError as ex:
                     plog("拒绝执行：%s" % ex)
                     code = 2
+                except BatchItemFailed as ex:
+                    plog("失败：%s" % ex)
+                    code = 1
                 except (AlignCancelled, KeyboardInterrupt):
                     plog("已取消")
                     code = 3
+            if not info["照片处理"]:  # 复制模式：看 run_gcp_transfer 是先去定位了，还是原片本来就没定位
+                if res is not None:
+                    info["照片处理"] = "复制" if res.get("note", "").startswith("原照片带定位") else "原片无定位"
+                elif stripped.is_dir():
+                    info["照片处理"] = "复制"
+            row.update(info)
             row["耗时分钟"] = _fmt_minutes(time.time() - t0)
             row["退出码"] = code
             row["状态"] = BATCH_EXIT_TEXT[code]
@@ -3018,6 +3172,9 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
         counts[r["状态"]] = counts.get(r["状态"], 0) + 1
     for st, c in counts.items():
         log("  %s：%d 期" % (st, c))
+    backups = [r["定位备份"] for r in rows if r.get("定位备份")]
+    if backups:
+        log("本次写了 %d 份定位备份（在各期照片目录里；要还原用「剔除定位」页签的「从备份还原」或命令行 restore-gps）" % len(backups))
     states = set(counts)
     code = 3 if cancelled else 1 if states & {"失败", "拒绝"} else 4 if "需人工核对" in states else 0
     return {"rows": rows, "summary": str(summary), "cancelled": cancelled, "exit": code, "counts": counts}
@@ -3278,8 +3435,9 @@ def run_gui():
             pass
         root.after(100, poll)
 
-    def ask_inplace_confirm(count):
-        """原地抹除确认框（警示色）：须输入照片目录名；取消/关窗返回 None，确认返回输入的文字（同 askstring）。"""
+    def ask_inplace_confirm(count, message=None, prompt=None):
+        """原地抹除确认框（警示色）：须输入照片目录名；取消/关窗返回 None，确认返回输入的文字（同 askstring）。
+        message/prompt 不给就用「剔除定位」页签的文字。"""
         dlg = ctk.CTkToplevel(root)
         dlg.title(APP_NAME + " - 警告：不可恢复")
         dlg.resizable(False, False)
@@ -3288,9 +3446,9 @@ def run_gui():
         v_name = tk.StringVar()
         ctk.CTkLabel(dlg, text="⚠ 警告：不可恢复！", text_color=danger,
                      font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=20, pady=(18, 4))
-        ctk.CTkLabel(dlg, text="会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。" % count, text_color=danger,
+        ctk.CTkLabel(dlg, text=message or "会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。" % count, text_color=danger,
                      font=ctk.CTkFont(weight="bold"), wraplength=440, justify="left").pack(anchor="w", padx=20, pady=4)
-        ctk.CTkLabel(dlg, text="请输入照片目录的名字（不是完整路径）以确认：").pack(anchor="w", padx=20, pady=(8, 2))
+        ctk.CTkLabel(dlg, text=prompt or "请输入照片目录的名字（不是完整路径）以确认：").pack(anchor="w", padx=20, pady=(8, 2))
         ent = ctk.CTkEntry(dlg, textvariable=v_name, width=440, border_color=danger)
         ent.pack(padx=20, pady=(0, 12))
 
@@ -3766,7 +3924,9 @@ def run_gui():
     v4_out = tk.StringVar(value=cfg4.get("batch_out", ""))
     v4_ms = tk.StringVar(value=find_metashape())
     v4_filter = tk.StringVar()
-    st4 = {"stop": None, "items": [], "rows": [], "scanned": None}
+    v4_mode = tk.StringVar(value="copy")  # D-26：不记进 config.json，每次启动都是「复制」
+    v4_skip = tk.StringVar(value=cfg4.get("batch_skip", ""))
+    st4 = {"stop": None, "items": [], "rows": [], "scanned": None, "running": False, "closing": False}
     q4 = queue.Queue()
     rows4 = (
         ("照片上级目录：", v4_root, lambda: pick_dir(v4_root, "选择照片上级目录（每个直接含照片的子目录算一期，只读）")),
@@ -3787,6 +3947,36 @@ def run_gui():
         ctk.CTkLabel(rf, text=t, text_color=hint_color, height=20).grid(row=0, column=c, sticky="w", padx=(6, 4))
     rules4 = []
 
+    def show_tail(e):  # 路径太长时让输入框显示尾部（文件名）；正在编辑的不动
+        try:
+            if e.focus_get() is not e._entry:
+                e.xview_moveto(1.0)
+        except (tk.TclError, KeyError):
+            pass
+
+    def tooltip(w, text_of):
+        tip = {"w": None}
+
+        def show(ev):
+            text = text_of()
+            if not text or tip["w"] is not None:
+                return
+            tw = tk.Toplevel(w)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry("+%d+%d" % (ev.x_root + 12, ev.y_root + 18))
+            tk.Label(tw, text=text, background="#FFFFE0", foreground="black", relief="solid", borderwidth=1,
+                     padx=4, pady=2).pack()
+            tip["w"] = tw
+
+        def hide(ev=None):
+            if tip["w"] is not None:
+                tip["w"].destroy()
+                tip["w"] = None
+
+        w.bind("<Enter>", show, add="+")
+        w.bind("<Leave>", hide, add="+")
+        w.bind("<ButtonPress>", hide, add="+")
+
     def regrid_rules():
         for i, r in enumerate(rules4, 1):
             for c, w in enumerate(r["widgets"]):
@@ -3794,15 +3984,21 @@ def run_gui():
 
     def add_rule(key="", psx="", exclude=""):
         r = {"key": tk.StringVar(value=key), "psx": tk.StringVar(value=psx), "exclude": tk.StringVar(value=exclude)}
+        e_psx = ctk.CTkEntry(rf, textvariable=r["psx"])
         r["widgets"] = (
             ctk.CTkEntry(rf, textvariable=r["key"], width=80),
-            ctk.CTkEntry(rf, textvariable=r["psx"]),
+            e_psx,
             button(rf, "浏览…", lambda: pick_file(r["psx"], "选择规则「%s」的参考期工程" % r["key"].get(), psx_types)),
             ctk.CTkEntry(rf, textvariable=r["exclude"], width=60),
             button(rf, "删除", lambda: del_rule(r), width=52),
         )
+        r["psx"].trace_add("write", lambda *_: e_psx.after_idle(lambda: show_tail(e_psx)))
+        e_psx.bind("<FocusOut>", lambda ev: show_tail(e_psx), add="+")
+        e_psx.bind("<Configure>", lambda ev: show_tail(e_psx), add="+")
+        tooltip(e_psx, lambda: r["psx"].get().strip())
         rules4.append(r)
         regrid_rules()
+        e_psx.after_idle(lambda: show_tail(e_psx))
 
     def del_rule(r):
         for w in r["widgets"]:
@@ -3817,12 +4013,25 @@ def run_gui():
     button(rf, "＋ 添加规则", lambda: add_rule(), width=96).grid(row=0, column=4, padx=(0, 4), pady=(3, 3))
     for r in cfg4.get("batch_rules") or BATCH_DEFAULT_RULES:
         add_rule(r.get("key", ""), r.get("psx", ""), r.get("exclude", ""))
-    hint(tab4, "直接含照片的子目录算一期。已有「控制点报告.txt」的期跳过，已有「<名>_去定位」的直接用。勾上且「待运行」的期"
-               "一期接一期地跑，本机有别的 Metashape 在跑就先等。筛选只影响显示；四个勾选按钮只作用于当前显示的行。"
-               ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
+    of4 = ctk.CTkFrame(tab4, fg_color="transparent")
+    of4.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+    of4.columnconfigure(2, weight=1)
+    ctk.CTkLabel(of4, text="照片处理方式：").grid(row=0, column=0, sticky="w")
+    ctk.CTkRadioButton(of4, text="复制一份去定位照片到输出目录（原片不动）", variable=v4_mode, value="copy",
+                       radiobutton_width=18, radiobutton_height=18).grid(row=0, column=1, sticky="w", padx=(0, 12))
+    ctk.CTkRadioButton(of4, text="直接在原照片上抹除定位（不复制，留定位备份）", variable=v4_mode, value="inplace",
+                       text_color=danger, fg_color=danger, hover_color=danger_hover, radiobutton_width=18,
+                       radiobutton_height=18).grid(row=0, column=2, sticky="w")
+    ctk.CTkLabel(of4, text="跳过这些期次（逗号分隔）：").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    ctk.CTkEntry(of4, textvariable=v4_skip).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0), padx=(150, 0))
+    hint(tab4, "直接含照片的子目录算一期。判定为自动通过/需人工核对的期算已有结果、跳过；上次已取消或失败的期显示"
+               "「待运行（上次…）」，重跑前旧结果目录改名保留。已有「<名>_去定位」的直接用。复制方式每期多占一份照片的空间；"
+               "原地方式直接改原照片的定位，定位备份写在各期照片目录里（可还原）。判定会有波动，需人工核对的期可以先重跑一次"
+               "（把它的 _控制点 目录改名后重扫）。筛选只影响显示；四个勾选按钮只作用于当前显示的行。"
+               ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
     tb4 = ctk.CTkFrame(tab4, fg_color="transparent")
-    tb4.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 2))
+    tb4.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(2, 2))
     btn4_scan = button(tb4, "扫描", primary=True)
     btn4_scan.pack(side="left")
     ctk.CTkLabel(tb4, text="筛选：").pack(side="left", padx=(12, 0))
@@ -3836,16 +4045,17 @@ def run_gui():
     lbl4_count.pack(side="left", padx=(10, 0))
 
     lst4 = ctk.CTkScrollableFrame(tab4, height=150)
-    lst4.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
+    lst4.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
     lst4.columnconfigure(6, weight=1)
-    tab4.rowconfigure(6, weight=1)
+    tab4.rowconfigure(7, weight=1)
     cols4 = (("", 28, "w"), ("序号", 36, "e"), ("期次", 150, "w"), ("匹配规则", 64, "w"), ("照片数", 52, "e"),
              ("参考期", 210, "w"), ("状态", 120, "w"))
     for c, (t, w, a) in enumerate(cols4):
         if t:
             ctk.CTkLabel(lst4, text=t, width=w, anchor=a, text_color=hint_color, height=20).grid(row=0, column=c, sticky="ew",
                                                                                              padx=(0, 6))
-    status_color = {"自动通过": ("#2E7D32", "#81C784"), "需人工核对": ("#E65100", "#FFB74D"), "失败": danger,
+    status_color = {"待运行（": ("#6A1B9A", "#CE93D8"), "自动通过": ("#2E7D32", "#81C784"),
+                    "需人工核对": ("#E65100", "#FFB74D"), "失败": danger,
                     "已取消": hint_color, "运行中": ("#1565C0", "#64B5F6"), "等待其他 Metashape": ("#1565C0", "#64B5F6")}
 
     def color_of(text):
@@ -3861,7 +4071,7 @@ def run_gui():
         rs = st4["rows"]
         sel = [r for r in rs if r["var"].get()]
         lbl4_count.configure(text="已勾 %d 期（待运行 %d）；显示 %d/%d" % (
-            len(sel), sum(r["item"]["status"] == "待运行" for r in sel), sum(visible(r) for r in rs), len(rs)))
+            len(sel), sum(r["item"]["status"].startswith("待运行") for r in sel), sum(visible(r) for r in rs), len(rs)))
 
     def apply_filter(*_):  # 只改显示；勾选状态放在每行自己的变量里，藏起来也不变
         for r in st4["rows"]:
@@ -3878,7 +4088,7 @@ def run_gui():
         for r in st4["rows"]:
             if visible(r):
                 r["var"].set({"全选": True, "全不选": False, "反选": not r["var"].get(),
-                              "只勾待运行": r["item"]["status"] == "待运行"}[kind])
+                              "只勾待运行": r["item"]["status"].startswith("待运行")}[kind])
         update_count()
 
     for b in bulk4:
@@ -3893,7 +4103,7 @@ def run_gui():
                 w.destroy()
         st4["rows"] = []
         for i, it in enumerate(items, 1):
-            var = tk.BooleanVar(value=it["status"] == "待运行")
+            var = tk.BooleanVar(value=it["status"].startswith("待运行"))
             cells = (ctk.CTkCheckBox(lst4, text="", width=28, checkbox_width=20, checkbox_height=20, variable=var,
                                      command=update_count),
                      str(it["idx"]), it["name"], it["rule"] or "—", str(it["n"]), Path(it["ref"]).name if it["ref"] else "",
@@ -3910,11 +4120,12 @@ def run_gui():
 
     def scan_key():
         return (v4_root.get().strip(), os.path.abspath(v4_out.get().strip()) if v4_out.get().strip() else "",
-                json.dumps(rules_now(), ensure_ascii=False))
+                json.dumps(rules_now(), ensure_ascii=False), tuple(_split_names(v4_skip.get())))
 
     def save4():
         cfg = load_config()
-        cfg.update(batch_root=v4_root.get().strip(), batch_out=v4_out.get().strip(), batch_rules=rules_now())
+        cfg.update(batch_root=v4_root.get().strip(), batch_out=v4_out.get().strip(), batch_rules=rules_now(),
+                   batch_skip=",".join(_split_names(v4_skip.get())))  # 照片处理方式不记（D-26）
         if v4_ms.get().strip():
             cfg["metashape"] = v4_ms.get().strip()
         save_config(cfg)
@@ -3933,7 +4144,7 @@ def run_gui():
             messagebox.showwarning(APP_NAME, "\n".join(errs))
             return
         try:
-            items = batch_scan(root_dir, rules, os.path.abspath(out))
+            items = batch_scan(root_dir, rules, os.path.abspath(out), skip=_split_names(v4_skip.get()))
         except (ValueError, OSError) as ex:
             messagebox.showwarning(APP_NAME, str(ex))
             return
@@ -3951,13 +4162,16 @@ def run_gui():
                 if v != "自动通过":
                     odd.append("%s（%s）" % (it["name"], v or "报告里没有判定"))
         if odd:
-            q4.put(("log", "注意：这些期已有结果但不是自动通过，会跳过；想重跑就删掉输出目录里它的 _控制点 目录再扫描：%s"
-                    % "、".join(odd)))
+            q4.put(("log", "注意：这些期已有结果但不是自动通过，会跳过；判定会有波动，想重跑一次就把输出目录里它的 _控制点 "
+                           "目录改名后再扫描：%s" % "、".join(odd)))
+        again = [it["name"] for it in items if it["status"].startswith("待运行（")]
+        if again:
+            q4.put(("log", "这些期上次已取消或失败，重跑前会把旧结果目录改名保留：%s" % "、".join(again)))
 
     btn4_scan.configure(command=scan4)
 
     bar4 = ctk.CTkFrame(tab4, fg_color="transparent")
-    bar4.grid(row=7, column=0, columnspan=3, sticky="ew")
+    bar4.grid(row=8, column=0, columnspan=3, sticky="ew")
     bar4.columnconfigure(0, weight=1)
     pb4 = ctk.CTkProgressBar(bar4, mode="determinate")
     pb4.set(0)
@@ -3969,7 +4183,7 @@ def run_gui():
     btn4_stop = button(bar4, "取消", state="disabled")
     btn4_stop.grid(row=0, column=3, padx=(6, 0))
     txt4 = log_box(tab4, 70)
-    txt4.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    txt4.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
     LOG4_KEEP = 1500  # 日志框只留最近这么多行，完整日志在输出目录的 批量迁移日志_<时间>.txt
 
     def poll4():
@@ -3984,7 +4198,7 @@ def run_gui():
                     txt4.see("end")
                 elif kind == "prog":
                     pb4.set(int(val[0] * 1000) / 1000)
-                    lbl4.configure(text=val[1][:36])
+                    lbl4.configure(text=val[1][:44])
                 elif kind == "item":
                     it, text = val
                     for r in st4["rows"]:
@@ -3996,6 +4210,10 @@ def run_gui():
                     btn4_scan.configure(state="normal")
                     btn4_stop.configure(state="disabled")
                     st4["scanned"] = None  # 状态都变了，再跑要先重新扫描
+                    st4["running"] = False
+                    if st4["closing"]:  # 用户点了关窗口：当前这一期已停好，现在关
+                        root.destroy()
+                        return
                     if isinstance(val, Exception):
                         lbl4.configure(text="失败")
                         txt4.insert("end", "出错：%s\n" % val)
@@ -4003,13 +4221,21 @@ def run_gui():
                         messagebox.showerror(APP_NAME, str(val))
                         continue
                     res, logf = val
-                    body = ["%s：%d 期" % kv for kv in res["counts"].items()] + ["", "汇总表：%s" % res["summary"],
-                                                                              "完整日志：%s" % logf]
+                    body = ["%s：%d 期" % kv for kv in res["counts"].items()]
+                    for st_name in ("需人工核对", "失败", "拒绝"):
+                        names = [r["期次"] for r in res["rows"] if r["状态"] == st_name]
+                        if names:
+                            body.append("%s：%s" % (st_name, "、".join(names)))
+                    nb_backup = sum(1 for r in res["rows"] if r.get("定位备份"))
+                    if nb_backup:
+                        body.append("本次写了 %d 份定位备份，在各期照片目录里（定位备份_<时间>.zip），都要留着。" % nb_backup)
+                    body += ["", "汇总表：%s" % res["summary"], "完整日志：%s" % logf]
                     if res["cancelled"]:
                         lbl4.configure(text="已取消")
                         last = res["rows"][-1] if res["rows"] else None
                         if last and last["状态"] == "已取消":
-                            body.append("\n被取消的「%s」结果不完整，不要使用；要重跑就先删掉输出目录里它的 _控制点 目录。" % last["期次"])
+                            body.append("\n被取消的「%s」结果不完整，不要使用；重新扫描会显示「待运行（上次已取消）」，"
+                                        "重跑时旧结果目录改名保留。" % last["期次"])
                         messagebox.showwarning(APP_NAME + " - 已取消",
                                                "已取消：已完成的期次结果都保留，剩下的没有开始。\n\n" + "\n".join(body))
                     else:
@@ -4035,11 +4261,30 @@ def run_gui():
             messagebox.showwarning(APP_NAME, err)
             return
         chosen = [r["item"] for r in st4["rows"] if r["var"].get()]
-        if not any(it["status"] == "待运行" for it in chosen):
+        if not any(it["status"].startswith("待运行") for it in chosen):
             messagebox.showwarning(APP_NAME, "勾选的期次里没有「待运行」的")
             return
-        save4()
         out = os.path.abspath(v4_out.get().strip())
+        mode, root_dir, confirm = v4_mode.get(), v4_root.get().strip(), None
+        if mode == "inplace":
+            todo = [it for it in chosen if it["status"].startswith("待运行") and not (
+                (Path(out) / (it["name"] + OUTPUT_SUFFIX)).is_dir() and any((Path(out) / (it["name"] + OUTPUT_SUFFIX)).iterdir()))]
+            confirm = ask_inplace_confirm(
+                sum(it["n"] for it in todo),
+                message="将直接修改 %d 期、共 %d 张原照片的定位，备份写在各期照片目录里（定位备份_<时间>.zip）。"
+                        "本来就没定位的照片不会改。" % (len(todo), sum(it["n"] for it in todo)),
+                prompt="请输入照片上级目录的名字（不是完整路径）以确认：")
+            if confirm is None:
+                return
+            if confirm != Path(os.path.abspath(root_dir)).name:
+                messagebox.showwarning(APP_NAME, "确认名不正确，未修改任何文件")
+                return
+            try:
+                check_batch_in_place(root_dir, chosen, confirm)
+            except ValueError as ex:
+                messagebox.showwarning(APP_NAME, str(ex))
+                return
+        save4()
         txt4.delete("1.0", "end")
         pb4.set(0)
         lbl4.configure(text="")
@@ -4048,6 +4293,7 @@ def run_gui():
         btn4_stop.configure(state="normal")
         stop = threading.Event()
         st4["stop"] = stop
+        st4["running"] = True
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         def work():
@@ -4062,7 +4308,8 @@ def run_gui():
 
                     res = run_gcp_batch(chosen, out, ms, log=log, progress=lambda f, s: q4.put(("prog", (f, s))),
                                         on_item=lambda it, phase, text: q4.put(("item", (it, text))), stop_event=stop,
-                                        summary=Path(out) / ("批量迁移汇总_%s.csv" % stamp))
+                                        summary=Path(out) / ("批量迁移汇总_%s.csv" % stamp), photo_mode=mode,
+                                        root=root_dir, confirm=confirm)
                 q4.put(("done", (res, str(logf))))
             except Exception as ex:
                 q4.put(("done", ex))
@@ -4074,8 +4321,22 @@ def run_gui():
             st4["stop"].set()
             lbl4.configure(text="正在取消…（当前这一期停下，剩下的不开始）")
 
+    def on_close():  # 跑批时误点关窗口：先问，确认后停在当前这一期，停好再关
+        if not st4["running"]:
+            root.destroy()
+            return
+        if st4["closing"]:
+            return
+        if messagebox.askyesno(APP_NAME + " - 批量迁移正在运行",
+                               "批量迁移正在运行。关掉窗口会停在当前这一期：当前这一期取消（结果不完整，下次扫描显示"
+                               "「待运行（上次已取消）」可重跑），剩下的不开始。\n\n确定要停止并关闭吗？"):
+            st4["closing"] = True
+            stop4()
+            lbl4.configure(text="正在停止当前这一期，停好后自动关闭…")
+
     btn4_start.configure(command=start4)
     btn4_stop.configure(command=stop4)
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(200, poll4)
 
     # 后续功能在这里加新页签：tab = nb.add("...")
@@ -4156,7 +4417,10 @@ def main(argv=None):
                     help="参考期规则，可给多次，从前往后匹配第一条，如 --rule 梯田=D:\梯田.psx:4 --rule 植被=D:\植被.psx")
     bt.add_argument("--include", default="", help="只要名字匹配的期（通配符，逗号分隔，如 \"*梯田*\"）")
     bt.add_argument("--pick", default="", help="按扫描序号选（如 1,3,5-9；先用 --plan 看序号）")
-    bt.add_argument("--skip", default="", help="不处理的期次名，逗号分隔（如参考期本身）")
+    bt.add_argument("--skip", default="", help="跳过名单：不处理的期次名，逗号分隔（如参考期本身）")
+    bt.add_argument("--in-place", action="store_true",
+                    help="直接在原照片上抹除定位（不复制，定位备份写在各期照片目录里；必须配 --confirm）；默认复制去定位照片到 --out")
+    bt.add_argument("--confirm", help="原地模式确认：照片上级目录的名字（不是完整路径）")
     bt.add_argument("--plan", action="store_true", help="只列计划、写汇总表，不运行")
     bt.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
     bt.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
@@ -4282,6 +4546,8 @@ def _cli_batch(args):
 
     try:
         try:
+            if args.confirm is not None and not args.in_place:
+                raise ValueError("--confirm 只能和 --in-place 一起用")
             rules = [parse_batch_rule(r) for r in args.rule]
             errs = check_batch_rules(rules)
             if errs:
@@ -4302,14 +4568,18 @@ def _cli_batch(args):
                 pick = parse_pick(args.pick, len(items))
                 chosen = [it for it in chosen if it["idx"] in pick]
                 log("按 --pick 选中 %d 期。" % len(chosen))
-        except ValueError as ex:
+        except (ValueError, OSError) as ex:  # OSError：上级目录读不了等
             log("拒绝执行：%s" % ex)
             return 2
         if not chosen:
             log("没有选中任何期次，结束。")
             return 0
         try:
-            res = run_gcp_batch(chosen, args.out, ms, plan=args.plan, log=log)
+            res = run_gcp_batch(chosen, args.out, ms, plan=args.plan, log=log,
+                                photo_mode="inplace" if args.in_place else "copy", root=args.root, confirm=args.confirm)
+        except ValueError as ex:  # 原地模式开跑前检查没过：什么都没动
+            log("拒绝执行：%s" % ex)
+            return 2
         except KeyboardInterrupt:
             log("已取消")
             return 3
