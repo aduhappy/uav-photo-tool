@@ -34,6 +34,7 @@
 import argparse
 import csv
 import datetime
+import fnmatch
 import hashlib
 import stat
 import glob
@@ -53,7 +54,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -2726,6 +2727,303 @@ def run_gcp_init(psx, csv_path, metashape, cc_path=None, out_base=None, accuracy
 
 
 # ---------------------------------------------------------------------------
+# 批量迁移（D-24）：扫描上级目录，按规则表配参考期，一期接一期调 run_gcp_transfer
+# ---------------------------------------------------------------------------
+
+BATCH_NOT_PERIOD = (OUTPUT_SUFFIX, ALIGN_SUFFIX, GCP_SUFFIX)  # 名字这样结尾的目录不算一期
+BATCH_DEFAULT_RULES = ({"key": "梯田", "psx": "", "exclude": ""}, {"key": "植被", "psx": "", "exclude": ""})
+BATCH_EXIT_TEXT = {0: "自动通过", 1: "失败", 2: "拒绝", 3: "已取消", 4: "需人工核对"}
+BATCH_CSV_FIELDS = ("序号", "期次", "类型", "照片数", "参考期", "排除点", "状态", "退出码", "判定", "RMS3D", "对齐",
+                    "耗时分钟", "报告")
+BATCH_WAIT_POLL = 30  # 秒：本机有别的 Metashape 在跑时，隔这么久再看一次
+
+
+def _name_sort_key():
+    """期次排序和 PowerShell 的 Sort-Object Name 一致（按系统区域的排序规则，中文按拼音）；非 Windows 退回按字符。"""
+    import ctypes
+    import functools
+    try:
+        cmp_ex = ctypes.windll.kernel32.CompareStringEx
+        cmp_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_wchar_p,
+                           ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    except (AttributeError, OSError):
+        return None
+    return functools.cmp_to_key(lambda a, b: (cmp_ex(None, 0, a, -1, b, -1, None, None, None) or 2) - 2)
+
+
+def _is_hidden(entry):
+    return bool(getattr(entry.stat(), "st_file_attributes", 0) & 2)  # FILE_ATTRIBUTE_HIDDEN，和 Get-ChildItem 一样不看隐藏项
+
+
+def _count_jpegs(d):
+    return sum(1 for e in os.scandir(d) if e.is_file() and not _is_hidden(e) and os.path.splitext(e.name)[1].lower() in JPEG_EXTS)
+
+
+def batch_period_dirs(root):
+    """root 下每个直接含 JPG 的子目录算一期（不含 _去定位/_空三/_控制点 结尾的）。返回 [(名字, 路径, 照片数)]。"""
+    names = [e.name for e in os.scandir(root) if e.is_dir() and not _is_hidden(e) and not e.name.endswith(BATCH_NOT_PERIOD)]
+    key = _name_sort_key()
+    names.sort(key=key) if key else names.sort()
+    out = []
+    for n in names:
+        d = Path(root) / n
+        k = _count_jpegs(d)
+        if k:
+            out.append((n, d, k))
+    return out
+
+
+def batch_find_report(out_dir, name):
+    """这一期已有的控制点报告：<名>_控制点 或 <名>_去定位_控制点（照片带定位、先去定位时）。"""
+    for d in (name + GCP_SUFFIX, name + OUTPUT_SUFFIX + GCP_SUFFIX):
+        r = Path(out_dir) / d / "控制点报告.txt"
+        if r.is_file():
+            return r
+    return None
+
+
+def batch_read_report(path):
+    out = {"判定": "", "RMS3D": "", "对齐": ""}
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return out
+    for k in out:
+        for ln in lines:
+            if ln.startswith(k + "：") and len(ln) > len(k) + 1:
+                out[k] = ln[len(k) + 1:]
+                break
+    return out
+
+
+def batch_match_rule(name, rules):
+    """从上到下第一条关键词出现在名字里的规则（不分大小写）；没有返回 None。"""
+    for r in rules:
+        if r["key"] and r["key"].lower() in name.lower():
+            return r
+    return None
+
+
+def parse_batch_rule(text):
+    """命令行 --rule：关键词=参考期.psx[:排除点]（路径里的盘符冒号不算分隔）。"""
+    key, sep, rest = text.partition("=")
+    m = re.match(r"^(.*?\.psx)(?::(.*))?$", rest.strip(), re.I)
+    if not sep or not key.strip() or not m:
+        raise ValueError("看不懂的 --rule：%s（写成 关键词=参考期.psx 或 关键词=参考期.psx:4）" % text)
+    return {"key": key.strip(), "psx": m.group(1), "exclude": ",".join(parse_exclude(m.group(2) or ""))}
+
+
+def parse_pick(text, n):
+    """序号选择 "1,3,5-9" → 集合；越界或看不懂抛 ValueError。"""
+    out = set()
+    for part in re.split(r"[,，]", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(\d+)\s*-\s*(\d+)$", part)
+        if m:
+            out.update(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.isdigit():
+            out.add(int(part))
+        else:
+            raise ValueError("看不懂的序号：%s（写成 1,3,5-9 这样）" % part)
+    bad = sorted(k for k in out if k < 1 or k > n)
+    if bad:
+        raise ValueError("序号 %d 超出范围 1～%d" % (bad[0], n))
+    return out
+
+
+def check_batch_rules(rules):
+    """规则表的参考期都要存在且是 .psx；返回问题清单（空 = 没问题）。没填参考期的规则允许（这类期次扫描时标跳过）。"""
+    errs = []
+    for r in rules:
+        if r["psx"]:
+            try:
+                _check_psx(r["psx"], "规则「%s」的参考期" % r["key"])
+            except ValueError as ex:
+                errs.append(str(ex))
+    return errs
+
+
+def batch_scan(root, rules, out_dir, skip=()):
+    """扫描：每期一个 dict（序号、期次、规则、照片数、参考期、排除点、状态 = 待运行 / 已有结果 / 跳过：原因）。"""
+    if not root or not Path(root).is_dir():
+        raise ValueError("照片上级目录不存在：%s" % root)
+    items = []
+    for i, (name, d, n) in enumerate(batch_period_dirs(root), 1):
+        rule = batch_match_rule(name, rules)
+        it = {"idx": i, "name": name, "dir": str(d), "n": n, "rule": rule["key"] if rule else "", "ref": "", "exclude": "",
+              "status": "待运行", "report": ""}
+        if name in skip:
+            it["status"] = "跳过：在 --skip 里"
+        elif rule is None:
+            it["status"] = "跳过：没有匹配的规则"
+        elif not rule["psx"]:
+            it["status"] = "跳过：规则「%s」没填参考期" % rule["key"]
+        else:
+            it["ref"], it["exclude"] = rule["psx"], rule["exclude"]
+        rep = batch_find_report(out_dir, name) if out_dir else None
+        if rep:
+            it["report"] = str(rep)
+            if it["status"] == "待运行":
+                it["status"] = "已有结果"
+        items.append(it)
+    return items
+
+
+def other_metashape_running():
+    """本机有没有 metashape.exe / photoscan.exe 在跑（tasklist，不需要第三方库）。查不了就当没有。"""
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=30).stdout
+    except Exception:
+        return False
+    names = set(ln.split(",")[0].strip('"').lower() for ln in out.decode("mbcs" if os.name == "nt" else "utf-8",
+                                                                         "replace").splitlines() if ln)
+    return any(n in names for n in METASHAPE_NAMES)
+
+
+def write_batch_summary(path, rows):
+    """汇总 CSV：列和 batch_gcp_transfer.ps1 相同，UTF-8 带 BOM、每格加引号（Export-Csv 的写法）。先写临时文件再替换。"""
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(BATCH_CSV_FIELDS)
+        for r in rows:
+            w.writerow([r.get(k, "") for k in BATCH_CSV_FIELDS])
+    os.replace(str(tmp), str(path))
+
+
+def _batch_row(it):
+    row = dict((k, "") for k in BATCH_CSV_FIELDS)
+    row.update({"序号": it["idx"], "期次": it["name"], "类型": it["rule"] or "未知", "照片数": it["n"],
+                "参考期": Path(it["ref"]).name if it["ref"] else "", "排除点": it["exclude"]})
+    return row
+
+
+def _fill_from_report(row, rep):
+    r = batch_read_report(rep)
+    row.update({"判定": r["判定"], "RMS3D": r["RMS3D"], "对齐": r["对齐"], "报告": str(rep)})
+
+
+def _fmt_minutes(secs):
+    return ("%.1f" % (secs / 60.0)).rstrip("0").rstrip(".")
+
+
+def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None, on_item=None, stop_event=None,
+                  summary=None, wait_poll=BATCH_WAIT_POLL, **timeouts):
+    """按顺序处理 items（batch_scan 的结果里选中的那些）：状态不是「待运行」的照写一行；待运行的串行调 run_gcp_transfer。
+    每期写一次汇总 CSV。on_item(item, 阶段, 文字)：阶段 wait/start/done。取消时当前这一期按 stop_event 停下，
+    剩下的不开始。返回 {"rows", "summary", "cancelled", "exit", "counts"}；
+    exit：0 全部自动通过或跳过 / 4 有需人工核对 / 1 有失败 / 3 取消。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    on_item = on_item or (lambda it, phase, text: None)
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    out_dir = Path(os.path.abspath(out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = Path(summary) if summary else out_dir / ("批量迁移汇总_%s.csv" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    rows, cancelled = [], False
+    log("—— 批量迁移：选中 %d 期，其中待运行 %d 期%s" % (len(items), sum(it["status"] == "待运行" for it in items),
+                                                "（只列计划）" if plan else ""))
+    log("输出目录：%s" % out_dir)
+    write_batch_summary(summary, rows)
+    for pos, it in enumerate(items, 1):
+        tag = "[%d/%d · 序号 %d] %s" % (pos, len(items), it["idx"], it["name"])
+        row = _batch_row(it)
+        if it["status"] == "待运行" and not plan:
+            rep = batch_find_report(out_dir, it["name"])  # 开跑前再看一次：上一期跑的时候别的电脑可能已经做完
+            if rep:
+                it["status"], it["report"] = "已有结果", str(rep)
+        if it["status"] != "待运行":
+            row["状态"] = "跳过：已有结果" if it["status"] == "已有结果" else it["status"]
+            if it["report"]:
+                _fill_from_report(row, it["report"])
+            log("%s → %s" % (tag, row["状态"]))
+            on_item(it, "done", it["status"])
+        elif plan:
+            row["状态"] = "计划运行"
+            log("%s（%s，%d 张）→ 会用参考期 %s%s" % (tag, it["rule"], it["n"], row["参考期"],
+                                               "，排除点 %s" % it["exclude"] if it["exclude"] else ""))
+        else:
+            waited = False
+            while not stopped() and other_metashape_running():
+                if not waited:
+                    log("%s：本机已有别的 Metashape 在跑，等它结束（每 %d 秒看一次）… %s" % (
+                        tag, wait_poll, datetime.datetime.now().strftime("%H:%M")))
+                    on_item(it, "wait", "等待其他 Metashape")
+                    progress(0.0, "等待其他 Metashape")
+                    waited = True
+                if stop_event is not None:
+                    stop_event.wait(wait_poll)
+                else:
+                    time.sleep(wait_poll)
+            if stopped():
+                cancelled = True
+                on_item(it, "done", "待运行")
+                log("已取消：%s 及之后的 %d 期都没有开始" % (it["name"], len(items) - pos + 1))
+                break
+            log("%s → 开始（参考期 %s%s） %s" % (tag, row["参考期"], "，排除点 %s" % it["exclude"] if it["exclude"] else "",
+                                         datetime.datetime.now().strftime("%H:%M")))
+            on_item(it, "start", "运行中")
+            t0 = time.time()
+            res, code = None, 1
+            with open(out_dir / ("%s_运行日志.txt" % it["name"]), "a", encoding="utf-8") as flog:
+                def plog(s):
+                    log(s)
+                    flog.write(s + "\n")
+                    flog.flush()
+
+                try:
+                    # 上次已经去定位过（输出目录里有 <名>_去定位），就直接用它，避免工具因去定位目录非空而拒绝
+                    photo_dir = it["dir"]
+                    stripped = out_dir / (it["name"] + OUTPUT_SUFFIX)
+                    if stripped.is_dir() and any(stripped.iterdir()):
+                        n = _count_jpegs(stripped)
+                        if n != it["n"]:
+                            raise ValueError("上次去定位没做完（%s 里 %d 张，原目录 %d 张）：删掉这个目录后重跑" % (
+                                stripped, n, it["n"]))
+                        photo_dir = str(stripped)
+                        plog("  用已去定位的照片：%s" % stripped)
+                    res = run_gcp_transfer(photo_dir, it["ref"], metashape, out_dir, log=plog, stop_event=stop_event,
+                                           progress=progress, exclude=it["exclude"], **timeouts)
+                    code = {"自动通过": 0, "需人工核对": 4, "已取消": 3}.get(res["status"], 1)
+                except ValueError as ex:
+                    plog("拒绝执行：%s" % ex)
+                    code = 2
+                except (AlignCancelled, KeyboardInterrupt):
+                    plog("已取消")
+                    code = 3
+            row["耗时分钟"] = _fmt_minutes(time.time() - t0)
+            row["退出码"] = code
+            row["状态"] = BATCH_EXIT_TEXT[code]
+            rep = batch_find_report(out_dir, it["name"])
+            if rep:
+                _fill_from_report(row, rep)
+            rms = " %.1f mm" % (res["rms3d"] * 1000) if res and res.get("rms3d") is not None else ""
+            it["status"] = ("失败（拒绝执行）" if code == 2 else row["状态"]) + rms
+            log("  → %s  %s  用时 %s 分钟" % (row["状态"], row["RMS3D"], row["耗时分钟"]))
+            on_item(it, "done", it["status"])
+            cancelled = code == 3 or stopped()
+        rows.append(row)
+        write_batch_summary(summary, rows)  # 每期写一次，中途停了也有汇总
+        if cancelled:
+            if pos < len(items):
+                log("已取消：剩下 %d 期没有开始" % (len(items) - pos))
+            break
+    log("")
+    log("汇总表：%s" % summary)
+    counts = {}
+    for r in rows:
+        counts[r["状态"]] = counts.get(r["状态"], 0) + 1
+    for st, c in counts.items():
+        log("  %s：%d 期" % (st, c))
+    states = set(counts)
+    code = 3 if cancelled else 1 if states & {"失败", "拒绝"} else 4 if "需人工核对" in states else 0
+    return {"rows": rows, "summary": str(summary), "cancelled": cancelled, "exit": code, "counts": counts}
+
+
+# ---------------------------------------------------------------------------
 # 图形界面
 # ---------------------------------------------------------------------------
 
@@ -3460,6 +3758,326 @@ def run_gui():
     btn3_stop.configure(command=stop3)
     root.after(200, poll3)
 
+    # ---- 页签 4：批量迁移（D-24）：扫描上级目录 → 按规则表配参考期 → 筛选勾选 → 一期接一期跑 ----
+    tab4 = nb.add("批量迁移")
+    tab4.columnconfigure(1, weight=1)
+    cfg4 = load_config()
+    v4_root = tk.StringVar(value=cfg4.get("batch_root", ""))
+    v4_out = tk.StringVar(value=cfg4.get("batch_out", ""))
+    v4_ms = tk.StringVar(value=find_metashape())
+    v4_filter = tk.StringVar()
+    st4 = {"stop": None, "items": [], "rows": [], "scanned": None}
+    q4 = queue.Queue()
+    rows4 = (
+        ("照片上级目录：", v4_root, lambda: pick_dir(v4_root, "选择照片上级目录（每个直接含照片的子目录算一期，只读）")),
+        ("输出目录：", v4_out, lambda: pick_dir(v4_out, "选择输出目录（每期的去定位照片、结果和汇总表都写在这里）")),
+        ("Metashape 程序：", v4_ms, lambda: pick_file(v4_ms, "选择 Metashape Pro 程序（metashape.exe）",
+                                                   [("Metashape", "metashape.exe photoscan.exe"), ("程序", "*.exe")])),
+    )
+    for r, (label, var, cmd) in enumerate(rows4):
+        ctk.CTkLabel(tab4, text=label).grid(row=r, column=0, sticky="w", pady=2)
+        ctk.CTkEntry(tab4, textvariable=var).grid(row=r, column=1, sticky="ew", pady=2)
+        button(tab4, "浏览…", cmd).grid(row=r, column=2, padx=(6, 0), pady=2)
+
+    # 参考期规则表：关键词 + 参考期 .psx + 排除点；从上到下匹配第一条；记进 config.json
+    rf = ctk.CTkFrame(tab4)
+    rf.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+    rf.columnconfigure(1, weight=1)
+    for c, t in enumerate(("关键词", "参考期 .psx（从上到下匹配第一条）", "", "排除点")):
+        ctk.CTkLabel(rf, text=t, text_color=hint_color, height=20).grid(row=0, column=c, sticky="w", padx=(6, 4))
+    rules4 = []
+
+    def regrid_rules():
+        for i, r in enumerate(rules4, 1):
+            for c, w in enumerate(r["widgets"]):
+                w.grid(row=i, column=c, sticky="ew" if c == 1 else "w", padx=(6, 4) if c == 0 else (0, 4), pady=(0, 3))
+
+    def add_rule(key="", psx="", exclude=""):
+        r = {"key": tk.StringVar(value=key), "psx": tk.StringVar(value=psx), "exclude": tk.StringVar(value=exclude)}
+        r["widgets"] = (
+            ctk.CTkEntry(rf, textvariable=r["key"], width=80),
+            ctk.CTkEntry(rf, textvariable=r["psx"]),
+            button(rf, "浏览…", lambda: pick_file(r["psx"], "选择规则「%s」的参考期工程" % r["key"].get(), psx_types)),
+            ctk.CTkEntry(rf, textvariable=r["exclude"], width=60),
+            button(rf, "删除", lambda: del_rule(r), width=52),
+        )
+        rules4.append(r)
+        regrid_rules()
+
+    def del_rule(r):
+        for w in r["widgets"]:
+            w.destroy()
+        rules4.remove(r)
+        regrid_rules()
+
+    def rules_now():
+        return [{"key": r["key"].get().strip(), "psx": r["psx"].get().strip(),
+                 "exclude": ",".join(parse_exclude(r["exclude"].get()))} for r in rules4]
+
+    button(rf, "＋ 添加规则", lambda: add_rule(), width=96).grid(row=0, column=4, padx=(0, 4), pady=(3, 3))
+    for r in cfg4.get("batch_rules") or BATCH_DEFAULT_RULES:
+        add_rule(r.get("key", ""), r.get("psx", ""), r.get("exclude", ""))
+    hint(tab4, "直接含照片的子目录算一期。已有「控制点报告.txt」的期跳过，已有「<名>_去定位」的直接用。勾上且「待运行」的期"
+               "一期接一期地跑，本机有别的 Metashape 在跑就先等。筛选只影响显示；四个勾选按钮只作用于当前显示的行。"
+               ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
+
+    tb4 = ctk.CTkFrame(tab4, fg_color="transparent")
+    tb4.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 2))
+    btn4_scan = button(tb4, "扫描", primary=True)
+    btn4_scan.pack(side="left")
+    ctk.CTkLabel(tb4, text="筛选：").pack(side="left", padx=(12, 0))
+    ctk.CTkEntry(tb4, textvariable=v4_filter, width=120).pack(side="left")
+    bulk4 = []
+    for t in ("全选", "全不选", "反选", "只勾待运行"):
+        b = button(tb4, t, width=56 if len(t) <= 3 else 88)
+        b.pack(side="left", padx=(6, 0))
+        bulk4.append(b)
+    lbl4_count = ctk.CTkLabel(tb4, text="", text_color=hint_color)
+    lbl4_count.pack(side="left", padx=(10, 0))
+
+    lst4 = ctk.CTkScrollableFrame(tab4, height=150)
+    lst4.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
+    lst4.columnconfigure(6, weight=1)
+    tab4.rowconfigure(6, weight=1)
+    cols4 = (("", 28, "w"), ("序号", 36, "e"), ("期次", 150, "w"), ("匹配规则", 64, "w"), ("照片数", 52, "e"),
+             ("参考期", 210, "w"), ("状态", 120, "w"))
+    for c, (t, w, a) in enumerate(cols4):
+        if t:
+            ctk.CTkLabel(lst4, text=t, width=w, anchor=a, text_color=hint_color, height=20).grid(row=0, column=c, sticky="ew",
+                                                                                             padx=(0, 6))
+    status_color = {"自动通过": ("#2E7D32", "#81C784"), "需人工核对": ("#E65100", "#FFB74D"), "失败": danger,
+                    "已取消": hint_color, "运行中": ("#1565C0", "#64B5F6"), "等待其他 Metashape": ("#1565C0", "#64B5F6")}
+
+    def color_of(text):
+        for k, c in status_color.items():
+            if text.startswith(k):
+                return c
+        return hint_color if text.startswith("跳过") or text == "已有结果" else label_color
+
+    def visible(row):
+        return v4_filter.get().strip().lower() in row["item"]["name"].lower()
+
+    def update_count(*_):
+        rs = st4["rows"]
+        sel = [r for r in rs if r["var"].get()]
+        lbl4_count.configure(text="已勾 %d 期（待运行 %d）；显示 %d/%d" % (
+            len(sel), sum(r["item"]["status"] == "待运行" for r in sel), sum(visible(r) for r in rs), len(rs)))
+
+    def apply_filter(*_):  # 只改显示；勾选状态放在每行自己的变量里，藏起来也不变
+        for r in st4["rows"]:
+            for w in r["widgets"]:
+                if visible(r):
+                    w.grid()
+                else:
+                    w.grid_remove()
+        update_count()
+
+    v4_filter.trace_add("write", apply_filter)
+
+    def bulk(kind):
+        for r in st4["rows"]:
+            if visible(r):
+                r["var"].set({"全选": True, "全不选": False, "反选": not r["var"].get(),
+                              "只勾待运行": r["item"]["status"] == "待运行"}[kind])
+        update_count()
+
+    for b in bulk4:
+        b.configure(command=lambda t=b.cget("text"): bulk(t))
+
+    def set_row_status(row, text):
+        row["status"].configure(text=text, text_color=color_of(text))
+
+    def fill_list(items):
+        for r in st4["rows"]:
+            for w in r["widgets"]:
+                w.destroy()
+        st4["rows"] = []
+        for i, it in enumerate(items, 1):
+            var = tk.BooleanVar(value=it["status"] == "待运行")
+            cells = (ctk.CTkCheckBox(lst4, text="", width=28, checkbox_width=20, checkbox_height=20, variable=var,
+                                     command=update_count),
+                     str(it["idx"]), it["name"], it["rule"] or "—", str(it["n"]), Path(it["ref"]).name if it["ref"] else "",
+                     it["status"])
+            ws = [cells[0]]
+            for c, (t, w, a) in enumerate(cols4[1:], 1):
+                ws.append(ctk.CTkLabel(lst4, text=cells[c], width=w, anchor=a, height=22))
+            for c, w in enumerate(ws):
+                w.grid(row=i, column=c, sticky="ew", padx=(0, 6))
+            row = {"item": it, "var": var, "widgets": ws, "status": ws[-1]}
+            set_row_status(row, it["status"])
+            st4["rows"].append(row)
+        apply_filter()
+
+    def scan_key():
+        return (v4_root.get().strip(), os.path.abspath(v4_out.get().strip()) if v4_out.get().strip() else "",
+                json.dumps(rules_now(), ensure_ascii=False))
+
+    def save4():
+        cfg = load_config()
+        cfg.update(batch_root=v4_root.get().strip(), batch_out=v4_out.get().strip(), batch_rules=rules_now())
+        if v4_ms.get().strip():
+            cfg["metashape"] = v4_ms.get().strip()
+        save_config(cfg)
+
+    def scan4():
+        root_dir, out = v4_root.get().strip(), v4_out.get().strip()
+        if not root_dir or not out:
+            messagebox.showwarning(APP_NAME, "请选择照片上级目录和输出目录")
+            return
+        rules = rules_now()
+        if not any(r["key"] for r in rules):
+            messagebox.showwarning(APP_NAME, "规则表至少要有一条带关键词的规则")
+            return
+        errs = check_batch_rules(rules)
+        if errs:
+            messagebox.showwarning(APP_NAME, "\n".join(errs))
+            return
+        try:
+            items = batch_scan(root_dir, rules, os.path.abspath(out))
+        except (ValueError, OSError) as ex:
+            messagebox.showwarning(APP_NAME, str(ex))
+            return
+        save4()
+        st4["items"], st4["scanned"] = items, scan_key()
+        fill_list(items)
+        cnt = {}
+        for it in items:
+            cnt[it["status"]] = cnt.get(it["status"], 0) + 1
+        q4.put(("log", "扫描 %s：共 %d 期；%s" % (root_dir, len(items), "，".join("%s %d" % kv for kv in cnt.items()))))
+        odd = []
+        for it in items:
+            if it["status"] == "已有结果":
+                v = batch_read_report(it["report"])["判定"]
+                if v != "自动通过":
+                    odd.append("%s（%s）" % (it["name"], v or "报告里没有判定"))
+        if odd:
+            q4.put(("log", "注意：这些期已有结果但不是自动通过，会跳过；想重跑就删掉输出目录里它的 _控制点 目录再扫描：%s"
+                    % "、".join(odd)))
+
+    btn4_scan.configure(command=scan4)
+
+    bar4 = ctk.CTkFrame(tab4, fg_color="transparent")
+    bar4.grid(row=7, column=0, columnspan=3, sticky="ew")
+    bar4.columnconfigure(0, weight=1)
+    pb4 = ctk.CTkProgressBar(bar4, mode="determinate")
+    pb4.set(0)
+    pb4.grid(row=0, column=0, sticky="ew")
+    lbl4 = ctk.CTkLabel(bar4, text="", width=260)
+    lbl4.grid(row=0, column=1, padx=6)
+    btn4_start = button(bar4, "开始", primary=True)
+    btn4_start.grid(row=0, column=2)
+    btn4_stop = button(bar4, "取消", state="disabled")
+    btn4_stop.grid(row=0, column=3, padx=(6, 0))
+    txt4 = log_box(tab4, 70)
+    txt4.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    LOG4_KEEP = 1500  # 日志框只留最近这么多行，完整日志在输出目录的 批量迁移日志_<时间>.txt
+
+    def poll4():
+        try:
+            for _ in range(500):  # 一次最多处理这么多条，别让界面卡住
+                kind, val = q4.get_nowait()
+                if kind == "log":
+                    txt4.insert("end", val + "\n")
+                    n = int(txt4.index("end-1c").split(".")[0])
+                    if n > LOG4_KEEP:
+                        txt4.delete("1.0", "%d.0" % (n - LOG4_KEEP))
+                    txt4.see("end")
+                elif kind == "prog":
+                    pb4.set(int(val[0] * 1000) / 1000)
+                    lbl4.configure(text=val[1][:36])
+                elif kind == "item":
+                    it, text = val
+                    for r in st4["rows"]:
+                        if r["item"] is it:
+                            set_row_status(r, text)
+                    update_count()
+                elif kind == "done":
+                    btn4_start.configure(state="normal")
+                    btn4_scan.configure(state="normal")
+                    btn4_stop.configure(state="disabled")
+                    st4["scanned"] = None  # 状态都变了，再跑要先重新扫描
+                    if isinstance(val, Exception):
+                        lbl4.configure(text="失败")
+                        txt4.insert("end", "出错：%s\n" % val)
+                        txt4.see("end")
+                        messagebox.showerror(APP_NAME, str(val))
+                        continue
+                    res, logf = val
+                    body = ["%s：%d 期" % kv for kv in res["counts"].items()] + ["", "汇总表：%s" % res["summary"],
+                                                                              "完整日志：%s" % logf]
+                    if res["cancelled"]:
+                        lbl4.configure(text="已取消")
+                        last = res["rows"][-1] if res["rows"] else None
+                        if last and last["状态"] == "已取消":
+                            body.append("\n被取消的「%s」结果不完整，不要使用；要重跑就先删掉输出目录里它的 _控制点 目录。" % last["期次"])
+                        messagebox.showwarning(APP_NAME + " - 已取消",
+                                               "已取消：已完成的期次结果都保留，剩下的没有开始。\n\n" + "\n".join(body))
+                    else:
+                        lbl4.configure(text="完成")
+                        bad = res["exit"] != 0
+                        (messagebox.showwarning if bad else messagebox.showinfo)(
+                            APP_NAME + " - 批量迁移完成", ("有需人工核对或失败的期次，详见汇总表和各期的控制点报告.txt。\n\n"
+                                                    if bad else "") + "\n".join(body))
+        except queue.Empty:
+            pass
+        root.after(200, poll4)
+
+    def start4():
+        if not st4["items"] or st4["scanned"] is None:
+            messagebox.showwarning(APP_NAME, "请先点「扫描」")
+            return
+        if scan_key() != st4["scanned"]:
+            messagebox.showwarning(APP_NAME, "目录或规则表在扫描后改过了，请先重新扫描")
+            return
+        ms = v4_ms.get().strip()
+        err = check_metashape(ms)
+        if err:
+            messagebox.showwarning(APP_NAME, err)
+            return
+        chosen = [r["item"] for r in st4["rows"] if r["var"].get()]
+        if not any(it["status"] == "待运行" for it in chosen):
+            messagebox.showwarning(APP_NAME, "勾选的期次里没有「待运行」的")
+            return
+        save4()
+        out = os.path.abspath(v4_out.get().strip())
+        txt4.delete("1.0", "end")
+        pb4.set(0)
+        lbl4.configure(text="")
+        btn4_start.configure(state="disabled")
+        btn4_scan.configure(state="disabled")
+        btn4_stop.configure(state="normal")
+        stop = threading.Event()
+        st4["stop"] = stop
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        def work():
+            logf = Path(out) / ("批量迁移日志_%s.txt" % stamp)
+            try:
+                Path(out).mkdir(parents=True, exist_ok=True)
+                with open(logf, "a", encoding="utf-8") as flog:
+                    def log(s):
+                        flog.write(s + "\n")
+                        flog.flush()
+                        q4.put(("log", s))
+
+                    res = run_gcp_batch(chosen, out, ms, log=log, progress=lambda f, s: q4.put(("prog", (f, s))),
+                                        on_item=lambda it, phase, text: q4.put(("item", (it, text))), stop_event=stop,
+                                        summary=Path(out) / ("批量迁移汇总_%s.csv" % stamp))
+                q4.put(("done", (res, str(logf))))
+            except Exception as ex:
+                q4.put(("done", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop4():
+        if st4["stop"] is not None:
+            st4["stop"].set()
+            lbl4.configure(text="正在取消…（当前这一期停下，剩下的不开始）")
+
+    btn4_start.configure(command=start4)
+    btn4_stop.configure(command=stop4)
+    root.after(200, poll4)
+
     # 后续功能在这里加新页签：tab = nb.add("...")
     nb.set("剔除定位")
     root.after(100, poll)
@@ -3530,8 +4148,22 @@ def main(argv=None):
                    help="D-20 细化挪动上限（像素），默认 %g：挪动更大的投影删掉，挪动中位数更大的点自动排除" % GCP_MAX_SHIFT_PX)
     for x in (g, g2):
         x.add_argument("--exclude", default="", help="排除的控制点，逗号分隔，如 1,2：不参与平差，改作检查点")
+    bt = sub.add_parser("gcp-batch", help="批量迁移：上级目录下每期按名字配参考期，一期接一期跑 gcp-transfer"
+                        "（退出码 0 全部自动通过或跳过 / 4 有需人工核对 / 1 有失败 / 2 参数错误 / 3 取消）")
+    bt.add_argument("root", help="照片上级目录：每个直接含 JPG 的子目录算一期（只读）")
+    bt.add_argument("--out", required=True, help="输出目录：每期的去定位照片、结果和汇总表都写在这里")
+    bt.add_argument("--rule", action="append", required=True, metavar="关键词=参考期.psx[:排除点]",
+                    help="参考期规则，可给多次，从前往后匹配第一条，如 --rule 梯田=D:\梯田.psx:4 --rule 植被=D:\植被.psx")
+    bt.add_argument("--include", default="", help="只要名字匹配的期（通配符，逗号分隔，如 \"*梯田*\"）")
+    bt.add_argument("--pick", default="", help="按扫描序号选（如 1,3,5-9；先用 --plan 看序号）")
+    bt.add_argument("--skip", default="", help="不处理的期次名，逗号分隔（如参考期本身）")
+    bt.add_argument("--plan", action="store_true", help="只列计划、写汇总表，不运行")
+    bt.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
+    bt.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
     args = ap.parse_args(argv)
+    if args.cmd == "gcp-batch":
+        return _cli_batch(args)
     if args.cmd == "align":
         return _cli_align(args)
     if args.cmd in ("gcp-transfer", "gcp-init"):
@@ -3632,6 +4264,59 @@ def _cli_gcp(args):
         if flog:
             flog.close()
     return {"自动通过": 0, "需人工核对": 4, "已取消": 3}.get(res["status"], 1)
+
+
+def _split_names(text):
+    return [x.strip() for x in re.split(r"[,，]", text or "") if x.strip()]
+
+
+def _cli_batch(args):
+    """退出码：0 全部自动通过或跳过 / 4 有需人工核对 / 1 有失败 / 2 参数错误 / 3 取消。"""
+    flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+    def log(s):
+        _print(s)
+        if flog:
+            flog.write(s + "\n")
+            flog.flush()
+
+    try:
+        try:
+            rules = [parse_batch_rule(r) for r in args.rule]
+            errs = check_batch_rules(rules)
+            if errs:
+                raise ValueError("；".join(errs))
+            ms = args.metashape or find_metashape()
+            if not args.plan:
+                err = check_metashape(ms)
+                if err:
+                    raise ValueError(err)
+            items = batch_scan(args.root, rules, os.path.abspath(args.out), skip=_split_names(args.skip))
+            log("共找到 %d 期照片目录。" % len(items))
+            chosen = items
+            inc = _split_names(args.include)
+            if inc:
+                chosen = [it for it in chosen if any(fnmatch.fnmatchcase(it["name"].lower(), x.lower()) for x in inc)]
+                log("按 --include 筛选后剩 %d 期。" % len(chosen))
+            if args.pick:
+                pick = parse_pick(args.pick, len(items))
+                chosen = [it for it in chosen if it["idx"] in pick]
+                log("按 --pick 选中 %d 期。" % len(chosen))
+        except ValueError as ex:
+            log("拒绝执行：%s" % ex)
+            return 2
+        if not chosen:
+            log("没有选中任何期次，结束。")
+            return 0
+        try:
+            res = run_gcp_batch(chosen, args.out, ms, plan=args.plan, log=log)
+        except KeyboardInterrupt:
+            log("已取消")
+            return 3
+        return res["exit"]
+    finally:
+        if flog:
+            flog.close()
 
 
 if __name__ == "__main__":

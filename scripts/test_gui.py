@@ -1,12 +1,18 @@
 # T6 界面测试夹具：进程内找控件并 invoke()（和鼠标点击走同一个 command 回调），只用标准库 + customtkinter。
 # 远程桌面里真鼠标点不到界面，所以用进程内 invoke()；截图用 PrintWindow（远程桌面断开也能画）。
 #
-# 用法 1（源码）：python scripts/test_gui.py --mode invoke|shots --out <结果目录> --data <测试数据根> #                    --metashape <metashape.exe> --ref <参考期.psx> --appdata <临时 APPDATA>
+# 用法 1（源码）：python scripts/test_gui.py --mode invoke|shots|batch --out <结果目录> --data <测试数据根> #                    --metashape <metashape.exe> --ref <参考期.psx> --appdata <临时 APPDATA>
 #   --data 下要有：strip/T6复制/（约 20 张带定位照片）、inplace/T6原地/（8 张）、align/T6空三/（8 张）、
 #   gcp/T6迁移/（8 张，不能是参考期自己的照片）；都用副本，别指向原始影像。
 #   --appdata 会被清空重建，写入 metashape/gcp_ref/gcp_csv，用来验证「记住路径」，不碰真的 config.json。
 # 用法 2（打包版）：PyInstaller 加 --runtime-hook scripts/test_gui.py 打一个测试用 exe，
 #   用环境变量 UAV_T6_MODE/UAV_T6_OUT/UAV_T6_DATA/UAV_T6_MS/UAV_T6_REF 和 APPDATA 传参（先用用法 1 的 --appdata 建好）。
+# batch 模式（T7「批量迁移」页签）：--data 指向测试上级目录（junction 指向原片期次 0802上午梯田、26.08.01植被，
+#   另有 0899测试其他、0899植被梯田 两个小目录各 2 张照片副本、0899梯田_去定位、0899空目录梯田\子目录），
+#   --ref 梯田参考期、--ref2 植被参考期；输出在 <结果目录>/batch_out。查扫描、筛选不清勾选、全选/全不选/反选/只勾待运行、
+#   规则增删后重扫、改了规则不重扫就拒绝开始；然后真跑两期，第一期出结论后、第二期运行中点「取消」，查第一期结果保留、
+#   第二期已取消、汇总表两行、界面不卡（200 ms 定时器最大间隔）；扫描后、运行中各截浅色/深色一张。
+#   环境变量 UAV_T7_NO_RUN=1 时只测到重扫为止（不起 Metashape）。
 # 结果：<结果目录>/harness_<mode>.json（checks 每条 [名称, 通过, 细节]），shots 模式另有 <结果目录>/截图/*.bmp。
 import os
 import sys
@@ -15,11 +21,12 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):  # 打包版里
     import argparse
     import shutil
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("invoke", "shots"), default="invoke")
+    ap.add_argument("--mode", choices=("invoke", "shots", "batch"), default="invoke")
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default="")
     ap.add_argument("--metashape", required=True)
     ap.add_argument("--ref", default="")
+    ap.add_argument("--ref2", default="", help="batch 模式：植被参考期 .psx（--ref 是梯田）")
     ap.add_argument("--appdata", required=True)
     ap.add_argument("--seed-only", action="store_true", help="只建 --appdata，不跑界面（给打包版测试用）")
     _a = ap.parse_args()
@@ -31,7 +38,7 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):  # 打包版里
     if _a.seed_only:
         sys.exit(0)
     os.environ.update(APPDATA=_a.appdata, UAV_T6_MODE=_a.mode, UAV_T6_OUT=_a.out, UAV_T6_DATA=_a.data,
-                      UAV_T6_MS=_a.metashape, UAV_T6_REF=_a.ref)
+                      UAV_T6_MS=_a.metashape, UAV_T6_REF=_a.ref, UAV_T6_REF2=_a.ref2)
 
 import ctypes
 import ctypes.wintypes as W
@@ -51,6 +58,8 @@ OUT = os.environ["UAV_T6_OUT"]
 DATA = os.environ.get("UAV_T6_DATA", "")
 MS = os.environ.get("UAV_T6_MS", "")
 REF = os.environ.get("UAV_T6_REF", "")
+REF2 = os.environ.get("UAV_T6_REF2", "")
+VERSION = os.environ.get("UAV_T6_VERSION", "0.8")
 os.makedirs(OUT, exist_ok=True)
 
 R = {"mode": MODE, "frozen": bool(getattr(sys, "frozen", False)), "boxes": [], "checks": [], "browser": []}
@@ -171,7 +180,7 @@ def steps_shots(root, nb):
     os.makedirs(shots, exist_ok=True)
     for mode, cn in (("light", "浅色"), ("dark", "深色")):
         ctk.set_appearance_mode(mode)
-        for name in ("剔除定位", "空三", "控制点"):
+        for name in ("剔除定位", "空三", "控制点", "批量迁移"):
             nb.set(name)
             yield 1.2
             p = os.path.join(shots, "%s_%s.bmp" % (name, cn))
@@ -189,7 +198,7 @@ def steps_invoke(root, nb):
     cfg_path = os.path.join(os.environ["APPDATA"], "无人机照片工具", "config.json")
     cfg = lambda: json.load(open(cfg_path, encoding="utf-8"))
     R["title"] = root.title()
-    check("窗口标题", root.title().endswith("v0.7"), root.title())
+    check("窗口标题", root.title().endswith("v" + VERSION), root.title())
     yield 2.5  # 让启动 1.5 秒后的自动检查更新跑一下（没有新版本时不弹窗）
     check("启动自动检查更新不弹窗（无新版本）", not R["boxes"], R["boxes"])
 
@@ -204,7 +213,7 @@ def steps_invoke(root, nb):
     hl = {lab: i for i, t, lab in R["help_menu"] if lab}
     check("帮助菜单四项", set(hl) == {"检查更新", "启动时自动检查更新", "项目主页（GitHub）", "关于"}, list(hl))
     help_m.invoke(hl["关于"])
-    check("关于", R["boxes"] and R["boxes"][-1][0] == "showinfo" and "v0.7" in R["boxes"][-1][2], R["boxes"][-1:])
+    check("关于", R["boxes"] and R["boxes"][-1][0] == "showinfo" and ("v" + VERSION) in R["boxes"][-1][2], R["boxes"][-1:])
     help_m.invoke(hl["项目主页（GitHub）"])
     check("项目主页", R["browser"] == ["https://github.com/aduhappy/uav-photo-tool"], R["browser"])
     n0 = len(R["boxes"])
@@ -228,7 +237,7 @@ def steps_invoke(root, nb):
     check("切回浅色", ctk.get_appearance_mode() == "Light" and cfg().get("appearance") == "light", cfg().get("appearance"))
 
     # ---- 页签 1：剔除定位 ----
-    check("三个页签", list(nb._name_list) == ["剔除定位", "空三", "控制点"], nb._name_list)
+    check("四个页签", list(nb._name_list) == ["剔除定位", "空三", "控制点", "批量迁移"], nb._name_list)
     check("默认页签", nb.get() == "剔除定位", nb.get())
     t1 = nb.tab("剔除定位")
     cbs = {c.cget("text"): c for c in find(t1, ctk.CTkCheckBox)}
@@ -361,6 +370,205 @@ def steps_invoke(root, nb):
     check("开始后记住参考期路径", cfg().get("gcp_ref") == REF, cfg().get("gcp_ref"))
 
 
+def steps_batch(root, nb):
+    """T7「批量迁移」页签。"""
+    cfg_path = os.path.join(os.environ["APPDATA"], "无人机照片工具", "config.json")
+    cfg = lambda: json.load(open(cfg_path, encoding="utf-8"))
+    out = os.path.join(OUT, "batch_out")
+    shots = os.path.join(OUT, "截图")
+    os.makedirs(shots, exist_ok=True)
+    root.geometry("+40+40")
+    check("窗口标题", root.title().endswith("v" + VERSION), root.title())
+    check("四个页签", list(nb._name_list) == ["剔除定位", "空三", "控制点", "批量迁移"], nb._name_list)
+    nb.set("批量迁移")
+    t4 = nb.tab("批量迁移")
+    yield 0.5
+    e_root, e_out, e_ms = (entry_row(t4, r) for r in range(3))
+    check("Metashape 自动填上", e_ms.get() == MS, e_ms.get())
+    rf = [f for f in find(t4, ctk.CTkFrame) if f.master is t4 and int(f.grid_info().get("row", -1)) == 3][0]
+
+    def rules():
+        es = sorted(find(rf, ctk.CTkEntry), key=lambda e: (int(e.grid_info()["row"]), int(e.grid_info()["column"])))
+        return [es[i:i + 3] for i in range(0, len(es), 3)]
+
+    check("默认两条规则（梯田、植被）", [r[0].get() for r in rules()] == ["梯田", "植被"], [r[0].get() for r in rules()])
+    set_entry(e_root, DATA)
+    set_entry(e_out, out)
+    set_entry(rules()[0][1], REF)
+    set_entry(rules()[1][1], REF2)
+    lst = find(t4, ctk.CTkScrollableFrame)[0]
+
+    def table():
+        rows = []
+        for cb in find(lst, ctk.CTkCheckBox):
+            gi = cb.grid_info()
+            if gi:
+                r = int(gi["row"])
+                cells = [w.cget("text") for w in sorted(cb.master.grid_slaves(row=r), key=lambda w: int(w.grid_info()["column"]))
+                         if isinstance(w, ctk.CTkLabel)]
+            else:
+                cells = getattr(cb, "_t7_cells", [])
+            cb._t7_cells = cells
+            rows.append({"cb": cb, "shown": bool(gi), "on": bool(cb.get()), "cells": cells})
+        return rows
+
+    def by_name():
+        return {r["cells"][1]: r for r in table() if r["cells"]}
+
+    btn(t4, "开始").invoke()
+    check("没扫描就开始 → 提示先扫描", R["boxes"] and "扫描" in R["boxes"][-1][2], R["boxes"][-1:])
+    btn(t4, "扫描").invoke()
+    yield 0.5
+    tb = by_name()
+    R["scan1"] = {k: [v["on"]] + v["cells"] for k, v in tb.items()}
+    want = {"0802上午梯田": ("梯田", "149", "待运行"), "0899测试其他": ("—", "2", "跳过：没有匹配的规则"),
+            "0899植被梯田": ("梯田", "2", "待运行"), "26.08.01植被": ("植被", "97", "待运行")}
+    got = {k: (v["cells"][2], v["cells"][3], v["cells"][5]) for k, v in tb.items()}
+    check("扫描结果（4 期；_去定位 结尾和不直接含照片的不算；两个关键词都有按第一条；没匹配的跳过）", got == want, got)
+    check("序号按名字排序", tb["0802上午梯田"]["cells"][0] == "1" and tb["0899测试其他"]["cells"][0] == "2"
+          and tb["0899植被梯田"]["cells"][0] == "3" and tb["26.08.01植被"]["cells"][0] == "4", got)
+    check("扫描后默认只勾待运行", {k: v["on"] for k, v in tb.items()} ==
+          {"0802上午梯田": True, "0899测试其他": False, "0899植被梯田": True, "26.08.01植被": True})
+    check("参考期列是文件名", tb["26.08.01植被"]["cells"][4] == os.path.basename(REF2), tb["26.08.01植被"]["cells"][4])
+    check("扫描后记住规则和目录", [r["psx"] for r in cfg()["batch_rules"]] == [REF, REF2] and cfg().get("batch_root") == DATA,
+          cfg().get("batch_rules"))
+    for mode, cn in (("light", "浅色"), ("dark", "深色")):
+        ctk.set_appearance_mode(mode)
+        yield 1.0
+        p = os.path.join(shots, "批量迁移_扫描后_%s.bmp" % cn)
+        grab_bmp(p, root)
+        R.setdefault("shots", []).append(p)
+    ctk.set_appearance_mode("light")
+
+    # 筛选只影响显示，不清勾选
+    e_f = [e for e in find(t4, ctk.CTkEntry) if e.master is not rf and e not in (e_root, e_out, e_ms)][0]
+    set_entry(e_f, "植被")
+    yield 0.3
+    tb = by_name()
+    check("筛选「植被」只显示 2 行", sorted(k for k, v in tb.items() if v["shown"]) == ["0899植被梯田", "26.08.01植被"],
+          {k: v["shown"] for k, v in tb.items()})
+    btn(t4, "全不选").invoke()
+    set_entry(e_f, "")
+    yield 0.3
+    tb = by_name()
+    check("全不选只作用于显示的行；清空筛选后其他行的勾还在", {k: v["on"] for k, v in tb.items()} ==
+          {"0802上午梯田": True, "0899测试其他": False, "0899植被梯田": False, "26.08.01植被": False}
+          and all(v["shown"] for v in tb.values()), {k: v["on"] for k, v in tb.items()})
+    set_entry(e_f, "zzz")
+    yield 0.3
+    check("筛选不匹配时一行不显示", not any(v["shown"] for v in by_name().values()))
+    set_entry(e_f, "")
+    yield 0.3
+    check("筛选过「zzz」再清空，勾选不变", {k: v["on"] for k, v in by_name().items()} ==
+          {"0802上午梯田": True, "0899测试其他": False, "0899植被梯田": False, "26.08.01植被": False})
+    btn(t4, "反选").invoke()
+    check("反选", {k: v["on"] for k, v in by_name().items()} ==
+          {"0802上午梯田": False, "0899测试其他": True, "0899植被梯田": True, "26.08.01植被": True})
+    btn(t4, "全选").invoke()
+    check("全选", all(v["on"] for v in by_name().values()))
+    btn(t4, "只勾待运行").invoke()
+    check("只勾待运行", {k: v["on"] for k, v in by_name().items()} ==
+          {"0802上午梯田": True, "0899测试其他": False, "0899植被梯田": True, "26.08.01植被": True})
+    by_name()["0899植被梯田"]["cb"].toggle()
+    check("单独点一行的勾选框", not by_name()["0899植被梯田"]["on"])
+
+    # 规则表加一行 → 重扫：0899测试其他 匹配上；改了规则不重扫就开始：拒绝；删掉 → 重扫：又变回跳过
+    btn(rf, "＋ 添加规则").invoke()
+    yield 0.3
+    check("加规则后 3 行", len(rules()) == 3, len(rules()))
+    set_entry(rules()[2][0], "其他")
+    set_entry(rules()[2][1], REF)
+    set_entry(rules()[2][2], "4")
+    btn(t4, "开始").invoke()
+    check("改了规则不重扫就开始 → 提示重新扫描", "重新扫描" in R["boxes"][-1][2], R["boxes"][-1:])
+    btn(t4, "扫描").invoke()
+    yield 0.5
+    tb = by_name()
+    check("加「其他」规则后重扫：0899测试其他 待运行、规则 其他", tb["0899测试其他"]["cells"][2] == "其他" and
+          tb["0899测试其他"]["cells"][5] == "待运行", tb["0899测试其他"]["cells"])
+    check("新规则记进 config", [r["key"] for r in cfg()["batch_rules"]] == ["梯田", "植被", "其他"]
+          and cfg()["batch_rules"][2]["exclude"] == "4", cfg()["batch_rules"])
+    dels = sorted([b for b in find(rf, ctk.CTkButton) if b.cget("text") == "删除"], key=lambda b: int(b.grid_info()["row"]))
+    dels[2].invoke()
+    yield 0.3
+    check("删规则后 2 行", [r[0].get() for r in rules()] == ["梯田", "植被"], [r[0].get() for r in rules()])
+    btn(t4, "扫描").invoke()
+    yield 0.5
+    tb = by_name()
+    check("删规则后重扫：0899测试其他 变回跳过", tb["0899测试其他"]["cells"][5] == "跳过：没有匹配的规则", tb["0899测试其他"]["cells"])
+    if os.environ.get("UAV_T7_NO_RUN"):
+        return
+
+    # 真跑：只勾 0802上午梯田、26.08.01植被；第一期出结论后、第二期运行中取消
+    set_entry(e_f, "0899")
+    yield 0.3
+    btn(t4, "全不选").invoke()
+    set_entry(e_f, "")
+    yield 0.3
+    R["run_checked"] = sorted(k for k, v in by_name().items() if v["on"])
+    check("开跑前勾的是两期", R["run_checked"] == ["0802上午梯田", "26.08.01植被"], R["run_checked"])
+    gaps = {"last": time.time(), "max": 0.0, "n": 0}
+
+    def probe():  # 界面线程每 200 ms 一次；最大间隔就是界面最长卡了多久
+        now = time.time()
+        gaps["max"] = max(gaps["max"], now - gaps["last"])
+        gaps["last"] = now
+        gaps["n"] += 1
+        if not R.get("stop_probe"):
+            root.after(200, probe)
+
+    nboxes = len(R["boxes"])
+    bs, bc = btn(t4, "开始"), btn(t4, "取消")
+    bs.invoke()
+    gaps["last"] = time.time()
+    root.after(200, probe)
+    check("开始后：开始/扫描禁用、取消可用", bs.cget("state") == "disabled" and btn(t4, "扫描").cget("state") == "disabled"
+          and bc.cget("state") == "normal")
+    st = lambda n: by_name()[n]["cells"][5]
+    yield (lambda: st("0802上午梯田") in ("运行中", "等待其他 Metashape")), 60
+    R["status_running"] = st("0802上午梯田")
+    yield 20
+    for mode, cn in (("light", "浅色"), ("dark", "深色")):
+        ctk.set_appearance_mode(mode)
+        yield 1.0
+        p = os.path.join(shots, "批量迁移_运行中_%s.bmp" % cn)
+        grab_bmp(p, root)
+        R.setdefault("shots", []).append(p)
+    ctk.set_appearance_mode("light")
+    yield (lambda: st("26.08.01植被") == "运行中" or bs.cget("state") == "normal"), 3600
+    R["first_status"] = st("0802上午梯田")
+    check("第一期出结论（自动通过/需人工核对 + RMS3D）", R["first_status"].split(" ")[0] in ("自动通过", "需人工核对")
+          and "mm" in R["first_status"], R["first_status"])
+    t4box = find(t4, ctk.CTkTextbox)[0]
+    yield (lambda: "匹配" in "\n".join(t4box.get("1.0", "end").splitlines()[-15:]) or bs.cget("state") == "normal"), 900
+    yield 20
+    R["log_before_cancel"] = t4box.get("1.0", "end").strip().splitlines()[-6:]
+    bc.invoke()
+    check("点取消后显示正在取消", any("正在取消" in l.cget("text") for l in find(t4, ctk.CTkLabel)))
+    yield wait_idle(bs)
+    R["stop_probe"] = True
+    R["ui_max_gap_s"] = round(gaps["max"], 2)
+    R["ui_ticks"] = gaps["n"]
+    check("运行期间界面不卡（200 ms 定时器最大间隔 < 2 s）", gaps["max"] < 2.0, "最大间隔 %.2f s，%d 次" % (gaps["max"], gaps["n"]))
+    tb = by_name()
+    R["final"] = {k: v["cells"][5] for k, v in tb.items()}
+    check("取消后：第一期保留结论、第二期已取消", tb["0802上午梯田"]["cells"][5] == R["first_status"]
+          and tb["26.08.01植被"]["cells"][5] == "已取消", R["final"])
+    new = R["boxes"][nboxes:]
+    check("取消后弹「已取消」提示", new and new[-1][0] == "showwarning" and "已取消" in new[-1][2], new)
+    sums = sorted(glob.glob(os.path.join(out, "批量迁移汇总_*.csv")))
+    R["summary"] = sums[-1] if sums else ""
+    import csv as _csv
+    rows = list(_csv.DictReader(open(R["summary"], encoding="utf-8-sig"))) if sums else []
+    R["summary_rows"] = rows
+    check("汇总表写到取消为止：两行，第一期结论、第二期已取消", [(r["期次"], r["状态"]) for r in rows] ==
+          [("0802上午梯田", R["first_status"].split(" ")[0]), ("26.08.01植被", "已取消")], [(r["期次"], r["状态"]) for r in rows])
+    rep1 = glob.glob(os.path.join(out, "0802上午梯田*_控制点", "控制点报告.txt"))
+    check("第一期的控制点报告保留", len(rep1) == 1 and
+          ("判定：%s" % R["first_status"].split(" ")[0]) in open(rep1[0], encoding="utf-8-sig").read(), rep1)
+    check("日志文件在", glob.glob(os.path.join(out, "批量迁移日志_*.txt")) != [])
+
+
 def fill_dialog(root, answer):
     tops = [w for w in root.winfo_children() if isinstance(w, ctk.CTkToplevel) and w.winfo_exists()]
     if not tops:
@@ -379,7 +587,7 @@ def fill_dialog(root, answer):
 
 def drive(root):
     nb = find(root, ctk.CTkTabview)[0]
-    gen = steps_shots(root, nb) if MODE == "shots" else steps_invoke(root, nb)
+    gen = {"shots": steps_shots, "batch": steps_batch}.get(MODE, steps_invoke)(root, nb)
 
     def tick(cond=None, deadline=0):
         if cond is not None and not cond() and time.time() < deadline:
