@@ -7,6 +7,12 @@
   3. 控制点（D-16、D-17）：①迁移：新一期照片和已有控制点的参考期联合匹配，零刺点自动放点、细化、平差、判定；
      ②建参考期：空三工程 + 控制点 CSV（+ CC 刺点），自动判 X/Y 是否对调，再细化、平差、判定。
      迁移时细化把点挪得太远（D-20）就自动排除该点；也可以手动排除。导出的 XML 写 CC 的 Local:unit=meter（D-19）。
+  4. 批量迁移（D-24、D-26、D-27）：扫描上级目录，按规则表配参考期，一期接一期跑「控制点·迁移」。
+  5. 影像处理（D-29）：扫描工点、勾选，一个接一个用 Metashape 最高精度空三，导出带 CGCS2000 3 度带（不带带号，
+     按工点自动选最近的带、可改）坐标的 Blocks Exchange（CC 直接导入），可选出 DOM/DSM；室外照片不去定位。
+     勾了 DOM/DSM 默认自动裁边（D-32）：只认「DOM 有影像 + 不插值的密集点云真有点 + 点云够密」的地方，补缝、取最大连片、
+     填小洞、往里收 3 米成范围线，DOM 和 DSM 用同一条线同一个像元网格裁（线外透明 / NoData），范围线另存 KML（WGS84）
+     + SHP（同 DOM 坐标系）。「按范围线重新裁剪…」/ survey-clip：用户改了线（可挖洞、加块）后只重新导出，不重建。
 
 规则：
   - 字节级原位等长改写，输出大小 = 原文件，SOS 之后的数据逐字节不变，不解码图像。
@@ -26,18 +32,26 @@
                                         [--exclude 1,2] [--max-shift 50]
   python uav_photo_tool.py gcp-init <空三.psx> --csv <控制点.csv> [--cc <CC导出.xml/.xmlz>] [--out 输出位置]
                                     [--exclude 1,2]
+  python uav_photo_tool.py gcp-batch <上级目录> --out <输出> --rule 关键词=参考期.psx[:排除点] ...
+  python uav_photo_tool.py survey-batch <上级目录> --out <输出> [--epsg auto|4543] [--dom-dsm] [--resolution 0.03]
+                                        [--clip auto|none|范围线.kml|.shp] [--clip-inset 3] [--clip-density 50]
+                                        [--include "*弃渣场*"] [--pick 1,3,5-9] [--skip 名字,...] [--plan]
+  python uav_photo_tool.py survey-clip <工点输出目录>... [--line <KML或SHP>] [--clip-inset 3] [--clip-density 50]
   python uav_photo_tool.py check-update
 不带参数启动图形界面（菜单「帮助」里可以检查更新）。
 退出码：0 成功（控制点＝自动通过）/ 1 有失败 / 2 拒绝执行 / 3 已取消 / 4 控制点需人工核对 / 10 有新版本（check-update）。
 """
 
 import argparse
+import base64
 import csv
 import datetime
 import fnmatch
 import hashlib
+import math
 import stat
 import glob
+import gzip
 import json
 import os
 import queue
@@ -51,10 +65,11 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "0.9"
+APP_VERSION = "1.3"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -3181,6 +3196,3327 @@ def run_gcp_batch(items, out_dir, metashape, plan=False, log=None, progress=None
 
 
 # ---------------------------------------------------------------------------
+# 影像处理（D-29，T9）：扫描工点 → 勾选 → 一个接一个用 Metashape 空三，导出带 CGCS2000 3 度带坐标的
+# Blocks Exchange（CC 直接导入、不用再空三），可选出 DOM/DSM。室外照片的 GPS 有用：本页签不去定位（与其他页签相反）。
+# T9 卡 🔒 节的定义和判据写在下面的常量里，不要改。
+# ---------------------------------------------------------------------------
+
+SURVEY_DOWNSCALE = 0              # 对齐精度「最高」
+SURVEY_KEYPOINTS = 40000
+SURVEY_TIEPOINTS = 10000
+SURVEY_MIN_RATIO = 0.8            # 对齐率 < 80% 判失败
+SURVEY_DEPTH_DOWNSCALE = 1        # 深度图 / 密集点云质量「超高」，深度过滤「适中」
+SURVEY_RESOLUTION = 0.03          # DOM/DSM 分辨率（米）；0 = 自动（Metashape 给的原始分辨率）
+SURVEY_NODATA = -9999.0           # DSM 的 NoData
+SURVEY_BIGTIFF = 3800 * 1024 ** 2  # 估算不压缩超过这么大就写 BigTIFF（普通 TIFF 上限 4 GB，留余量）
+SURVEY_NEAR_ZONE = 0.1            # 经度离分带线（中央经线 ±1.5°）不到这么多度：标「靠近分带线」
+SURVEY_MIN_GPS = 3                # 带定位的照片少于这么多张，没法按 GPS 定坐标
+SURVEY_EPSG_MIN, SURVEY_EPSG_MAX = 4534, 4554  # CGCS2000 3 度带（东坐标不带带号），中央经线 75°E～135°E
+SURVEY_REGION_LIMIT = 200.0       # 米：（不裁边时）DOM/DSM 范围用 Metashape 自动的区域框；比已对齐相机的平面范围往外伸出超过这么多的边收回来
+# D-33/T13（勾了自动裁边时）：平面范围 = 自动区域框 ∪ 连接点东、北各自的分位数范围，再限制在相机平面范围 ± 1000 米；
+# 高程方向用自动区域框的。多出来的边角由自动裁边收回
+SURVEY_REGION_LIMIT_CLIP = 1000.0
+SURVEY_REGION_TIE_PCT = (0.1, 99.9)  # %：连接点分位数（去掉两头各 0.1% 的离群点）
+# D-32/T12 自动裁边：0.5 米分析网格上「DOM 有影像 + 不插值的辅助 DSM 有真实点 + 点云够密」的格子 → 补缝 → 最大连片 →
+# 填小洞 → 往里收 → 简化成范围线；DOM/DSM 用同一条线同像元网格裁（T11 的两趟导出、范围线文件、用户线优先照旧）
+SURVEY_CLIP_INSET = 3.0           # 米：「往里收」的默认值（界面/命令行可改）
+SURVEY_CLIP_INSET_MIN, SURVEY_CLIP_INSET_MAX = 0.0, 30.0
+SURVEY_CLIP_HOLE = 100.0          # m²：内部面积小于这么多的洞填掉
+SURVEY_CLIP_GRID = 0.5            # 米：分析网格（判有效、补缝、连片、填洞、往里收都在这上面做），原点 = 没裁的 DOM/DSM 左上角
+SURVEY_CLIP_SIMPLIFY = 1.0        # 米：范围线简化的容差上限，也是相邻点最小间距
+SURVEY_CLIP_MARGIN_PX = 5         # 像元：输出外框 = 范围线外接矩形外扩这么多像素
+SURVEY_CLIP_DOM_FRAC = 0.9        # 判据①：格子里没裁的 DOM alpha > 0 的像元 ≥ 这么多（9 成）才算「影像有内容」
+SURVEY_CLIP_AUX_RES = 0.1         # 米：不插值辅助 DSM 的分辨率（只判断、不输出；5 × 5 个子格 = 1 个分析格）
+SURVEY_CLIP_BLOCK = 1.0           # 米：判据③「点云够密」按这么大的块算（10 × 10 个子格 = 2 × 2 个分析格）
+SURVEY_CLIP_DENSITY = 50.0        # %：判据③ 块里有点的子格占比的门槛（「点云密度门槛」，界面/命令行可调）
+SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX = 10.0, 90.0
+SURVEY_CLIP_CLOSE = 1.0           # 米：补缝＝先往外扩这么多再往里收这么多（把细缝连起来）
+SURVEY_CLIP_ANALYSIS = "_裁边分析.json.gz"  # 三条判据的分析网格缓存（只改往里收/密度门槛重新裁时不用再进 Metashape 分析）
+SURVEY_CLIP_AUTO, SURVEY_CLIP_NONE = "auto", "none"
+SURVEY_CLIP_INSET_TAIL = 0.25     # 像元：向 Metashape 要多 0.25 个像元（它按 int() 截断像素数），保证正好外扩 5 像素
+SURVEY_RANGE_KML = "_范围线.kml"  # 范围线备份（WGS84 经纬度，可选用）
+SURVEY_RANGE_SHP = "_范围线.shp"  # 范围线备份（坐标系同 DOM，带 .shx/.dbf/.prj）
+SURVEY_REPORT = "处理报告.txt"
+SURVEY_TODO = "待处理"
+SURVEY_LOW_GPS = "定位不足"
+SURVEY_CSV_FIELDS = ("序号", "工点", "照片数", "带定位张数", "坐标系", "坐标系来源", "状态", "对齐", "未对齐数",
+                     "相机参考误差RMS", "DOM/DSM", "耗时分钟", "报告")
+SURVEY_ACCURACY_NOTE = "平面/高程精度取决于机载 GPS（普通 GPS、没有 RTK），未用控制点，误差一般是米级；高程用照片记录的高度，没有做高程基准改正。"
+
+# 内嵌脚本：运行在 Metashape 自带的 Python 里（1.7 是 3.8），只许用 Python 3.8 语法。
+SURVEY_SCRIPT = r'''# -*- coding: utf-8 -*-
+# 由「无人机照片工具」影像处理页签生成，在 Metashape 内嵌的 Python 里运行。只用 Python 3.8 语法。
+import json
+import math
+import os
+import sys
+import time
+import traceback
+
+P = json.load(open(sys.argv[-1], "r", encoding="utf-8"))
+_pf = open(P["progress"], "a", encoding="utf-8")
+
+
+def ev(kind, **kw):
+    kw["ev"] = kind
+    kw["t"] = round(time.time(), 1)
+    _pf.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    _pf.flush()
+
+
+class Prog(object):
+    def __init__(self, stage):
+        self.stage = stage
+        self.last = -1
+
+    def __call__(self, p):
+        p = int(p)
+        if p != self.last:
+            self.last = p
+            ev("progress", stage=self.stage, pct=p)
+
+
+def timed(stage, fn, *a, **kw):
+    ev("stage", stage=stage)
+    t0 = time.time()
+    out = fn(*a, **kw)
+    ev("secs", stage=stage, secs=round(time.time() - t0, 1))
+    return out
+
+
+def enum(owner, *names):
+    for n in names:
+        o = owner
+        for part in n.split("."):
+            o = getattr(o, part, None)
+            if o is None:
+                break
+        if o is not None:
+            return o
+    raise RuntimeError("Metashape 里找不到 %s" % "/".join(names))
+
+
+def region_box(chunk, crs):
+    """区域框 8 个角换到投影坐标后的范围 [东min, 北min, 东max, 北max, 高min, 高max]。"""
+    T = chunk.transform.matrix
+    reg = chunk.region
+    cs = []
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            for sz in (-1, 1):
+                v = reg.center + reg.rot * Metashape.Vector([sx * reg.size.x / 2, sy * reg.size.y / 2, sz * reg.size.z / 2])
+                cs.append(crs.project(T.mulp(v)))
+    return [min(c.x for c in cs), min(c.y for c in cs), max(c.x for c in cs), max(c.y for c in cs),
+            min(c.z for c in cs), max(c.z for c in cs)]
+
+
+def set_region_box(chunk, crs, box):
+    """把区域框设成投影坐标里北朝上的长方体 box = [东min, 北min, 东max, 北max, 高min, 高max]。"""
+    x0, y0, x1, y1, z0, z1 = box
+    Ti = chunk.transform.matrix.inv()
+    center = Metashape.Vector([(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2])
+    c_int = Ti.mulp(crs.unproject(center))
+    axes, lens = [], []
+    for d in ([1, 0, 0], [0, 1, 0], [0, 0, 1]):
+        a = Ti.mulp(crs.unproject(Metashape.Vector([center.x + d[0], center.y + d[1], center.z + d[2]]))) - c_int
+        lens.append(a.norm())
+        axes.append(a.normalized())
+    reg = chunk.region
+    reg.center = c_int
+    reg.rot = Metashape.Matrix([[axes[0].x, axes[1].x, axes[2].x], [axes[0].y, axes[1].y, axes[2].y],
+                                [axes[0].z, axes[1].z, axes[2].z]])
+    reg.size = Metashape.Vector([(x1 - x0) * lens[0], (y1 - y0) * lens[1], (z1 - z0) * lens[2]])
+    chunk.region = reg
+
+
+def check_region(chunk, cams, crs, limit):
+    """DOM/DSM 范围用 Metashape 对齐后自动给的区域框；只有它比已对齐相机的平面范围还往外伸出 limit 米以上时
+    （斜拍照片里的远山把框撑大），才把那一边收到 相机范围 ± limit。返回 (用的框, 原来的框, 是否收过)。"""
+    T = chunk.transform.matrix
+    cp = [crs.project(T.mulp(c.center)) for c in cams]
+    cb = [min(p.x for p in cp), min(p.y for p in cp), max(p.x for p in cp), max(p.y for p in cp)]
+    box = region_box(chunk, crs)
+    new = [max(box[0], cb[0] - limit), max(box[1], cb[1] - limit), min(box[2], cb[2] + limit),
+           min(box[3], cb[3] + limit), box[4], box[5]]
+    if new[:4] != box[:4]:
+        set_region_box(chunk, crs, new)
+        return region_box(chunk, crs), box, True
+    return box, box, False
+
+
+def tie_range(chunk, crs, pct):
+    """连接点（稀疏点云里有效的点）东、北坐标各自 pct[0]%～pct[1]% 分位数（最近秩）的范围 [东min, 北min, 东max, 北max]
+    和点数；没有连接点返回 (None, 0)。"""
+    tp = getattr(chunk, "tie_points", None)  # 2.x
+    if tp is None:
+        tp = getattr(chunk, "point_cloud", None)  # 1.x
+    if tp is None or tp.points is None:
+        return None, 0
+    T = chunk.transform.matrix
+    xs, ys = [], []
+    for p in tp.points:
+        if not p.valid:
+            continue
+        q = crs.project(T.mulp(Metashape.Vector([p.coord.x, p.coord.y, p.coord.z])))
+        xs.append(q.x)
+        ys.append(q.y)
+    n = len(xs)
+    if not n:
+        return None, 0
+    xs.sort()
+    ys.sort()
+    lo, hi = [int(round(f / 100.0 * (n - 1))) for f in pct]
+    return [xs[lo], ys[lo], xs[hi], ys[hi]], n
+
+
+def expand_region(chunk, cams, crs, limit, pct):
+    """D-33（勾了自动裁边）：平面范围 = 自动区域框 ∪ 连接点分位数范围，再限制在 已对齐相机平面范围 ± limit；
+    高程用自动区域框的。返回 (用的框, 原来的框, 连接点范围, 连接点数, 被 ± limit 收过的边 [西/南/东/北])。"""
+    T = chunk.transform.matrix
+    cp = [crs.project(T.mulp(c.center)) for c in cams]
+    cb = [min(p.x for p in cp), min(p.y for p in cp), max(p.x for p in cp), max(p.y for p in cp)]
+    box = region_box(chunk, crs)
+    tr, n = tie_range(chunk, crs, pct)
+    u = list(box[:4])
+    if tr:
+        u = [min(u[0], tr[0]), min(u[1], tr[1]), max(u[2], tr[2]), max(u[3], tr[3])]
+    lim = [cb[0] - limit, cb[1] - limit, cb[2] + limit, cb[3] + limit]
+    new = [max(u[0], lim[0]), max(u[1], lim[1]), min(u[2], lim[2]), min(u[3], lim[3])]
+    sides = [s for s, a, b in zip(("西", "南", "东", "北"), u, new) if a != b]
+    if new != box[:4]:
+        set_region_box(chunk, crs, new + box[4:6])
+        return region_box(chunk, crs), box, tr, n, sides
+    return box, box, tr, n, sides
+
+
+app = None
+try:
+    try:
+        import Metashape
+    except ImportError:
+        import PhotoScan as Metashape
+    app = Metashape.app
+    ev("start", version=str(app.version), python=sys.version.split()[0])
+    print("Metashape version: %s" % app.version)
+    CS = Metashape.CoordinateSystem
+    crs = CS("EPSG::%d" % P["epsg"])
+    geo = CS("EPSG::4490")  # CGCS2000 经纬度；照片 GPS（WGS84）与 CGCS2000 只差厘米级，按同一套经纬度换算到投影坐标
+
+    doc = Metashape.Document()
+    doc.save(P["psx"])
+    chunk = doc.addChunk()
+    chunk.label = P["name"]
+    ev("stage", stage="add")
+    chunk.addPhotos(P["photos"])
+    cams = list(chunk.cameras)
+    if len(cams) != len(P["photos"]):
+        raise RuntimeError("addPhotos added %d cameras, expected %d" % (len(cams), len(P["photos"])))
+
+    # 照片 GPS（经纬度）→ 该工点的 CGCS2000 3 度带投影坐标，作相机参考；姿态参考不用（斜拍、云台角不当先验）
+    ev("stage", stage="refs")
+    located, samples, sx, sy, sz = 0, [], 0.0, 0.0, 0.0
+    for c in cams:
+        r = c.reference
+        loc = r.location
+        if loc is not None and not (abs(loc.x) < 1e-9 and abs(loc.y) < 1e-9):
+            p = CS.transform(Metashape.Vector([loc.x, loc.y, loc.z]), geo, crs)
+            r.location = p
+            r.location_enabled = True
+            located += 1
+            sx, sy, sz = sx + p.x, sy + p.y, sz + p.z
+            if len(samples) < 3 or c is cams[-1]:
+                samples.append([os.path.basename(c.photo.path), [loc.x, loc.y, loc.z], [p.x, p.y, p.z]])
+        else:
+            r.location = None
+            r.location_enabled = False
+        r.rotation_enabled = False
+    chunk.crs = crs
+    if located < P["min_gps"]:
+        raise RuntimeError("带定位的照片只有 %d 张（少于 %d 张），没法按 GPS 定坐标" % (located, P["min_gps"]))
+    mean = [sx / located, sy / located, sz / located]
+    ev("refs", total=len(cams), located=located, crs=crs.name, mean=mean, samples=samples[:4])
+
+    kw = dict(generic_preselection=True, reference_preselection=True, keypoint_limit=P["keypoint_limit"],
+              tiepoint_limit=P["tiepoint_limit"], progress=Prog("match"))
+    timed("match", chunk.matchPhotos, downscale=P["downscale"], **kw)
+    timed("align", chunk.alignCameras, progress=Prog("align"))
+    aligned = [c for c in chunk.cameras if c.transform is not None]
+    unaligned = [os.path.basename(c.photo.path) for c in chunk.cameras if c.transform is None]
+    if not aligned:
+        raise RuntimeError("一张照片都没有对齐")
+    timed("optimize", chunk.optimizeCameras, progress=Prog("optimize"))
+    aligned = [c for c in chunk.cameras if c.transform is not None]
+    unaligned = [os.path.basename(c.photo.path) for c in chunk.cameras if c.transform is None]
+    T = chunk.transform.matrix
+    errs = []
+    for c in aligned:
+        if c.reference.location is not None and c.reference.location_enabled:
+            errs.append(crs.project(T.mulp(c.center)) - c.reference.location)
+    rms = None
+    if errs:
+        rx = math.sqrt(sum(e.x ** 2 for e in errs) / len(errs))
+        ry = math.sqrt(sum(e.y ** 2 for e in errs) / len(errs))
+        rz = math.sqrt(sum(e.z ** 2 for e in errs) / len(errs))
+        rms = [rx, ry, rz, math.sqrt(rx * rx + ry * ry + rz * rz), len(errs)]
+    tp = getattr(chunk, "tie_points", None)  # 2.x
+    if tp is None:
+        tp = getattr(chunk, "point_cloud", None)  # 1.x
+    n_tie = len(tp.points) if tp is not None and tp.points is not None else 0
+    ev("aligned", aligned=len(aligned), total=len(chunk.cameras), unaligned=unaligned, tiepoints=n_tie, rms=rms)
+    timed("save", doc.save)
+    if len(aligned) < P["min_ratio"] * len(chunk.cameras):
+        ev("low_ratio")
+        ev("done")
+    else:
+        # 只读重开工程再导出；未对齐的相机从导出里去掉（D-12），.psx 保留全部照片
+        ev("stage", stage="export")
+        t0 = time.time()
+        doc2 = Metashape.Document()
+        doc2.open(P["psx"], read_only=True)
+        ch2 = doc2.chunk
+        drop = [c for c in ch2.cameras if c.transform is None]
+        if drop:
+            ch2.remove(drop)
+        ch2.exportCameras(P["xml_raw"], format=enum(Metashape, "CamerasFormatBlocksExchange",
+                                                    "CamerasFormat.CamerasFormatBlocksExchange"), crs=crs)
+        ev("exported", path=P["xml_raw"], cameras=len(ch2.cameras), dropped=len(drop))
+        doc2 = ch2 = None
+        ev("secs", stage="export", secs=round(time.time() - t0, 1))
+
+        if P["dom_dsm"]:
+            res = P["resolution"] or 0
+            op = Metashape.OrthoProjection()
+            op.crs = crs
+            if P["clip"]:
+                box, box0, tr, n_tr, sides = expand_region(chunk, aligned, crs, P["region_limit_clip"],
+                                                           P["region_tie_pct"])
+                ev("region", box=box, default=box0, clamped=bool(sides), mode="tie", limit=P["region_limit_clip"],
+                   tie=tr, n_tie=n_tr, pct=P["region_tie_pct"], sides=sides)
+            else:
+                box, box0, clamped = check_region(chunk, aligned, crs, P["region_limit"])
+                ev("region", box=box, default=box0, clamped=clamped, mode="limit", limit=P["region_limit"])
+            timed("depth", chunk.buildDepthMaps, downscale=P["depth_downscale"],
+                  filter_mode=Metashape.ModerateFiltering, progress=Prog("depth"))
+            timed("dense", chunk.buildDenseCloud, point_colors=True, progress=Prog("dense"))
+            timed("save", doc.save)
+            timed("dem", chunk.buildDem, source_data=Metashape.DenseCloudData,
+                  interpolation=Metashape.EnabledInterpolation, projection=op, resolution=res, progress=Prog("dem"))
+            timed("ortho", chunk.buildOrthomosaic, surface_data=Metashape.ElevationData,
+                  blending_mode=Metashape.MosaicBlending, fill_holes=True, projection=op, resolution=res,
+                  progress=Prog("ortho"))
+            timed("save", doc.save)
+            info = {}
+            # DOM、DSM 导出成同一个范围（DSM 的范围）；分辨率按投影坐标单位给（resolution 参数是地面米，
+            # 高斯投影离中央经线远了会差万分之几，导出的像素就不是整 0.03）
+            el = chunk.elevation
+            box = Metashape.BBox()
+            box.min = Metashape.Vector([el.left, el.bottom])
+            box.max = Metashape.Vector([el.right, el.top])
+            # 要裁边时先导出「没裁」的 DSM、DOM（拿它们定网格、判「影像有内容」），按范围线重新导出时再出正式的
+            kinds = {"dsm": (Metashape.ElevationData, 1, 4), "dom": (Metashape.OrthomosaicData, 4, 1)}
+            plan = (("dsm", P["dsm_uncropped"] if P["clip"] else P["dsm"]),
+                    ("dom", P["dom_uncropped"] if P["clip"] else P["dom"]))
+            for key, out_path in plan:
+                if out_path is None:
+                    continue
+                src, bands, nbytes = kinds[key]
+                r = chunk.elevation if key == "dsm" else chunk.orthomosaic
+                px = res or r.resolution
+                w, h = (el.right - el.left) / px, (el.top - el.bottom) / px
+                big = w * h * bands * nbytes > P["bigtiff"]
+                ic = Metashape.ImageCompression()
+                ic.tiff_compression = Metashape.ImageCompression.TiffCompressionDeflate
+                ic.tiff_big = big
+                ic.tiff_tiled = False
+                ic.tiff_overviews = False
+                kw = dict(source_data=src, image_format=Metashape.ImageFormatTIFF, projection=op, region=box,
+                          save_world=True, image_compression=ic, progress=Prog("export_" + key))
+                if res:
+                    kw.update(resolution_x=res, resolution_y=res)
+                if key == "dsm":
+                    kw.update(nodata_value=P["nodata"], save_alpha=False)
+                else:
+                    kw.update(save_alpha=True, white_background=False)
+                timed("export_" + key, chunk.exportRaster, out_path, **kw)
+                info[key] = {"native": r.resolution, "res": px, "left": el.left, "right": el.right, "bottom": el.bottom,
+                             "top": el.top, "width": int(round(w)), "height": int(round(h)), "bigtiff": big}
+            ev("rasters", info=info)
+        ev("done")
+except Exception:
+    ev("error", msg=traceback.format_exc())
+finally:
+    _pf.close()
+    if app is not None:
+        app.quit()
+'''
+
+_SURVEY_SPAN = {
+    False: {"add": (0, 1, "导入照片"), "refs": (1, 2, "GPS 换算到投影坐标"), "match": (2, 60, "匹配（最高精度）"),
+            "align": (60, 85, "对齐"), "optimize": (85, 90, "优化相机"), "save": (90, 92, "保存工程"),
+            "export": (92, 97, "导出 XML"), "fix": (97, 100, "修正 XML")},
+    True: {"add": (0, 1, "导入照片"), "refs": (1, 1, "GPS 换算到投影坐标"), "match": (1, 12, "匹配（最高精度）"),
+           "align": (12, 16, "对齐"), "optimize": (16, 17, "优化相机"), "save": (17, 17, "保存工程"),
+           "export": (17, 18, "导出 XML"), "depth": (18, 48, "深度图（超高）"), "dense": (48, 70, "密集点云"),
+           "dem": (70, 76, "生成 DSM"), "ortho": (76, 86, "生成 DOM"), "export_dsm": (86, 89, "导出 DSM"),
+           "export_dom": (89, 92, "导出 DOM"), "clip": (92, 99, "按范围线裁边"), "fix": (99, 100, "检查结果")},
+}
+_SURVEY_STEP_LABEL = (("match", "匹配"), ("align", "对齐"), ("optimize", "优化相机"), ("export", "导出 XML"),
+                      ("depth", "深度图"), ("dense", "密集点云"), ("dem", "DSM"), ("ortho", "DOM"),
+                      ("export_dsm", "导出 DSM"), ("export_dom", "导出 DOM"), ("clip", "裁边重新导出"),
+                      ("dom_raw", "导出没裁的 DOM（裁边分析）"), ("aux_dem", "建不插值辅助 DSM"),
+                      ("aux_export", "导出辅助 DSM"), ("clip_dsm", "按范围线导出 DSM"), ("clip_dom", "按范围线导出 DOM"))
+
+
+
+def survey_zone(lon):
+    """照片平均经度 → (EPSG, 中央经线, 是否靠近分带线)。🔒：中央经线 = 3 × round(经度 / 3)，EPSG = 4534 + (中央经线 − 75) / 3；
+    不在 75°E～135°E 的 3 度带范围里时 EPSG 为 None。"""
+    cm = 3 * int(lon / 3.0 + 0.5)
+    epsg = SURVEY_EPSG_MIN + (cm - 75) // 3
+    near = abs(abs(lon - cm) - 1.5) < SURVEY_NEAR_ZONE
+    return (epsg if SURVEY_EPSG_MIN <= epsg <= SURVEY_EPSG_MAX else None), cm, near
+
+
+def survey_cm(epsg):
+    return 75 + 3 * (int(epsg) - SURVEY_EPSG_MIN)
+
+
+def survey_srs_label(epsg):
+    """列表和汇总表里显示的坐标系，如 EPSG:4543 CM102；没有坐标系返回空串。"""
+    return "EPSG:%d CM%d" % (epsg, survey_cm(epsg)) if epsg else ""
+
+
+def survey_srs_name(epsg):
+    return "CGCS2000 / 3-degree Gauss-Kruger CM %dE" % survey_cm(epsg)
+
+
+def parse_survey_epsg(text):
+    """「auto」「自动」或空 → None；「4543」「EPSG:4543」「EPSG:4543 CM102」→ 4543；不在 4534～4554 抛 ValueError。"""
+    t = (text or "").strip()
+    if not t or t.lower() == "auto" or t.startswith("自动"):
+        return None
+    m = re.match(r"^(?:EPSG\s*:{0,2}\s*)?(\d{4,5})\b", t, re.I)
+    if not m:
+        raise ValueError("看不懂的坐标系：%s（写 auto 或 4534～4554 的 EPSG 号，如 4543）" % text)
+    e = int(m.group(1))
+    if not SURVEY_EPSG_MIN <= e <= SURVEY_EPSG_MAX:
+        raise ValueError("EPSG:%d 不是 CGCS2000 3 度带（不带带号）：只能是 %d～%d（中央经线 75°E～135°E）"
+                         % (e, SURVEY_EPSG_MIN, SURVEY_EPSG_MAX))
+    return e
+
+
+def parse_survey_resolution(text):
+    """DOM/DSM 分辨率：「auto」「自动」或 0 → 0（Metashape 给的原始分辨率）；否则 0.001～10 米。"""
+    t = str(text if text is not None else "").strip()
+    if not t or t.lower() == "auto" or t.startswith("自动"):
+        return 0.0
+    try:
+        v = float(t)
+    except ValueError:
+        raise ValueError("分辨率要填数字（米，如 0.03）或「自动」：%s" % text)
+    if v == 0:
+        return 0.0
+    if not 0.001 <= v <= 10:
+        raise ValueError("分辨率要在 0.001～10 米之间（默认 %g）：%s" % (SURVEY_RESOLUTION, text))
+    return v
+
+
+_RE_XMP_GPS = re.compile(rb"drone-dji:(GpsLatitude|GpsLongitude|GpsLongtitude|AbsoluteAltitude)\s*=\s*[\"']([^\"']*)[\"']",
+                         re.IGNORECASE)
+
+
+def _exif_gps(b, base, end):
+    """Exif（TIFF 头在 base）里 GPS IFD 的经纬度、高度；没有返回 None。"""
+    order = bytes(b[base:base + 2])
+    e = "<" if order == b"II" else ">" if order == b"MM" else None
+    if e is None or base + 8 > end:
+        return None
+    entries, _ = _read_ifd(b, base, end, struct.unpack(e + "I", b[base + 4:base + 8])[0], e)
+    ptr = [x for x in entries if x[0] == GPS_POINTER_TAG]
+    if not ptr:
+        return None
+    gents, _ = _read_ifd(b, base, end, struct.unpack(e + "I", ptr[0][3])[0], e)
+    tags = dict((t, (typ, cnt, val)) for t, typ, cnt, val, _ in gents)
+
+    def rationals(tag):
+        typ, cnt, val = tags[tag]
+        if typ not in (5, 10) or cnt < 1:
+            raise JpegError("GPS 标签 0x%04X 类型不对" % tag)
+        p = base + struct.unpack(e + "I", val)[0]
+        if p + 8 * cnt > end:
+            raise JpegError("GPS 标签 0x%04X 越界" % tag)
+        out = []
+        for k in range(cnt):
+            n, d = struct.unpack(e + ("II" if typ == 5 else "ii"), bytes(b[p + 8 * k:p + 8 * k + 8]))
+            out.append(n / float(d) if d else 0.0)
+        return out
+
+    def dms(v):
+        return v[0] + (v[1] if len(v) > 1 else 0) / 60.0 + (v[2] if len(v) > 2 else 0) / 3600.0
+
+    if 2 not in tags or 4 not in tags:
+        return None
+    lat, lon = dms(rationals(2)), dms(rationals(4))
+    if 1 in tags and tags[1][2][:1] in (b"S", b"s"):
+        lat = -lat
+    if 3 in tags and tags[3][2][:1] in (b"W", b"w"):
+        lon = -lon
+    alt = rationals(6)[0] if 6 in tags else None
+    if alt is not None and 5 in tags and tags[5][2][:1] == b"\x01":
+        alt = -alt
+    return lat, lon, alt
+
+
+def photo_gps(path, head=65536):
+    """照片的 (纬度, 经度, 高度)：先读 EXIF GPS，没有再读 DJI XMP；不带定位（或是 0,0）返回 None。
+    只读文件开头（默认 64 KB，元数据段更长时才多读），网络盘上也快。"""
+    with open(path, "rb") as f:
+        b = f.read(head)
+        if b[:2] != b"\xff\xd8":
+            return None
+        exif = xmp = None
+        i = 2
+        while i + 4 <= len(b) and b[i] == 0xFF:
+            m = b[i + 1]
+            if m == 0xFF:
+                i += 1
+                continue
+            if m in (0xDA, 0xD9):
+                break
+            seg_end = i + 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
+            if m == 0xE1:
+                if seg_end > len(b):
+                    b += f.read(seg_end - len(b) + 4)
+                payload = b[i + 4:i + 4 + 32]
+                if payload.startswith(EXIF_HEADER) and exif is None:
+                    try:
+                        exif = _exif_gps(b, i + 4 + len(EXIF_HEADER), min(seg_end, len(b))) or False
+                    except (JpegError, struct.error, IndexError, KeyError, ZeroDivisionError):
+                        exif = False
+                elif payload.startswith(XMP_HEADER) and xmp is None:
+                    v = dict((k.lower(), s) for k, s in _RE_XMP_GPS.findall(b[i + 4:seg_end]))
+                    try:
+                        lon = v.get(b"gpslongitude") or v.get(b"gpslongtitude")
+                        xmp = (float(v[b"gpslatitude"]), float(lon),
+                               float(v[b"absolutealtitude"]) if v.get(b"absolutealtitude") else None)
+                    except (KeyError, TypeError, ValueError):
+                        xmp = False
+            i = seg_end
+    for g in (exif, xmp):
+        if g and -90 <= g[0] <= 90 and -180 <= g[1] <= 180 and not (abs(g[0]) < 1e-9 and abs(g[1]) < 1e-9):
+            return g
+    return None
+
+
+def _visible_jpeg(e):
+    return e.is_file() and not _is_hidden(e) and os.path.splitext(e.name)[1].lower() in JPEG_EXTS
+
+
+def _scandir_memo(d, memo):
+    """同一次扫描里同一个目录只列一次（网络盘上列目录慢）。"""
+    d = str(d)
+    if d not in memo:
+        memo[d] = list(os.scandir(d))
+    return memo[d]
+
+
+def survey_site_photos(d, memo=None, with_stat=False):
+    """工点下所有照片（含各层子文件夹，如 正摄\），按相对路径排序；不看隐藏项（同批量迁移）。
+    with_stat：返回 [(路径, 大小, 修改时间)]（用列目录时带回来的信息，不再逐个去网络盘上查）。"""
+    memo = {} if memo is None else memo
+    out = []
+    stack = [Path(d)]
+    while stack:
+        cur = stack.pop()
+        es = _scandir_memo(cur, memo)
+        for e in es:
+            if _visible_jpeg(e):
+                st = e.stat()
+                out.append((Path(e.path), st.st_size, st.st_mtime_ns))
+        stack += [cur / e.name for e in es if e.is_dir() and not _is_hidden(e)]
+    key = _name_sort_key()
+    rel = lambda x: str(x[0].relative_to(d)).lower()
+    out.sort(key=(lambda x: key(rel(x))) if key else rel)
+    return out if with_stat else [x[0] for x in out]
+
+
+def survey_site_dirs(root, memo=None):
+    """🔒 工点：所选目录下每个「自己直接含 JPG、且不在另一个工点里面」的文件夹；自己不直接含 JPG 的往下找子文件夹。
+    返回 [(工点名, 工点文件夹, 是否在子目录里)]。工点名一般就是这个文件夹的名字；若它的上级（在所选目录之下）里
+    只有它这一个工点（如只有 正摄\ 的工点），工点名和工点文件夹都取到那一级（照片还是同一批）。重名时用相对路径拼。
+    「在子目录里」＝工点文件夹不是所选目录的直接子文件夹（如 无正射影像\<子文件夹>），这类默认不勾。
+    排序：直接子文件夹的工点在前，各自按相对路径（中文按拼音，同批量迁移）。"""
+    memo = {} if memo is None else memo
+    root = Path(os.path.abspath(root))
+    key = _name_sort_key()
+    found = []
+
+    def walk(d):
+        es = _scandir_memo(d, memo)
+        if any(_visible_jpeg(e) for e in es):
+            found.append(Path(d))
+            return
+        subs = [e.name for e in es if e.is_dir() and not _is_hidden(e)]
+        subs.sort(key=key) if key else subs.sort()
+        for n in subs:
+            walk(Path(d) / n)
+
+    walk(root)
+    sites = []
+    for d in found:
+        cur = d
+        while cur != root and cur.parent != root and sum(1 for x in found if cur.parent in x.parents) == 1:
+            cur = cur.parent
+        sites.append(cur)
+    names = [s.name if s != root else root.name for s in sites]
+    out = []
+    for s, n in zip(sites, names):
+        if names.count(n) > 1:
+            n = "_".join(s.relative_to(root).parts) or n
+        out.append((n, s, s != root and s.parent != root))
+    rel = lambda x: str(x[1].relative_to(root)) if x[1] != root else ""
+    out.sort(key=(lambda x: (x[2], key(rel(x)))) if key else (lambda x: (x[2], rel(x))))
+    return out
+
+
+def survey_result_dir(out_dir, name):
+    return Path(out_dir) / name
+
+
+def survey_read_report(path):
+    out = {"状态": "", "对齐": "", "相机参考误差RMS": "", "DOM/DSM": ""}
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return out
+    for k in out:
+        for ln in lines:
+            if ln.startswith(k + "：") and len(ln) > len(k) + 1:
+                out[k] = ln[len(k) + 1:]
+                break
+    return out
+
+
+def survey_result_state(out_dir, name):
+    """这个工点在输出目录里的结果：返回 (状态, 报告, 结果目录)。done（完成/部分对齐）/ cancelled（已取消 或有 已取消.txt）/
+    failed（失败，或目录里有东西却没有报告）/ None（没有结果目录）。"""
+    d = survey_result_dir(out_dir, name)
+    rep = d / SURVEY_REPORT
+    if not rep.is_file():
+        if d.is_dir() and any(d.iterdir()):
+            return "failed", None, d
+        return None, None, None
+    verdict = survey_read_report(rep)["状态"].split("（")[0].strip()
+    if (d / "已取消.txt").exists() or verdict == "已取消":
+        return "cancelled", rep, d
+    if verdict == "失败":
+        return "failed", rep, d
+    return "done", rep, d
+
+
+def survey_scan(root, out_dir=None, skip=(), epsg=None, manual=None, cache=None, progress=None, stop_event=None):
+    """扫描工点：每个一个 dict（序号、工点、照片清单、照片数、带定位张数、平均经纬度、自动选的带、用的 EPSG 和来源、
+    是否靠近分带线、状态）。epsg：整批统一用这个（来源记「手动」）；manual：{工点名: EPSG}（界面里手动改过的）。
+    cache：{路径: (大小, 修改时间, GPS)}，重扫时没变的照片不再读。状态：待处理 / 待处理（上次失败|已取消）/ 已有结果 /
+    定位不足 / 跳过：在跳过名单里。default：界面里默认勾不勾（待处理且不在子目录里的才勾）。"""
+    progress = progress or (lambda i, n, s: None)
+    if not root or not Path(root).is_dir():
+        raise ValueError("照片上级目录不存在：%s" % root)
+    if out_dir:
+        r, o = Path(os.path.abspath(root)), Path(os.path.abspath(out_dir))
+        if o == r or r in o.parents:
+            raise ValueError("输出目录不能放在照片目录里面（原片目录只读）：%s" % o)
+    manual = manual or {}
+    cache = cache if cache is not None else {}
+    progress(0, 0, "列工点")
+    memo = {}
+    sites = [(n, d, nested, survey_site_photos(d, memo, with_stat=True)) for n, d, nested in survey_site_dirs(root, memo)]
+    total = sum(len(p) for _, _, _, p in sites)
+    items, k = [], 0
+    for i, (name, d, nested, photos) in enumerate(sites, 1):
+        gps = []
+        for p, size, mtime in photos:
+            if stop_event is not None and stop_event.is_set():
+                raise AlignCancelled()
+            k += 1
+            hit = cache.get(str(p))
+            if hit and hit[0] == size and hit[1] == mtime:
+                g = hit[2]
+            else:
+                try:
+                    g = photo_gps(p)
+                except OSError:
+                    g = None
+                cache[str(p)] = (size, mtime, g)
+            if g:
+                gps.append(g)
+            if k % 25 == 0 or k == total:
+                progress(k, total, name)
+        lon = sum(g[1] for g in gps) / len(gps) if gps else None
+        lat = sum(g[0] for g in gps) / len(gps) if gps else None
+        auto, cm, near = survey_zone(lon) if gps else (None, None, False)
+        use, src = auto, "自动"
+        if epsg:
+            use, src = epsg, "手动"
+        elif manual.get(name):
+            use, src = int(manual[name]), "手动"
+        rel = str(Path(d).relative_to(os.path.abspath(root))) if Path(d) != Path(os.path.abspath(root)) else name
+        it = {"idx": i, "name": name, "dir": str(d), "rel": rel, "n": len(photos), "nested": nested,
+              "n_gps": len(gps), "lon": lon, "lat": lat, "auto_epsg": auto, "near": near, "epsg": use, "epsg_src": src,
+              "status": SURVEY_TODO, "report": "", "default": False}
+        state, rep, _ = survey_result_state(out_dir, name) if out_dir else (None, None, None)
+        if rep:
+            it["report"] = str(rep)
+        if name in skip:
+            it["status"] = "跳过：在跳过名单里"
+        elif state == "done":
+            it["status"] = "已有结果"
+        elif len(gps) * 2 < len(photos):
+            it["status"] = SURVEY_LOW_GPS
+        elif state:
+            it["status"] = "%s（上次%s）" % (SURVEY_TODO, BATCH_RERUN_LABEL[state])
+        it["default"] = it["status"].startswith(SURVEY_TODO) and not nested
+        items.append(it)
+    return items
+
+
+def survey_runnable(it):
+    """勾上后会真跑的：待处理…，以及用户自己勾上的「定位不足」。"""
+    return it["status"].startswith(SURVEY_TODO) or it["status"] == SURVEY_LOW_GPS
+
+
+def add_epsg_srs(src, dst, epsg):
+    """在已按 D-10 去掉坐标系的 XML 上，流式加回 CC 认的 EPSG 坐标系（T9 🔒）：<Block> 前插 <SpatialReferenceSystems>
+    （唯一一个 <SRS>：Id 1、Name「CGCS2000 / 3-degree Gauss-Kruger CM <中央经线>E」、Definition「EPSG:<号>」），
+    <Block> 的 <Name> 之后插 <SRSId>1</SRSId>；缩进照抄相邻元素，其余逐字保留。返回插了几处 <SRSId>。"""
+    stack, ws, need, n = [], "", None, 0
+
+    def tag_name(tok):
+        m = re.match(r"</?\s*([^\s/>]+)", tok)
+        return m.group(1) if m else ""
+
+    def indent(w):
+        return w[w.rfind("\n") + 1:] if "\n" in w else w
+
+    with open(src, "r", encoding="utf-8") as fi, open(dst, "w", encoding="utf-8", newline="") as fo:
+        buf = ""
+        while True:
+            chunk = fi.read(4 * 1024 * 1024)
+            buf += chunk
+            if chunk:
+                cut = buf.rfind(">") + 1
+                if cut <= 0:
+                    continue
+                work, buf = buf[:cut], buf[cut:]
+            else:
+                work, buf = buf, ""
+            for m in _TOKEN_RE.finditer(work):
+                tok = m.group(0)
+                if not tok.startswith("<"):
+                    fo.write(tok)
+                    ws = tok if not tok.strip() else ""
+                    continue
+                if tok.startswith("<?") or tok.startswith("<!"):
+                    fo.write(tok)
+                    ws = ""
+                    continue
+                name = tag_name(tok)
+                closing = tok.startswith("</")
+                nl = "\n" + indent(ws) if "\n" in ws else ws
+                if not closing:
+                    parent = stack[-1] if stack else ""
+                    if name in ("SRSId", "SpatialReferenceSystems"):
+                        raise ValueError("XML 里已经有 <%s>，要先按 D-10 去掉坐标系" % name)
+                    if need is not None and len(stack) == need and name != "Name":
+                        fo.write("<SRSId>%s</SRSId>" % BX_LOCAL_SRS_ID + nl)
+                        n += 1
+                        need = None
+                    if name == "Block" and parent == "BlocksExchange":
+                        fo.write("<SpatialReferenceSystems>" + nl + "  <SRS>" + nl + "    <Id>%s</Id>" % BX_LOCAL_SRS_ID
+                                 + nl + "    <Name>%s</Name>" % survey_srs_name(epsg)
+                                 + nl + "    <Definition>EPSG:%d</Definition>" % epsg
+                                 + nl + "  </SRS>" + nl + "</SpatialReferenceSystems>" + nl)
+                    fo.write(tok)
+                    stack.append(name)
+                    if name == "Block" and not tok.endswith("/>"):
+                        need = len(stack)
+                    if tok.endswith("/>"):
+                        stack.pop()
+                else:
+                    if need is not None and len(stack) == need:
+                        raise ValueError("<Block> 里没有可以挂 <SRSId> 的位置")
+                    fo.write(tok)
+                    if stack:
+                        stack.pop()
+                ws = ""
+            if not chunk:
+                break
+    return n
+
+
+def check_bx_epsg(xml_path, epsg, expected_photos, ref_mean=None, tol=200.0):
+    """T9 XML 自检：只有一个 <SRS>（Id 1、Name、Definition = EPSG:<号>，不是 WKT），<Block> 下 1 处 <SRSId>1</SRSId>、
+    别处没有；<Pose> 下没有 <Metadata>；<Photo> 数 = 对齐数、ImagePath 都在；照片中心是投影坐标：东坐标在
+    （不带带号的）3 度带范围里，平均值和相机参考（GPS 换算后）的平均值相差 < tol 米。返回 (问题列表, 信息)。"""
+    problems = []
+    srs, block_ids, other_ids, pose_meta, photos, missing = [], [], 0, 0, 0, []
+    cx = cy = cz = 0.0
+    nc = 0
+    bad_e = 0
+    stack = []
+    base = Path(xml_path).parent
+    try:
+        for event, el in ET.iterparse(str(xml_path), events=("start", "end")):
+            if event == "start":
+                if el.tag == "Metadata" and stack and stack[-1] == "Pose":
+                    pose_meta += 1
+                stack.append(el.tag)
+                continue
+            stack.pop()
+            parent = stack[-1] if stack else ""
+            if el.tag == "SRSId":
+                if parent == "Block":
+                    block_ids.append((el.text or "").strip())
+                else:
+                    other_ids += 1
+            elif el.tag == "SRS":
+                srs.append((parent, el.findtext("Id"), el.findtext("Name"), el.findtext("Definition"), len(list(el))))
+            elif el.tag == "ImagePath":
+                p = Path(el.text or "")
+                if not p.is_absolute():
+                    p = base / p
+                if not p.is_file():
+                    missing.append(str(p))
+            elif el.tag == "Center" and parent == "Pose":
+                try:
+                    x, y, z = (float(el.findtext(k)) for k in ("x", "y", "z"))
+                except (TypeError, ValueError):
+                    problems.append("有照片的 <Center> 不是数字")
+                    continue
+                cx, cy, cz, nc = cx + x, cy + y, cz + z, nc + 1
+                if not 300000 < x < 700000:
+                    bad_e += 1
+            elif el.tag == "Photo":
+                photos += 1
+                el.clear()
+            elif el.tag == "TiePoint":
+                el.clear()
+    except ET.ParseError as ex:
+        return ["XML 解析失败：%s" % ex], {}
+    want = ("SpatialReferenceSystems", BX_LOCAL_SRS_ID, survey_srs_name(epsg), "EPSG:%d" % epsg, 3)
+    if srs != [want]:
+        problems.append("<SRS> 应该只有一个且是 %s，实际 %s" % (want[1:4], [s[1:4] for s in srs]))
+    if block_ids != [BX_LOCAL_SRS_ID]:
+        problems.append("<Block> 下的 <SRSId> 应该是 1 处「%s」，实际 %s" % (BX_LOCAL_SRS_ID, block_ids))
+    if other_ids:
+        problems.append("<Block> 以外还有 %d 处 <SRSId>" % other_ids)
+    if pose_meta:
+        problems.append("<Pose> 下还有 %d 个 <Metadata>" % pose_meta)
+    if photos != expected_photos:
+        problems.append("<Photo> 有 %d 个，和对齐数 %d 不一致" % (photos, expected_photos))
+    if nc != photos:
+        problems.append("有 %d 张照片没有 <Pose>/<Center>" % (photos - nc))
+    if missing:
+        problems.append("%d 个 ImagePath 指向的文件不存在（如 %s）" % (len(missing), missing[0]))
+    if bad_e:
+        problems.append("%d 张照片的东坐标不在 3 度带（不带带号）范围里，可能没换算成投影坐标" % bad_e)
+    mean = [cx / nc, cy / nc, cz / nc] if nc else None
+    if mean and ref_mean:
+        d = ((mean[0] - ref_mean[0]) ** 2 + (mean[1] - ref_mean[1]) ** 2) ** 0.5
+        if d > tol:
+            problems.append("照片中心平均值和 GPS 换算后的平均值差 %.0f 米（> %g 米），坐标可能没换算对" % (d, tol))
+    return problems, {"photos": photos, "center_mean": mean, "missing": len(missing)}
+
+
+GEOTIFF_TYPES = {1: "B", 2: "s", 3: "H", 4: "I", 5: "II", 6: "b", 7: "B", 8: "h", 9: "i", 10: "ii", 11: "f", 12: "d",
+                 16: "Q", 17: "q", 18: "Q"}
+
+
+def geotiff_info(path):
+    """只用标准库读 GeoTIFF 第一张图的头（普通 TIFF 和 BigTIFF）：宽高、波段、位深、数据类型、压缩、像素大小、左上角、
+    投影 EPSG（GeoKey 3072）、NoData（GDAL 的 42113 标签）。读不了抛 ValueError。"""
+    with open(path, "rb") as f:
+        h = f.read(16)
+        e = "<" if h[:2] == b"II" else ">" if h[:2] == b"MM" else None
+        if e is None:
+            raise ValueError("不是 TIFF：%s" % path)
+        magic = struct.unpack(e + "H", h[2:4])[0]
+        big = magic == 43
+        if magic not in (42, 43):
+            raise ValueError("不是 TIFF：%s" % path)
+        off = struct.unpack(e + "Q", h[8:16])[0] if big else struct.unpack(e + "I", h[4:8])[0]
+        f.seek(off)
+        n = struct.unpack(e + ("Q" if big else "H"), f.read(8 if big else 2))[0]
+        esz = 20 if big else 12
+        raw = f.read(n * esz)
+        tags = {}
+        for k in range(n):
+            ent = raw[k * esz:(k + 1) * esz]
+            if big:
+                tag, typ, cnt = struct.unpack(e + "HHQ", ent[:12])
+                vbytes = ent[12:20]
+            else:
+                tag, typ, cnt = struct.unpack(e + "HHI", ent[:8])
+                vbytes = ent[8:12]
+            fmt = GEOTIFF_TYPES.get(typ)
+            if fmt is None:
+                continue
+            size = struct.calcsize(e + fmt) * cnt
+            if size > len(vbytes):
+                f.seek(struct.unpack(e + ("Q" if big else "I"), vbytes)[0])
+                data = f.read(size)
+            else:
+                data = vbytes[:size]
+            if typ == 2:
+                tags[tag] = data.rstrip(b"\x00").decode("latin-1")
+            else:
+                tags[tag] = list(struct.unpack(e + fmt * cnt, data))
+    geokeys = {}
+    gk = tags.get(34735) or []
+    for k in range(4, len(gk) - 3, 4):
+        key, loc, cnt, val = gk[k:k + 4]
+        if loc == 0:
+            geokeys[key] = val
+    sfmt = (tags.get(339) or [1])[0]
+    bits = (tags.get(258) or [0])[0]
+    dtype = {(1, 8): "uint8", (1, 16): "uint16", (2, 16): "int16", (3, 32): "float32", (3, 64): "float64",
+             (2, 32): "int32", (1, 32): "uint32"}.get((sfmt, bits), "sfmt%d/%dbit" % (sfmt, bits))
+    scale = tags.get(33550) or [None, None]
+    tie = tags.get(33922) or [None] * 6
+    nod = tags.get(42113)
+    try:
+        nod = float(nod) if nod not in (None, "") else None
+    except ValueError:
+        pass
+    return {"width": (tags.get(256) or [0])[0], "height": (tags.get(257) or [0])[0], "bands": (tags.get(277) or [1])[0],
+            "dtype": dtype, "compression": (tags.get(259) or [1])[0], "bigtiff": big, "res": scale[:2],
+            "origin": (tie[3], tie[4]), "epsg": geokeys.get(3072), "nodata": nod, "extra_samples": tags.get(338)}
+
+
+def read_tfw(path):
+    vals = [float(x) for x in Path(path).read_text(encoding="ascii", errors="replace").split()]
+    if len(vals) != 6:
+        raise ValueError("TFW 应该 6 行数字：%s" % path)
+    return vals
+
+
+def check_survey_rasters(dom, dsm, epsg, resolution):
+    """DOM/DSM 自检：文件和 .tfw 都在；坐标系 EPSG 对；分辨率 = 设定值（0 = 自动时不查）；DOM 4 波段 uint8（RGBA）、
+    DSM 1 波段 float32、NoData −9999；Deflate 压缩；.tfw 的像素大小和 GeoTIFF 一致。返回 (问题列表, {dom: 信息, dsm: 信息})。"""
+    problems, info = [], {}
+    for key, path, bands, dtype in (("DOM", dom, 4, "uint8"), ("DSM", dsm, 1, "float32")):
+        p = Path(path)
+        tfw = p.with_suffix(".tfw")
+        if not p.is_file():
+            problems.append("没有 %s：%s" % (key, p.name))
+            continue
+        if not tfw.is_file():
+            problems.append("%s 缺 .tfw：%s" % (key, tfw.name))
+        try:
+            g = geotiff_info(p)
+        except (ValueError, OSError, struct.error) as ex:
+            problems.append("%s 读不了：%s" % (key, ex))
+            continue
+        g["size"] = p.stat().st_size
+        info[key] = g
+        if g["epsg"] != epsg:
+            problems.append("%s 坐标系是 EPSG:%s，应该是 EPSG:%d" % (key, g["epsg"], epsg))
+        if g["bands"] != bands or g["dtype"] != dtype:
+            problems.append("%s 是 %d 波段 %s，应该是 %d 波段 %s" % (key, g["bands"], g["dtype"], bands, dtype))
+        if g["compression"] not in (8, 32946):
+            problems.append("%s 压缩方式是 %s，应该是 Deflate" % (key, g["compression"]))
+        if resolution and (g["res"][0] is None or abs(g["res"][0] - resolution) > 1e-6 or abs(g["res"][1] - resolution) > 1e-6):
+            problems.append("%s 分辨率是 %s，应该是 %g 米" % (key, g["res"], resolution))
+        if key == "DSM" and g["nodata"] != SURVEY_NODATA:
+            problems.append("DSM 的 NoData 是 %s，应该是 %g" % (g["nodata"], SURVEY_NODATA))
+        if tfw.is_file():
+            try:
+                t = read_tfw(tfw)
+                g["tfw"] = t
+                if g["res"][0] is not None and (abs(t[0] - g["res"][0]) > 1e-6 or abs(-t[3] - g["res"][1]) > 1e-6):
+                    problems.append("%s 的 .tfw 像素大小 %s 和 GeoTIFF %s 不一致" % (key, (t[0], t[3]), g["res"]))
+            except (ValueError, OSError) as ex:
+                problems.append("%s 的 .tfw 读不了：%s" % (key, ex))
+    return problems, info
+
+
+def check_survey_raster_pair(info):
+    """DOM 和 DSM 的外框、像元网格必须完全一致（后面算方量要用）。返回问题列表。"""
+    a, b = info.get("DOM"), info.get("DSM")
+    if not a or not b:
+        return []
+    problems = []
+    if (a["width"], a["height"]) != (b["width"], b["height"]):
+        problems.append("DOM 是 %d × %d 像元，DSM 是 %d × %d 像元，行列数不一样（算方量会错）" % (
+            a["width"], a["height"], b["width"], b["height"]))
+    ta, tb = a.get("tfw"), b.get("tfw")
+    if ta and tb:
+        if abs(ta[4] - tb[4]) > 1e-6 or abs(ta[5] - tb[5]) > 1e-6:
+            problems.append("DOM 的 .tfw 左上角 (%.6f, %.6f) 和 DSM 的 (%.6f, %.6f) 不一致" % (
+                ta[4], ta[5], tb[4], tb[5]))
+        if abs(ta[0] - tb[0]) > 1e-6 or abs(ta[3] - tb[3]) > 1e-6:
+            problems.append("DOM 和 DSM 的像元大小不一致：%.9f / %.9f" % (ta[0], tb[0]))
+    elif a["origin"] != b["origin"] or a["res"] != b["res"]:
+        problems.append("DOM 和 DSM 的左上角或像元大小不一致：%r %r / %r %r" % (
+            a["origin"], a["res"], b["origin"], b["res"]))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# DOM/DSM 自动裁边（D-31/T11 的范围线文件、两趟导出、用户线优先；D-32/T12 换了「有效区域怎么算」）
+# 做法（🔒 D-32）：0.5 米分析网格上同时满足 ①没裁的 DOM alpha>0 的像元 ≥ 90% ②不插值辅助 DSM（0.1 米）有真实点
+# ③1 米块里有点的 0.1 米子格 ≥ 点云密度门槛 的格子 → 补缝（扩 1 m 收 1 m）→ 最大 8 邻接连片 → 填内部 < 100 m² 的洞 →
+# 往里收 N 米 → 折线简化（相邻点 ≥ 1 m）＝范围线；DOM、DSM 用同一条线、同一个像元网格裁（线外 DOM alpha=0 / DSM NoData），
+# 外框 = 范围线外接矩形外扩 5 个像元。与飞法无关。辅助 DSM 在一个读写打开但从不保存的 Metashape 会话里建（只读打开建不上），
+# 正式 DSM 不动；网格运算全部用标准库自己写（每行一个大整数做形态学，字节当计数器数点）。
+# 只有「按线重新导出」这一步借 Metashape 的外边界形状（1.7.2：shape.vertices / boundary_type；内环用 InnerBoundary 挖掉）。
+
+# ---------------------------------------------------------------------------
+def survey_clip_inset(text):
+    """解析「往里收」：0～30 米。"""
+    t = str(text).strip().replace("，", ".")
+    try:
+        v = float(t)
+    except ValueError:
+        raise ValueError("「往里收」要填 %g～%g 之间的米数，不能是「%s」" % (SURVEY_CLIP_INSET_MIN,
+                                                                 SURVEY_CLIP_INSET_MAX, text))
+    if not (SURVEY_CLIP_INSET_MIN <= v <= SURVEY_CLIP_INSET_MAX):
+        raise ValueError("「往里收」只能填 %g～%g 米（现在是 %g）" % (SURVEY_CLIP_INSET_MIN, SURVEY_CLIP_INSET_MAX, v))
+    return v
+
+
+def parse_survey_clip(text):
+    """--clip：auto（默认，按 D-32 三条判据自动算）/ none（不裁，同 v1.0）/ 范围线文件（.kml 或 .shp）。
+    返回 ("auto", None) / ("none", None) / ("file", 绝对路径)。"""
+    t = (text or "").strip().strip('"')
+    if not t or t.lower() == SURVEY_CLIP_AUTO or t.startswith("自动"):
+        return SURVEY_CLIP_AUTO, None
+    if t.lower() == SURVEY_CLIP_NONE or t.startswith("不裁"):
+        return SURVEY_CLIP_NONE, None
+    p = Path(os.path.abspath(t))
+    if not p.is_file():
+        raise ValueError("找不到范围线文件：%s" % p)
+    if p.suffix.lower() not in (".kml", ".shp"):
+        raise ValueError("范围线只认 .kml 或 .shp（点、线文件不行）：%s" % p)
+    return "file", str(p)
+
+
+# ---- CGCS2000 3 度带高斯投影正/反算（写 KML 用反算，读 KML 用正算；只用标准库） ----
+_GK_A = 6378137.0                     # CGCS2000 长半轴
+_GK_F = 1 / 298.257222101             # CGCS2000 扁率
+
+
+def _gk_coeffs():
+    """Krüger 级数系数（EPSG Guidance Note 7-2 的 α/β/δ），CGCS2000 椭球。"""
+    n = _GK_F / (2 - _GK_F)
+    big = _GK_A / (1 + n) * (1 + n ** 2 / 4 + n ** 4 / 64 + n ** 6 / 256)
+    al = (n / 2 - 2 * n ** 2 / 3 + 5 * n ** 3 / 16 + 41 * n ** 4 / 180 - 127 * n ** 5 / 288 + 7891 * n ** 6 / 37800,
+          13 * n ** 2 / 48 - 3 * n ** 3 / 5 + 557 * n ** 4 / 1440 + 281 * n ** 5 / 630 - 1983433 * n ** 6 / 1935360,
+          61 * n ** 3 / 240 - 103 * n ** 4 / 140 + 15061 * n ** 5 / 26880 + 167603 * n ** 6 / 181440,
+          49561 * n ** 4 / 161280 - 179 * n ** 5 / 168 + 6601661 * n ** 6 / 7257600,
+          34729 * n ** 5 / 80640 - 3418889 * n ** 6 / 1995840,
+          212378941 * n ** 6 / 319334400)
+    be = (n / 2 - 2 * n ** 2 / 3 + 37 * n ** 3 / 96 - n ** 4 / 360 - 81 * n ** 5 / 512 + 96199 * n ** 6 / 604800,
+          n ** 2 / 48 + n ** 3 / 15 - 437 * n ** 4 / 1440 + 46 * n ** 5 / 105 - 1118711 * n ** 6 / 3870720,
+          17 * n ** 3 / 480 - 37 * n ** 4 / 840 - 209 * n ** 5 / 4480 + 5569 * n ** 6 / 90720,
+          4397 * n ** 4 / 161280 - 11 * n ** 5 / 504 - 830251 * n ** 6 / 7257600,
+          4583 * n ** 5 / 161280 - 108847 * n ** 6 / 3991680,
+          20648693 * n ** 6 / 638668800)
+    de = (2 * n - 2 * n ** 2 / 3 - 2 * n ** 3 + 116 * n ** 4 / 45 + 26 * n ** 5 / 45 - 2854 * n ** 6 / 675,
+          7 * n ** 2 / 3 - 8 * n ** 3 / 5 - 227 * n ** 4 / 45 + 2704 * n ** 5 / 315 + 2323 * n ** 6 / 945,
+          56 * n ** 3 / 15 - 136 * n ** 4 / 35 - 1262 * n ** 5 / 105 + 73814 * n ** 6 / 2835,
+          4279 * n ** 4 / 630 - 332 * n ** 5 / 35 - 399572 * n ** 6 / 14175,
+          4174 * n ** 5 / 315 - 144838 * n ** 6 / 6237,
+          601676 * n ** 6 / 22275)
+    return n, big, al, be, de
+
+
+_GK_N, _GK_BIG, _GK_ALPHA, _GK_BETA, _GK_DELTA = _gk_coeffs()
+
+
+def survey_tm_forward(lon, lat, epsg):
+    """经纬度（度）→ 该 CGCS2000 3 度带的东坐标、北坐标（米，东坐标不带带号）。"""
+    lam0 = math.radians(survey_cm(epsg))
+    phi, lam = math.radians(lat), math.radians(lon)
+    s = math.sinh(math.atanh(math.sin(phi)) - 2 * math.sqrt(_GK_N) / (1 + _GK_N) *
+                  math.atanh(2 * math.sqrt(_GK_N) / (1 + _GK_N) * math.sin(phi)))
+    xi = math.atan2(s, math.cos(lam - lam0))
+    eta = math.atanh(math.sin(lam - lam0) / math.sqrt(1 + s * s))
+    x = _GK_BIG * (eta + sum(_GK_ALPHA[j - 1] * math.cos(2 * j * xi) * math.sinh(2 * j * eta) for j in range(1, 7)))
+    y = _GK_BIG * (xi + sum(_GK_ALPHA[j - 1] * math.sin(2 * j * xi) * math.cosh(2 * j * eta) for j in range(1, 7)))
+    return 500000.0 + x, y
+
+
+def survey_tm_inverse(x, y, epsg):
+    """东坐标、北坐标（米，东坐标不带带号）→ 经纬度（度）。WGS84 与 CGCS2000 差厘米级，KML 里直接当 WGS84。"""
+    return _tm_inverse_cm(x, y, survey_cm(epsg))
+
+
+def _tm_inverse_cm(x, y, cm):
+    """同 survey_tm_inverse，中央经线直接给（度）。"""
+    xi0 = y / _GK_BIG
+    eta0 = (x - 500000.0) / _GK_BIG
+    xi = xi0 - sum(_GK_BETA[j - 1] * math.sin(2 * j * xi0) * math.cosh(2 * j * eta0) for j in range(1, 7))
+    eta = eta0 - sum(_GK_BETA[j - 1] * math.cos(2 * j * xi0) * math.sinh(2 * j * eta0) for j in range(1, 7))
+    chi = math.asin(math.sin(xi) / math.cosh(eta))
+    phi = chi + sum(_GK_DELTA[j - 1] * math.sin(2 * j * chi) for j in range(1, 7))
+    lam = math.radians(cm) + math.atan2(math.sinh(eta), math.cos(xi))
+    return math.degrees(lam), math.degrees(phi)
+
+
+# ---- 读条带式 GeoTIFF（本软件导出的都是条带式、Deflate 压缩；只用标准库） ----
+def tiff_strip_info(path):
+    """读 GeoTIFF 的结构：宽高、波段、位深、压缩、每像素字节、NoData、条带偏移/字节数、左上角、像素大小。
+    只支持条带式（分块式抛 ValueError）；压缩支持不压缩和 Deflate（8 / 32946）。读不了抛 ValueError。"""
+    p = Path(path)
+    with open(p, "rb") as f:
+        h = f.read(16)
+        if len(h) < 16:
+            raise ValueError("不是 TIFF：%s" % p)
+        e = "<" if h[:2] == b"II" else ">" if h[:2] == b"MM" else None
+        if e is None:
+            raise ValueError("不是 TIFF：%s" % p)
+        magic = struct.unpack(e + "H", h[2:4])[0]
+        big = magic == 43
+        if magic not in (42, 43):
+            raise ValueError("不是 TIFF：%s" % p)
+        off = struct.unpack(e + "Q", h[8:16])[0] if big else struct.unpack(e + "I", h[4:8])[0]
+        f.seek(off)
+        n = struct.unpack(e + ("Q" if big else "H"), f.read(8 if big else 2))[0]
+        esz = 20 if big else 12
+        raw = f.read(n * esz)
+        tags = {}
+        for k in range(n):
+            ent = raw[k * esz:(k + 1) * esz]
+            if len(ent) < esz:
+                break
+            if big:
+                tag, typ, cnt = struct.unpack(e + "HHQ", ent[:12])
+                vb = ent[12:20]
+            else:
+                tag, typ, cnt = struct.unpack(e + "HHI", ent[:8])
+                vb = ent[8:12]
+            fmt = GEOTIFF_TYPES.get(typ)
+            if fmt is None:
+                continue
+            size = struct.calcsize(e + fmt) * cnt
+            if size > len(vb):
+                f.seek(struct.unpack(e + ("Q" if big else "I"), vb)[0])
+                data = f.read(size)
+            else:
+                data = vb[:size]
+            if typ == 2:
+                tags[tag] = data.rstrip(b"\x00").decode("latin-1")
+            else:
+                tags[tag] = list(struct.unpack(e + fmt * cnt, data))
+    if tags.get(322):
+        raise ValueError("这是分块（tile）式 TIFF，读不了（本软件导出的是条带式）：%s" % p)
+    comp = (tags.get(259) or [1])[0]
+    if comp not in (1, 8, 32946):
+        raise ValueError("压缩方式是 %s，只认 Deflate 或不压缩：%s" % (comp, p))
+    bits = (tags.get(258) or [0])[0]
+    sfmt = (tags.get(339) or [1])[0]
+    bands = (tags.get(277) or [1])[0]
+    bps = bits // 8 if bits % 8 == 0 else 0
+    scale = tags.get(33550) or [None, None, None]
+    tie = tags.get(33922) or [None] * 6
+    nod = tags.get(42113)
+    nodf = None
+    if nod not in (None, ""):
+        try:
+            nodf = float(nod)
+        except ValueError:
+            nodf = None
+    return {"path": str(p), "width": (tags.get(256) or [0])[0], "height": (tags.get(257) or [0])[0],
+            "bands": bands, "bits": bits, "bytes_per_pixel": bps * bands,
+            "dtype": {(1, 8): "uint8", (1, 16): "uint16", (2, 16): "int16", (3, 32): "float32", (3, 64): "float64",
+                      (2, 32): "int32", (1, 32): "uint32"}.get((sfmt, bits), "sfmt%d/%dbit" % (sfmt, bits)),
+            "sample_format": sfmt, "compression": comp, "bigtiff": big, "endian": e,
+            "rows_per_strip": (tags.get(278) or [0])[0] or (tags.get(257) or [0])[0],
+            "strip_offsets": tags.get(273) or [], "strip_bytes": tags.get(279) or [],
+            "px": (scale[0], scale[1]), "origin": (tie[3], tie[4]), "nodata": nodf,
+            "nodata_bytes": (struct.pack(e + "f", nodf) if nodf is not None and bits == 32 else None)}
+
+
+def iter_tiff_rows(path, info, step=1):
+    """逐条带解压，交出 (行号, 该行原始字节)；只交出行号是 step 整数倍的行（解压照样做）。"""
+    w, h = info["width"], info["height"]
+    bpp = info["bytes_per_pixel"]
+    rps = info["rows_per_strip"]
+    if bpp <= 0:
+        raise ValueError("看不懂的位深：%s（%d 位 %d 波段）" % (info["path"], info["bits"], info["bands"]))
+    if rps > 1024:
+        raise ValueError("每条约带 %d 行，太多（内存吃不消）；这不是本软件导出的 TIFF：%s" % (rps, info["path"]))
+    rowbytes = w * bpp
+    offs, cnts = info["strip_offsets"], info["strip_bytes"]
+    with open(path, "rb") as f:
+        for si in range(len(offs)):
+            r0 = si * rps
+            if r0 >= h:
+                break
+            r1 = min(r0 + rps, h)
+            first = r0 + (step - r0 % step) % step
+            if first >= r1:
+                continue
+            f.seek(offs[si])
+            raw = f.read(cnts[si])
+            if info["compression"] in (8, 32946):
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error as ex:
+                    raise ValueError("解压第 %d 条带失败（%s）：%s" % (si, ex, info["path"]))
+            if len(raw) < (r1 - r0) * rowbytes:
+                raise ValueError("第 %d 条带只有 %d 字节，不够 %d 行：%s" % (si, len(raw), r1 - r0, info["path"]))
+            for r in range(first, r1, step):
+                o = (r - r0) * rowbytes
+                yield r, raw[o:o + rowbytes]
+
+
+def survey_clip_density(text):
+    """解析「点云密度门槛」：10～90（%）。"""
+    t = str(text).strip().replace("，", ".").rstrip("%").strip()
+    try:
+        v = float(t)
+    except ValueError:
+        raise ValueError("「点云密度门槛」要填 %g～%g 之间的百分数，不能是「%s」" % (
+            SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX, text))
+    if not (SURVEY_CLIP_DENSITY_MIN <= v <= SURVEY_CLIP_DENSITY_MAX):
+        raise ValueError("「点云密度门槛」只能填 %g～%g（%%，现在是 %g）" % (
+            SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX, v))
+    return v
+
+
+def survey_clip_grid(width, height, px, cell=SURVEY_CLIP_GRID):
+    """没裁的 DOM/DSM（width × height 像元、像素 px 米）对应的分析网格：列数、行数（偶数，凑整 1 米块）。"""
+    nx = int(math.ceil(width * px / cell - 1e-9))
+    ny = int(math.ceil(height * px / cell - 1e-9))
+    return nx + nx % 2, ny + ny % 2
+
+
+def _grid_bounds(n_px, px, cell, n_cells):
+    """每格包含哪些像元（按像元中心落在哪一格）：返回 n_cells+1 个边界像元号。"""
+    return [min(n_px, max(0, int(math.ceil(k * cell / px - 0.5 - 1e-9)))) for k in range(n_cells + 1)]
+
+
+_ZERO_RUN = re.compile(b"\x00+")
+
+
+def survey_dom_coverage(dom_path, nx, ny, cell=SURVEY_CLIP_GRID, log=None):
+    """判据①：读没裁的 DOM（RGBA，条带式），每个分析格里 alpha > 0 的像元占比 ≥ SURVEY_CLIP_DOM_FRAC 记 1。
+    网格原点 = DOM 左上角。逐行读、按透明像元的连续段记账（不一次载入整幅）。返回 bytearray（nx × ny，行向下）。"""
+    log = log or (lambda s: None)
+    info = tiff_strip_info(dom_path)
+    if info["bands"] != 4 or info["dtype"] != "uint8":
+        raise ValueError("DOM 应该是 4 波段 uint8（RGBA），这个是 %d 波段 %s：%s" % (info["bands"], info["dtype"], dom_path))
+    w, h, px = info["width"], info["height"], info["px"][0]
+    xb, yb = _grid_bounds(w, px, cell, nx), _grid_bounds(h, px, cell, ny)
+    widths = [xb[k + 1] - xb[k] for k in range(nx)]
+    col_cell = [0] * w
+    for k in range(nx):
+        for i in range(xb[k], xb[k + 1]):
+            col_cell[i] = k
+    row_cell = [0] * h
+    for k in range(ny):
+        for j in range(yb[k], yb[k + 1]):
+            row_cell[j] = k
+    ok = bytearray(nx * ny)
+    t0 = time.time()
+    cur, nrow, acc = -1, 0, [0] * nx
+
+    def flush(cy):
+        base = cy * nx
+        for k in range(nx):
+            tot = nrow * widths[k]
+            if tot and acc[k] >= SURVEY_CLIP_DOM_FRAC * tot:
+                ok[base + k] = 1
+
+    add = int.__add__
+    for r, line in iter_tiff_rows(dom_path, info):
+        cy = row_cell[r]
+        if cy != cur:
+            if cur >= 0:
+                flush(cur)
+            cur, nrow, acc = cy, 0, [0] * nx
+        a = line[3::4]
+        z = a.count(0)
+        if z == 0:
+            acc = list(map(add, acc, widths))
+        elif z < w:
+            row = list(widths)
+            for m in _ZERO_RUN.finditer(a):
+                s, e = m.span()
+                k0, k1 = col_cell[s], col_cell[e - 1]
+                if k0 == k1:
+                    row[k0] -= e - s
+                else:
+                    row[k0] -= xb[k0 + 1] - s
+                    for k in range(k0 + 1, k1):
+                        row[k] = 0
+                    row[k1] -= e - xb[k1]
+            acc = list(map(add, acc, row))
+        nrow += 1
+    if cur >= 0:
+        flush(cur)
+    log("判据① 影像有内容：读没裁的 DOM %d × %d 像元，%d × %d 个 %g 米格，%d 格达标（每格 alpha > 0 的像元 ≥ %d%%），用 %.0f 秒" % (
+        w, h, nx, ny, cell, ok.count(1), int(SURVEY_CLIP_DOM_FRAC * 100), time.time() - t0))
+    return ok
+
+
+def survey_aux_counts(aux_path, nx, ny, log=None):
+    """判据②③ 的原始数：读不插值辅助 DSM（0.1 米、原点 = 分析网格原点、不压缩或 Deflate 条带式、NoData 已知），
+    返回 (cnt, blk)：cnt[每个 0.5 米格] = 有值的 0.1 米子格数（0～25）；blk[每个 1 米块] = 有值的子格数（0～100）。
+    逐行读；每行用「字节当计数器」的大整数加法一次数完（每个字节 ≤ 100，不会进位）。"""
+    log = log or (lambda s: None)
+    info = tiff_strip_info(aux_path)
+    if info["dtype"] != "float32" or info["bands"] != 1:
+        raise ValueError("辅助 DSM 应该是 1 波段 float32：%s" % aux_path)
+    pat = info["nodata_bytes"]
+    if pat is None:
+        raise ValueError("辅助 DSM 里没有 NoData 值：%s" % aux_path)
+    sub = int(round(SURVEY_CLIP_GRID / SURVEY_CLIP_AUX_RES))
+    if abs(info["px"][0] - SURVEY_CLIP_AUX_RES) > 1e-6:
+        raise ValueError("辅助 DSM 的像素是 %s 米，应该是 %g 米：%s" % (info["px"][0], SURVEY_CLIP_AUX_RES, aux_path))
+    w, h = info["width"], info["height"]
+    wp = nx * sub
+    use = min(w, wp)
+    tabs = []
+    for b in pat:
+        t = bytearray(256)
+        t[b] = 1
+        tabs.append(bytes(t))
+    ones = int.from_bytes(b"\x01" * use, "big")
+    cnt = bytearray(nx * ny)
+    acc, t0 = 0, time.time()
+    cur = -1
+    for r, line in iter_tiff_rows(aux_path, info):
+        cy = r // sub
+        if cy >= ny:
+            break
+        if cy != cur:
+            if cur >= 0:
+                cnt[cur * nx:(cur + 1) * nx] = acc.to_bytes(nx, "big")
+            cur, acc = cy, 0
+        line = line[:use * 4]
+        nod = (int.from_bytes(line[0::4].translate(tabs[0]), "big") & int.from_bytes(line[1::4].translate(tabs[1]), "big")
+               & int.from_bytes(line[2::4].translate(tabs[2]), "big") & int.from_bytes(line[3::4].translate(tabs[3]), "big"))
+        v = (nod ^ ones).to_bytes(use, "big") + bytes(wp - use)
+        for k in range(sub):
+            acc += int.from_bytes(v[k::sub], "big")
+    if cur >= 0:
+        cnt[cur * nx:(cur + 1) * nx] = acc.to_bytes(nx, "big")
+    bx, by = nx // 2, ny // 2
+    blk = bytearray(bx * by)
+    for j in range(by):
+        s = (int.from_bytes(cnt[2 * j * nx:(2 * j + 1) * nx], "big") +
+             int.from_bytes(cnt[(2 * j + 1) * nx:(2 * j + 2) * nx], "big")).to_bytes(nx, "big")
+        blk[j * bx:(j + 1) * bx] = (int.from_bytes(s[0::2], "big") + int.from_bytes(s[1::2], "big")).to_bytes(bx, "big")
+    log("判据②③ 真实点云：读不插值辅助 DSM %d × %d 个 %g 米子格（有值 %.1f%%），用 %.0f 秒" % (
+        w, h, SURVEY_CLIP_AUX_RES, 100.0 * sum(cnt) / max(1, w * h), time.time() - t0))
+    return cnt, blk
+
+
+def survey_write_analysis(path, an):
+    """分析网格存成 gzip 的 JSON（字节数组用 base64）。"""
+    d = dict((k, v) for k, v in an.items() if k not in ("dom_ok", "cnt", "blk"))
+    for k in ("dom_ok", "cnt", "blk"):
+        d[k] = base64.b64encode(bytes(an[k])).decode("ascii")
+    tmp = Path(str(path) + ".tmp")
+    with gzip.open(str(tmp), "wt", encoding="utf-8") as f:
+        json.dump(d, f)
+    os.replace(str(tmp), str(path))
+
+
+def survey_read_analysis(path):
+    with gzip.open(str(path), "rt", encoding="utf-8") as f:
+        d = json.load(f)
+    for k in ("dom_ok", "cnt", "blk"):
+        d[k] = bytearray(base64.b64decode(d[k]))
+    nx, ny = d["nx"], d["ny"]
+    if len(d["dom_ok"]) != nx * ny or len(d["cnt"]) != nx * ny or len(d["blk"]) != (nx // 2) * (ny // 2):
+        raise ValueError("裁边分析文件大小对不上：%s" % path)
+    return d
+
+
+# ---- 分析网格上的形态学运算：每行存成一个大整数（第 x 位 = 第 x 列），扩/收按圆盘做 ----
+_B01 = bytes.maketrans(b"\x00\x01", b"01")
+_B10 = bytes.maketrans(b"01", b"\x00\x01")
+
+
+def _mask_rows(mask, nx, ny):
+    rows = []
+    for y in range(ny):
+        s = bytes(mask[y * nx:(y + 1) * nx]).translate(_B01)
+        rows.append(int(s[::-1], 2) if b"1" in s else 0)
+    return rows
+
+
+def _rows_mask(rows, nx):
+    out = bytearray()
+    zero = bytes(nx)
+    for v in rows:
+        out += format(v, "0%db" % nx)[::-1].encode("ascii").translate(_B10) if v else zero
+    return out
+
+
+def _disk_widths(radius, strict):
+    """圆盘每一行（dy = 0, 1, …）的半宽：dx² + dy² <（strict）或 ≤ radius² 的最大 dx。"""
+    out, r2 = [], radius * radius
+    dy = 0
+    while True:
+        w = int(math.floor(math.sqrt(max(0.0, r2 - dy * dy)))) + 1
+        while w >= 0 and (w * w + dy * dy >= r2 if strict else w * w + dy * dy > r2 + 1e-9):
+            w -= 1
+        if w < 0:
+            return out
+        out.append(w)
+        dy += 1
+
+
+def _hdilate(v, w, full):
+    span, cur = 0, v
+    while span < w:
+        st = min(span + 1, w - span)
+        cur = cur | (cur << st) | (cur >> st)
+        span += st
+    return cur & full
+
+
+def _dilate_rows(rows, nx, radius, strict=False):
+    """往外扩：格子到最近的 1 格（中心距）< / ≤ radius 格就置 1（网格外不算）。"""
+    ws = _disk_widths(radius, strict)
+    if not ws:
+        return [0] * len(rows)
+    full = (1 << nx) - 1
+    hs = dict((w, [_hdilate(v, w, full) if v else 0 for v in rows]) for w in set(ws))
+    ny, out = len(rows), [0] * len(rows)
+    for y in range(ny):
+        acc = 0
+        for dy, w in enumerate(ws):
+            hr = hs[w]
+            if y - dy >= 0:
+                acc |= hr[y - dy]
+            if dy and y + dy < ny:
+                acc |= hr[y + dy]
+        out[y] = acc
+    return out
+
+
+def _erode_rows(rows, nx, radius, strict=False):
+    """往里收：离最近的 0 格（中心距）< / ≤ radius 格就清掉；网格外当 0（贴着网格边的也往里收）。"""
+    ws = _disk_widths(radius, strict)
+    if not ws:
+        return list(rows)
+    pad = max(len(ws), max(ws)) + 1
+    wide = nx + 2 * pad
+    full = (1 << wide) - 1
+    comp = [full] * pad + [~(v << pad) & full for v in rows] + [full] * pad
+    d = _dilate_rows(comp, wide, radius, strict)
+    keep = (1 << nx) - 1
+    return [((~d[y + pad] & full) >> pad) & keep for y in range(len(rows))]
+
+
+def _fix_pinches(rows, nx):
+    """两个格子只在角上相碰（2 × 2 里对角两个 1）时把旁边一格补上，让外环、内环都不在一个点上自相接触。"""
+    keep = (1 << nx) - 1
+    changed, guard = True, 0
+    while changed and guard < 50:
+        changed, guard = False, guard + 1
+        for y in range(len(rows) - 1):
+            a, b = rows[y], rows[y + 1]
+            p1 = a & (b >> 1) & ~(a >> 1) & ~b          # a[x]、b[x+1] 是 1，a[x+1]、b[x] 是 0 → 补 a[x+1]
+            p2 = (a >> 1) & b & ~a & ~(b >> 1)          # a[x+1]、b[x] 是 1，a[x]、b[x+1] 是 0 → 补 a[x]
+            if p1 or p2:
+                rows[y] = (a | (p1 << 1) | p2) & keep
+                changed = True
+    return rows
+
+
+def _mask_runs(mask, nx, ny):
+    """按行找 mask 里为 1 的连续段：[(行号, 起列, 止列（不含）)]。"""
+    runs = []
+    one = re.compile(b"\x01+")
+    for y in range(ny):
+        row = bytes(mask[y * nx:(y + 1) * nx])
+        if b"\x01" in row:
+            runs.extend((y, m.start(), m.end()) for m in one.finditer(row))
+    return runs
+
+
+def _runs_components(runs, ny):
+    """8 邻接把连续段并成连片（并查集），返回 (每段的根, {根: 像元数})。"""
+    parent = list(range(len(runs)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    byrow = {}
+    for i, (y, c0, c1) in enumerate(runs):
+        byrow.setdefault(y, []).append(i)
+    for y in range(1, ny):
+        a, b = byrow.get(y - 1, []), byrow.get(y, [])
+        i = j = 0
+        while i < len(a) and j < len(b):
+            a0, a1 = runs[a[i]][1], runs[a[i]][2]
+            b0, b1 = runs[b[j]][1], runs[b[j]][2]
+            if a1 < b0:                     # 8 邻接：相邻行的段错开一格也算连着
+                i += 1
+            elif b1 < a0:
+                j += 1
+            else:
+                union(a[i], b[j])
+                if a1 < b1:
+                    i += 1
+                else:
+                    j += 1
+    roots = [find(i) for i in range(len(runs))]
+    area = {}
+    for i, rt in enumerate(roots):
+        area[rt] = area.get(rt, 0) + (runs[i][2] - runs[i][1])
+    return roots, area
+
+
+def _runs_mask(runs, roots, want, nx, ny):
+    """把根 == want 的段填进新掩膜。"""
+    m = bytearray(nx * ny)
+    for i, (y, c0, c1) in enumerate(runs):
+        if roots[i] == want:
+            base = y * nx
+            m[base + c0:base + c1] = b"\x01" * (c1 - c0)
+    return m
+
+
+def survey_mask_largest(mask, nx, ny):
+    """取面积最大的 8 邻接连片。返回 (新掩膜, 连片数, 最大连片像元数, 第二大连片像元数)。"""
+    runs = _mask_runs(mask, nx, ny)
+    if not runs:
+        return bytearray(nx * ny), 0, 0, 0
+    roots, area = _runs_components(runs, ny)
+    order = sorted(area.items(), key=lambda kv: -kv[1])
+    return (_runs_mask(runs, roots, order[0][0], nx, ny), len(order), order[0][1],
+            order[1][1] if len(order) > 1 else 0)
+
+
+def survey_mask_fill_holes(mask, nx, ny, cell):
+    """填掉内部面积 < SURVEY_CLIP_HOLE 的洞（洞 = 不碰边界的一块空格子）。返回 (新掩膜, 填了几个, 填掉多少像元)。"""
+    inv = bytearray(1 - v for v in mask)
+    runs = _mask_runs(inv, nx, ny)
+    if not runs:
+        return mask, 0, 0
+    roots, area = _runs_components(runs, ny)
+    border = set()                          # 碰到边界的空格子不算洞
+    for i, (y, c0, c1) in enumerate(runs):
+        if y == 0 or y == ny - 1 or c0 == 0 or c1 >= nx:
+            border.add(roots[i])
+    by_root = {}
+    for i, rt in enumerate(roots):
+        by_root.setdefault(rt, []).append(i)
+    out = bytearray(mask)
+    n, filled = 0, 0
+    for root, a in area.items():
+        if root in border or a * cell * cell >= SURVEY_CLIP_HOLE:
+            continue
+        n += 1
+        filled += a
+        for i in by_root[root]:
+            y, c0, c1 = runs[i]
+            base = y * nx
+            out[base + c0:base + c1] = b"\x01" * (c1 - c0)
+    return out, n, filled
+
+
+def _simplify_dp(pts, tol):
+    """Douglas-Peucker 简化折线（pts 首尾相同）。"""
+    if len(pts) <= 3:
+        return list(pts)
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        (xa, ya), (xb, yb) = pts[a], pts[b]
+        dx, dy = xb - xa, yb - ya
+        norm = math.hypot(dx, dy)
+        best, bi = -1.0, -1
+        for i in range(a + 1, b):
+            px, py = pts[i]
+            dist = math.hypot(px - xa, py - ya) if norm < 1e-12 else abs(dy * (px - xa) - dx * (py - ya)) / norm
+            if dist > best:
+                best, bi = dist, i
+        if best > tol and bi > 0:
+            keep[bi] = True
+            stack.append((a, bi))
+            stack.append((bi, b))
+    return [p for i, p in enumerate(pts) if keep[i]]
+
+
+def survey_polygon_area(pts):
+    """多边形面积（m²，鞋带公式；闭合与否都行，返回正值）。"""
+    if len(pts) < 3:
+        return 0.0
+    s = 0.0
+    for i in range(len(pts) - 1):
+        s += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
+    if pts[0] != pts[-1]:
+        s += pts[-1][0] * pts[0][1] - pts[0][0] * pts[-1][1]
+    return abs(s) / 2.0
+
+
+def _bits(v):
+    """大整数里为 1 的位号。"""
+    s = bin(v)[:1:-1]
+    i = s.find("1")
+    while i >= 0:
+        yield i
+        i = s.find("1", i + 1)
+
+
+def survey_mask_rings(rows, nx):
+    """分析网格（每行一个大整数）→ 所有边界环（格角点坐标 (列, 行)，行向下，首尾相同）。掩膜总在前进方向右手边：
+    换到 y 向上的投影坐标后外环顺时针、洞逆时针（同 ESRI 的约定）。先过 _fix_pinches，每个角点只有一条出边，环都是简单环。"""
+    nxt = {}
+    keep = (1 << nx) - 1
+    ny = len(rows)
+    for y, r in enumerate(rows):
+        if not r:
+            continue
+        up = rows[y - 1] if y else 0
+        dn = rows[y + 1] if y + 1 < ny else 0
+        for x in _bits(r & ~up):
+            nxt.setdefault((x, y), []).append((x + 1, y))
+        for x in _bits(r & ~(r >> 1) & keep):
+            nxt.setdefault((x + 1, y), []).append((x + 1, y + 1))
+        for x in _bits(r & ~dn):
+            nxt.setdefault((x + 1, y + 1), []).append((x, y + 1))
+        for x in _bits(r & ~(r << 1)):
+            nxt.setdefault((x, y + 1), []).append((x, y))
+    loops = []
+    while nxt:
+        start = next(iter(nxt))
+        loop, cur = [start], start
+        while True:
+            ends = nxt.get(cur)
+            if not ends:
+                break
+            e = ends.pop()
+            if not ends:
+                del nxt[cur]
+            loop.append(e)
+            cur = e
+            if cur == start:
+                break
+        if cur == start and len(loop) >= 5:
+            loops.append(loop)
+    return loops
+
+
+def survey_ring_signed_area(pts):
+    """有向面积（y 向上的投影坐标里逆时针为正）。"""
+    s = 0.0
+    n = len(pts)
+    for i in range(n - 1):
+        s += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
+    if n and pts[0] != pts[-1]:
+        s += pts[-1][0] * pts[0][1] - pts[0][0] * pts[-1][1]
+    return s / 2.0
+
+
+def _simplify_ring(pts):
+    """首尾相同的环：Douglas-Peucker（容差 SURVEY_CLIP_SIMPLIFY 的一半）+ 相邻点间距 ≥ SURVEY_CLIP_SIMPLIFY。不够 3 点返回 []。"""
+    simp = _simplify_dp(pts, SURVEY_CLIP_SIMPLIFY / 2.0)
+    out = []
+    for p in simp:
+        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) >= SURVEY_CLIP_SIMPLIFY:
+            out.append(p)
+    while len(out) > 3 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) < SURVEY_CLIP_SIMPLIFY:
+        out.pop()
+    if len(out) < 3:
+        return []
+    out.append(out[0])
+    return out
+
+
+def survey_polygons_area(polys):
+    """[(外环, [内环…])…] 的面积（外环减内环）。"""
+    return sum(survey_polygon_area(o) - sum(survey_polygon_area(h) for h in hs) for o, hs in polys)
+
+
+def survey_point_in_ring(x, y, ring):
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def survey_valid_cells(an, density=SURVEY_CLIP_DENSITY):
+    """三条判据（🔒 D-32）同时满足的分析格 → (掩膜, 统计)。统计里是按 ①→②→③ 依次淘汰的格数。"""
+    nx, ny = an["nx"], an["ny"]
+    bx = nx // 2
+    ok, cnt, blk = an["dom_ok"], an["cnt"], an["blk"]
+    t2 = bytes([0] + [1] * 255)
+    thr = int(math.ceil(density * 100 / 100.0 - 1e-9))   # 1 米块 = 100 个子格：有值的 ≥ density% 个
+    t3 = bytes([1 if v >= thr else 0 for v in range(256)])
+    valid = bytearray(nx * ny)
+    n12 = 0
+    for y in range(ny):
+        a = ok[y * nx:(y + 1) * nx]
+        b = bytes(cnt[y * nx:(y + 1) * nx]).translate(t2)
+        bb = bytes(blk[(y // 2) * bx:(y // 2 + 1) * bx]).translate(t3)
+        c = bytearray(nx)
+        c[0::2] = bb
+        c[1::2] = bb
+        ia, ib = int.from_bytes(a, "big"), int.from_bytes(b, "big")
+        n12 += (ia & ib).to_bytes(nx, "big").count(1)
+        valid[y * nx:(y + 1) * nx] = (ia & ib & int.from_bytes(c, "big")).to_bytes(nx, "big")
+    n1 = ok.count(1)
+    nv = valid.count(1)
+    return valid, {"cells": nx * ny, "fail1": nx * ny - n1, "fail2": n1 - n12, "fail3": n12 - nv, "valid": nv,
+                   "density": density, "thr": thr}
+
+
+def survey_range_from_analysis(an, inset=SURVEY_CLIP_INSET, density=SURVEY_CLIP_DENSITY, log=None):
+    """分析网格 → 范围线（🔒 D-32 的顺序）：有效格 → 补缝（扩 1 米再收 1 米）→ 最大 8 邻接连片 → 填内部 < 100 m² 的洞 →
+    往里收 inset 米 → 简化（相邻点 ≥ 1 米）。返回 dict：polygons [(外环, [内环…])]（投影坐标、首尾闭合）、各步面积等。"""
+    log = log or (lambda s: None)
+    nx, ny, cell = an["nx"], an["ny"], an["cell"]
+    area_of = lambda n: n * cell * cell
+    t0 = time.time()
+    valid, st = survey_valid_cells(an, density)
+    log("有效格子：%d 格（%.0f m²）。按 ①→②→③ 依次淘汰：①影像不足 %.0f m²、②没有真实点 %.0f m²、③点云不够密（1 米块里有点的 "
+        "0.1 米子格 < %g%%）%.0f m²" % (st["valid"], area_of(st["valid"]), area_of(st["fail1"]), area_of(st["fail2"]),
+                                      density, area_of(st["fail3"])))
+    if not st["valid"]:
+        raise RuntimeError("一个有效格子都没有（没有影像、没有真实点云，或点云密度门槛太高），画不出范围线")
+    rc = SURVEY_CLIP_CLOSE / cell
+    rows = _erode_rows(_dilate_rows(_mask_rows(valid, nx, ny), nx, rc), nx, rc)
+    mask = _rows_mask(rows, nx)
+    closed = mask.count(1)
+    mask, ncomp, big, second = survey_mask_largest(mask, nx, ny)
+    log("补缝（扩 %g 米再收 %g 米）后 %.0f m²；最大连片 %.0f m²（连片共 %d 片，其余 %.0f m² 舍掉）" % (
+        SURVEY_CLIP_CLOSE, SURVEY_CLIP_CLOSE, area_of(closed), area_of(big), ncomp, area_of(closed - big)))
+    mask, nhole, filled = survey_mask_fill_holes(mask, nx, ny, cell)
+    if nhole:
+        log("填掉 %d 个内部小于 %g m² 的洞（共 %.0f m²）" % (nhole, SURVEY_CLIP_HOLE, area_of(filled)))
+    before = mask.count(1)
+    rows = _erode_rows(_mask_rows(mask, nx, ny), nx, inset / cell + 1.0, strict=True) if inset > 0 else \
+        _mask_rows(mask, nx, ny)
+    mask = _rows_mask(rows, nx)
+    if not mask.count(1):
+        raise RuntimeError("往里收 %g 米之后一格都不剩（有效区域只有 %.0f m²，太窄），请把「往里收」调小" % (inset, area_of(before)))
+    mask, ncomp2, big2, _ = survey_mask_largest(mask, nx, ny)
+    if ncomp2 > 1:
+        log("往里收之后断成 %d 片，只留最大的一片（%.0f m²）" % (ncomp2, area_of(big2)))
+    rows = _fix_pinches(_mask_rows(mask, nx, ny), nx)
+    loops = survey_mask_rings(rows, nx)
+    x0, top = an["left"], an["top"]
+    outers, holes = [], []
+    for lp in loops:
+        ring = _simplify_ring([(x0 + i * cell, top - j * cell) for i, j in lp])
+        if not ring:
+            continue
+        (outers if survey_ring_signed_area(ring) < 0 else holes).append(ring)   # 外环在投影坐标里顺时针
+    if not outers:
+        raise RuntimeError("范围线画不出来（有效区域的边界不成圈）")
+    outer = max(outers, key=survey_polygon_area)
+    holes = [h for h in holes if survey_point_in_ring(h[0][0], h[0][1], outer)]
+    polys = [(outer, holes)]
+    line_area = survey_polygons_area(polys)
+    log("往里收 %g 米，范围线 1 个外环 %d 个点%s、面积 %.0f m²（收之前 %.0f m²），算范围线用 %.0f 秒" % (
+        inset, len(outer) - 1, "、%d 个内环（挖掉的大洞）" % len(holes) if holes else "", line_area, area_of(before),
+        time.time() - t0))
+    return {"polygons": polys, "valid_area": area_of(before), "line_area": line_area, "cell": cell,
+            "grid": (nx, ny), "components": ncomp, "second_area": area_of(second), "holes": nhole,
+            "holes_area": area_of(filled), "inset": inset, "density": density, "points": len(outer) - 1,
+            "inner_rings": len(holes), "stats": st, "valid_cells_area": area_of(st["valid"]),
+            "fail_area": (area_of(st["fail1"]), area_of(st["fail2"]), area_of(st["fail3"])),
+            "closed_area": area_of(closed), "largest_area": area_of(big), "pieces_after_inset": ncomp2}
+
+
+# ---- 范围线文件：KML（WGS84 经纬度）、SHP（同 DOM 坐标系，带 .shx/.dbf/.prj）；都支持多个多边形和内环（内环＝挖掉） ----
+def _shp_esri_wkt(epsg):
+    """该带的 ESRI WKT（写 .prj 用）。"""
+    cm = survey_cm(epsg)
+    return ('PROJCS["CGCS2000_3_Degree_GK_CM_%dE",GEOGCS["GCS_China_Geodetic_Coordinate_System_2000",'
+            'DATUM["D_China_2000",SPHEROID["CGCS2000",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],'
+            'UNIT["Degree",0.0174532925199433]],PROJECTION["Gauss_Kruger"],PARAMETER["False_Easting",500000.0],'
+            'PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",%g],PARAMETER["Scale_Factor",1.0],'
+            'PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]' % (cm, cm))
+
+
+def _as_polygons(polygon):
+    """范围线统一成 [(外环, [内环…])…]；也接受 T11 的单个点列。"""
+    if polygon and isinstance(polygon[0], (list, tuple)) and len(polygon[0]) == 2 and \
+            isinstance(polygon[0][0], (int, float)):
+        return [(list(polygon), [])]
+    return [(list(o), [list(h) for h in hs]) for o, hs in polygon]
+
+
+def _closed(ring):
+    ring = [tuple(p) for p in ring]
+    if ring and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
+def survey_write_range_kml(path, polygon, epsg, name=""):
+    """写 KML：WGS84 经纬度（由不带带号的高斯投影反算；WGS84 与 CGCS2000 差厘米级）。多个多边形用 MultiGeometry，
+    内环写 innerBoundaryIs。"""
+    def coords(ring):
+        return "\n".join("%.9f,%.9f,0" % survey_tm_inverse(x, y, epsg) for x, y in _closed(ring))
+
+    polys = _as_polygons(polygon)
+    geo = []
+    for o, hs in polys:
+        geo.append('<Polygon><tessellate>1</tessellate>\n<outerBoundaryIs><LinearRing><coordinates>\n%s\n'
+                   '</coordinates></LinearRing></outerBoundaryIs>\n%s</Polygon>\n' % (coords(o), "".join(
+                       '<innerBoundaryIs><LinearRing><coordinates>\n%s\n</coordinates></LinearRing></innerBoundaryIs>\n'
+                       % coords(h) for h in hs)))
+    body = geo[0] if len(geo) == 1 else "<MultiGeometry>\n%s</MultiGeometry>\n" % "".join(geo)
+    Path(path).write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n'
+        '<name>%s</name>\n<description>无人机照片工具 DOM/DSM 裁剪范围线（%s，WGS84 经纬度）</description>\n'
+        '<Placemark>\n<name>范围线</name>\n<Style><LineStyle><color>ff0000ff</color><width>2</width></LineStyle>'
+        '<PolyStyle><color>190000ff</color></PolyStyle></Style>\n%s</Placemark>\n</Document>\n</kml>\n' % (
+            name or "范围线", survey_srs_name(epsg), body), encoding="utf-8")
+    return Path(path)
+
+
+def survey_write_range_shp(base, polygon, epsg, name=""):
+    """写范围线 SHP（一条多边形记录，外环顺时针、内环逆时针）+ .shx + .dbf + .prj；坐标系同 DOM（如 EPSG:4543）。
+    返回写出的文件列表。"""
+    s = str(base)
+    if s.lower().endswith(".shp"):
+        s = s[:-4]
+    polys = _as_polygons(polygon)
+    parts = []
+    for o, hs in polys:
+        for k, ring in enumerate([o] + hs):
+            ring = _closed(ring)
+            if (survey_ring_signed_area(ring) > 0) == (k == 0):   # ESRI：外环顺时针（有向面积为负），内环逆时针
+                ring.reverse()
+            parts.append(ring)
+    area = survey_polygons_area(polys)
+    pts = [p for ring in parts for p in ring]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    bb = (min(xs), min(ys), max(xs), max(ys))
+    offs, n = [], 0
+    for ring in parts:
+        offs.append(n)
+        n += len(ring)
+    content = struct.pack("<i4d2i", 5, bb[0], bb[1], bb[2], bb[3], len(parts), len(pts)) + \
+        struct.pack("<%di" % len(parts), *offs) + b"".join(struct.pack("<2d", p[0], p[1]) for p in pts)
+
+    def header(nbytes):
+        return (struct.pack(">6i", 9994, 0, 0, 0, 0, 0) + struct.pack(">i", nbytes // 2) +
+                struct.pack("<2i", 1000, 5) + struct.pack("<4d", bb[0], bb[1], bb[2], bb[3]) +
+                struct.pack("<4d", 0.0, 0.0, 0.0, 0.0))
+    Path(s + ".shp").write_bytes(header(100 + 8 + len(content)) + struct.pack(">2i", 1, len(content) // 2) + content)
+    Path(s + ".shx").write_bytes(header(100 + 8) + struct.pack(">2i", 50, len(content) // 2))
+    fields = (("NAME", "C", 60, 0), ("AREA_M2", "N", 18, 3), ("EPSG", "N", 7, 0))
+    now = datetime.date.today()
+    hdr_len = 32 + 32 * len(fields) + 1
+    rec_len = 1 + sum(f[2] for f in fields)
+    hdr = struct.pack("<4Bihh", 3, now.year - 1900, now.month, now.day, 1, hdr_len, rec_len) + b"\x00" * 20
+    for fname, ftype, flen, fdec in fields:
+        hdr += fname.encode("ascii")[:11].ljust(11, b"\x00") + ftype.encode("ascii") + b"\x00" * 4 + \
+            bytes([flen, fdec]) + b"\x00" * 14
+    hdr += b"\r"
+    try:
+        nm = (name or Path(s).name).encode("gbk", "replace")[:60]
+    except LookupError:
+        nm = (name or Path(s).name).encode("ascii", "replace")[:60]
+    rec = (b" " + nm.ljust(60, b" ") + ("%.3f" % area).encode("ascii").rjust(18, b" ") +
+           str(int(epsg)).encode("ascii").rjust(7, b" "))
+    Path(s + ".dbf").write_bytes(hdr + rec + b"\x1a")
+    Path(s + ".prj").write_text(_shp_esri_wkt(epsg), encoding="ascii")
+    return [Path(s + ".shp"), Path(s + ".shx"), Path(s + ".dbf"), Path(s + ".prj")]
+
+
+def _rings_to_polygons(rings):
+    """一堆环（不管顺/逆时针）按嵌套层数分外环和内环：被偶数个更大的环包着的是外环，奇数个的是紧挨着包它的外环的内环。"""
+    rings = [r for r in (_closed(r) for r in rings) if len(r) >= 4]
+    rings.sort(key=lambda r: -survey_polygon_area(r))
+    depth, parent = [0] * len(rings), [None] * len(rings)
+    for i, r in enumerate(rings):
+        x, y = r[0]
+        for j in range(i):
+            if survey_point_in_ring(x, y, rings[j]):
+                depth[i] += 1
+                parent[i] = j            # 面积从大到小，最后一个包住它的就是最紧的那个
+    out, index = [], {}
+    for i, r in enumerate(rings):
+        if depth[i] % 2 == 0:
+            index[i] = len(out)
+            out.append((r, []))
+        elif parent[i] in index:
+            out[index[parent[i]]][1].append(r)
+    return out
+
+
+def _prj_transform(prj_text, epsg):
+    """看 .prj：返回把文件坐标换到本工点投影坐标的函数；看不懂抛 ValueError。认：经纬度（WGS84/CGCS2000）、
+    CGCS2000/WGS84 的高斯-克吕格或横轴墨卡托投影（任意中央经线、东坐标带不带带号、比例因子）。"""
+    t = prj_text.upper()
+    if "PROJCS" not in t:
+        if "GEOGCS" in t:
+            return lambda x, y: survey_tm_forward(x, y, epsg)
+        raise ValueError("看不懂 .prj 里的坐标系")
+    if "MERCATOR" not in t and "GAUSS" not in t:
+        raise ValueError("只认高斯-克吕格 / 横轴墨卡托投影的 .prj，这个是：%s" % prj_text[:120])
+
+    def par(key, default):
+        m = re.search(r'PARAMETER\["%s",\s*([-0-9.eE+]+)\]' % key, prj_text, re.I)
+        return float(m.group(1)) if m else default
+    cm, fe, k0 = par("Central_Meridian", None), par("False_Easting", 500000.0), par("Scale_Factor", 1.0)
+    fn = par("False_Northing", 0.0)
+    if cm is None:
+        raise ValueError(".prj 里没有中央经线")
+    if abs(cm - survey_cm(epsg)) < 1e-9 and abs(fe - 500000.0) < 1e-6 and abs(k0 - 1.0) < 1e-12 and abs(fn) < 1e-6:
+        return lambda x, y: (x, y)
+
+    def f(x, y):
+        lon, lat = _tm_inverse_cm((x - fe) / k0 + 500000.0, (y - fn) / k0, cm)
+        return survey_tm_forward(lon, lat, epsg)
+    return f
+
+
+def survey_read_range_shp(path, epsg=None):
+    """读 SHP 里所有多边形记录的所有环 → [(外环, [内环…])…]（本工点投影坐标）。有 .prj 按它换算，没有当作与 DOM 同坐标系。"""
+    data = Path(path).read_bytes()
+    if len(data) < 100 or struct.unpack(">i", data[:4])[0] != 9994:
+        raise ValueError("不是 SHP 文件：%s" % path)
+    kind = struct.unpack("<i", data[32:36])[0]
+    if kind not in (5, 15, 25):
+        raise ValueError("SHP 里的不是多边形（类型 %d）：%s" % (kind, path))
+    prj = Path(str(path)[:-4] + ".prj")
+    conv = None
+    if epsg and prj.is_file():
+        try:
+            conv = _prj_transform(prj.read_text(encoding="utf-8", errors="replace"), epsg)
+        except ValueError as ex:
+            raise ValueError("%s：%s" % (ex, prj))
+    off, rings = 100, []
+    while off + 8 <= len(data):
+        words = struct.unpack(">i", data[off + 4:off + 8])[0]
+        body = data[off + 8:off + 8 + words * 2]
+        off += 8 + words * 2
+        if len(body) < 44 or struct.unpack("<i", body[:4])[0] not in (5, 15, 25):
+            continue
+        nparts, npts = struct.unpack("<2i", body[36:44])
+        if npts < 3 or nparts < 1:
+            continue
+        parts = list(struct.unpack("<%di" % nparts, body[44:44 + 4 * nparts])) + [npts]
+        p0 = 44 + 4 * nparts
+        for k in range(nparts):
+            ring = [struct.unpack("<2d", body[p0 + 16 * i:p0 + 16 * i + 16]) for i in range(parts[k], parts[k + 1])]
+            if conv:
+                ring = [conv(x, y) for x, y in ring]
+            if len(ring) >= 3:
+                rings.append(ring)
+    polys = _rings_to_polygons(rings)
+    if not polys:
+        raise ValueError("SHP 里没有可用的多边形：%s" % path)
+    return polys
+
+
+def _kml_ring(el, epsg):
+    pts = []
+    for tok in (el.text or "").split():
+        v = tok.split(",")
+        if len(v) >= 2:
+            try:
+                pts.append(survey_tm_forward(float(v[0]), float(v[1]), epsg))
+            except ValueError:
+                continue
+    return pts
+
+
+def survey_read_range_kml(path, epsg):
+    """读 KML 里所有 Polygon（外环 + 内环，WGS84 经纬度）→ [(外环, [内环…])…]（本工点投影坐标）。
+    没有 Polygon 时退回去找第一个点数 ≥ 3 的坐标串当外环。"""
+    try:
+        root = ET.parse(str(path)).getroot()
+    except ET.ParseError as ex:
+        raise ValueError("KML 读不了（%s）：%s" % (ex, path))
+    tag = lambda e: e.tag.split("}")[-1]
+    polys = []
+    for el in root.iter():
+        if tag(el) != "Polygon":
+            continue
+        outer, inner = None, []
+        for b in el:
+            if tag(b) not in ("outerBoundaryIs", "innerBoundaryIs"):
+                continue
+            for c in b.iter():
+                if tag(c) == "coordinates":
+                    ring = _kml_ring(c, epsg)
+                    if len(ring) >= 3:
+                        if tag(b) == "outerBoundaryIs":
+                            outer = ring
+                        else:
+                            inner.append(ring)
+        if outer:
+            polys.append((_closed(outer), [_closed(h) for h in inner]))
+    if not polys:
+        for el in root.iter():
+            if tag(el) == "coordinates":
+                ring = _kml_ring(el, epsg)
+                if len(ring) >= 3:
+                    polys.append((_closed(ring), []))
+                    break
+    if not polys:
+        raise ValueError("KML 里没有可用的多边形（要 lon,lat 至少 3 个点）：%s" % path)
+    return polys
+
+
+def survey_read_range_line(path, epsg):
+    """读范围线文件（.shp 或 .kml）→ [(外环, [内环…])…]（本工点投影坐标，环都首尾闭合）。"""
+    p = Path(path)
+    if p.suffix.lower() == ".shp":
+        polys = survey_read_range_shp(p, epsg)
+    elif p.suffix.lower() == ".kml":
+        polys = survey_read_range_kml(p, epsg)
+    else:
+        raise ValueError("范围线只认 .kml 或 .shp：%s" % p)
+    out = []
+    for o, hs in polys:
+        o = _closed(o)
+        if len(o) >= 4 and survey_polygon_area(o) > 0:
+            out.append((o, [_closed(h) for h in hs if len(h) >= 3]))
+    if not out:
+        raise ValueError("范围线里没有面积大于 0 的多边形：%s" % p)
+    return out
+
+
+def survey_user_range_line(site_dir, name, report):
+    """重跑时用户改过的范围线优先：`<工点名>_范围线.shp/.kml` 比 处理报告.txt 新就返回它的路径，否则 None。"""
+    rep = Path(report)
+    if not rep.is_file():
+        return None
+    try:
+        mt = rep.stat().st_mtime
+    except OSError:
+        return None
+    for suf in (SURVEY_RANGE_SHP, SURVEY_RANGE_KML):   # .shp 在前：坐标系同 DOM，不用换算
+        p = Path(site_dir) / (name + suf)
+        try:
+            if p.is_file() and p.stat().st_mtime > mt:
+                return str(p)
+        except OSError:
+            pass
+    return None
+
+
+def survey_site_range_line(site_dir, name):
+    """工点目录里的范围线（「按范围线重新裁剪」选「用工点目录里的」时）：.shp、.kml 哪个新用哪个；都没有返回 None。"""
+    best = None
+    for suf in (SURVEY_RANGE_SHP, SURVEY_RANGE_KML):
+        p = Path(site_dir) / (name + suf)
+        if p.is_file() and (best is None or p.stat().st_mtime > best.stat().st_mtime):
+            best = p
+    return str(best) if best else None
+
+
+def survey_set_aside_range_lines(site_dir, name, stamp):
+    """旧的范围线文件改名保留成 <工点名>_范围线_上次_<时间>.kml/.shp（.shx/.dbf/.prj 跟着改）。返回改了名的新路径。"""
+    moved = []
+    for suf in (".kml", ".shp", ".shx", ".dbf", ".prj", ".cpg"):
+        p = Path(site_dir) / ("%s_范围线%s" % (name, suf))
+        if p.is_file():
+            q = p.with_name("%s_范围线_上次_%s%s" % (name, stamp, suf))
+            os.replace(str(p), str(q))
+            moved.append(q)
+    return moved
+
+
+def survey_clip_window(polygon, origin, px, margin=SURVEY_CLIP_MARGIN_PX):
+    """范围线（所有外环）外接矩形外扩 margin 个像元，并对齐到原 GeoTIFF 的像元网格（左上角 origin、像素 px）。
+    返回 (region [x0, y0, x1, y1], 列数, 行数)。region 高宽多要 0.25 个像元：Metashape 按 int() 截断像素数。"""
+    ox, oy = origin
+    pts = [p for o, hs in _as_polygons(polygon) for p in o]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    c0 = int(math.floor((min(xs) - ox) / px)) - margin
+    c1 = int(math.ceil((max(xs) - ox) / px)) + margin
+    r0 = int(math.floor((oy - max(ys)) / px)) - margin
+    r1 = int(math.ceil((oy - min(ys)) / px)) + margin
+    ncol, nrow = c1 - c0, r1 - r0
+    x0 = ox + c0 * px
+    x1 = x0 + (ncol + SURVEY_CLIP_INSET_TAIL) * px
+    y1 = oy - r0 * px
+    y0 = y1 - (nrow + SURVEY_CLIP_INSET_TAIL) * px
+    return [x0, y0, x1, y1], ncol, nrow
+
+
+# 内嵌脚本：裁边分析用（D-32）。读写打开工程但**不保存**：（可选）先导出没裁的 DOM，再用密集点云建一张**不插值**的辅助 DSM
+# （0.1 米，只判断、不输出）导出成不压缩的 GeoTIFF。正式 DSM 留在工程文件里不动（从不调用 save）；建辅助 DSM 时 Metashape
+# 在 .files 里新写的数据目录由调用方事后删掉。只用 Python 3.8 语法。
+SURVEY_AUX_SCRIPT = r'''# -*- coding: utf-8 -*-
+# 由「无人机照片工具」影像处理页签生成：裁边分析（不插值辅助 DSM），在 Metashape 内嵌的 Python 里运行。不保存工程。
+import json
+import sys
+import time
+import traceback
+
+P = json.load(open(sys.argv[-1], "r", encoding="utf-8"))
+_pf = open(P["progress"], "a", encoding="utf-8")
+
+
+def ev(kind, **kw):
+    kw["ev"] = kind
+    kw["t"] = round(time.time(), 1)
+    _pf.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    _pf.flush()
+
+
+class Prog(object):
+    def __init__(self, stage):
+        self.stage = stage
+        self.last = -1
+
+    def __call__(self, p):
+        p = int(p)
+        if p != self.last:
+            self.last = p
+            ev("progress", stage=self.stage, pct=p)
+
+
+def compression(big, deflate):
+    ic = Metashape.ImageCompression()
+    ic.tiff_compression = (Metashape.ImageCompression.TiffCompressionDeflate if deflate
+                           else Metashape.ImageCompression.TiffCompressionNone)
+    ic.tiff_big = big
+    ic.tiff_tiled = False
+    ic.tiff_overviews = False
+    return ic
+
+
+app = None
+try:
+    try:
+        import Metashape
+    except ImportError:
+        import PhotoScan as Metashape
+    app = Metashape.app
+    ev("start", version=str(app.version), python=sys.version.split()[0])
+    crs = Metashape.CoordinateSystem("EPSG::%d" % P["epsg"])
+    ev("stage", stage="open")
+    doc = Metashape.Document()
+    doc.open(P["psx"], read_only=False)      # 辅助 DSM 只读打开建不上；读写打开但从不保存
+    ch = doc.chunk
+    if ch.dense_cloud is None:
+        raise RuntimeError("工程里没有密集点云，判断不了「真实点云」（要勾 DOM/DSM 跑过的工程）")
+    el = ch.elevation
+    if el is None:
+        raise RuntimeError("工程里没有 DSM")
+    L, T, R, B = el.left, el.top, el.right, el.bottom
+    ev("elevation", left=L, top=T, right=R, bottom=B, res=el.resolution)
+    op = Metashape.OrthoProjection()
+    op.crs = crs
+    if P.get("dom_raw"):                      # 没裁的 DOM（判据①），范围、像元网格同第 1 趟（正式 DSM 的范围）
+        if ch.orthomosaic is None:
+            raise RuntimeError("工程里没有 DOM")
+        res = P["resolution"] or ch.orthomosaic.resolution
+        box = Metashape.BBox()
+        box.min = Metashape.Vector([L, B])
+        box.max = Metashape.Vector([R, T])
+        big = (R - L) / res * (T - B) / res * 4 > P["bigtiff"]
+        kw = dict(source_data=Metashape.OrthomosaicData, image_format=Metashape.ImageFormatTIFF, projection=op,
+                  region=box, save_world=True, image_compression=compression(big, True), save_alpha=True,
+                  white_background=False, progress=Prog("dom_raw"))
+        if P["resolution"]:
+            kw.update(resolution_x=res, resolution_y=res)
+        ev("stage", stage="dom_raw")
+        t0 = time.time()
+        ch.exportRaster(P["dom_raw"], **kw)
+        ev("secs", stage="dom_raw", secs=round(time.time() - t0, 1))
+    ev("stage", stage="aux_dem")
+    t0 = time.time()
+    ch.buildDem(source_data=Metashape.DenseCloudData, interpolation=Metashape.DisabledInterpolation, projection=op,
+                resolution=P["aux_res"], progress=Prog("aux_dem"))
+    ev("secs", stage="aux_dem", secs=round(time.time() - t0, 1))
+    r = P["aux_res"]
+    cols = int(round((R - L) / r)) + 10
+    rows = int(round((T - B) / r)) + 10
+    box = Metashape.BBox()
+    box.min = Metashape.Vector([L, T - (rows + 0.25) * r])
+    box.max = Metashape.Vector([L + (cols + 0.25) * r, T])
+    ev("stage", stage="aux_export")
+    t0 = time.time()
+    ch.exportRaster(P["aux"], source_data=Metashape.ElevationData, image_format=Metashape.ImageFormatTIFF, projection=op,
+                    region=box, resolution_x=r, resolution_y=r, nodata_value=P["nodata"], save_alpha=False,
+                    save_world=True, image_compression=compression(cols * rows * 4 > P["bigtiff"], False),
+                    progress=Prog("aux_export"))
+    ev("secs", stage="aux_export", secs=round(time.time() - t0, 1))
+    ev("aux", cols=cols, rows=rows, interpolation="DisabledInterpolation")
+    ev("done")
+except Exception:
+    ev("error", msg=traceback.format_exc())
+finally:
+    _pf.close()
+    if app is not None:
+        app.quit()
+'''
+
+
+def _psx_frame_dirs(psx):
+    """工程数据目录 <名>.files/<chunk>/<frame>/ 下现有的子目录（建辅助 DSM 前后比，删掉新多出来的）。"""
+    base = Path(str(psx)[:-4] + ".files")
+    out = set()
+    if base.is_dir():
+        for c in base.iterdir():
+            if c.is_dir():
+                for f in c.iterdir():
+                    if f.is_dir():
+                        for d in f.iterdir():
+                            if d.is_dir():
+                                out.add(str(d))
+    return out
+
+
+def _psx_fingerprint(psx):
+    """工程文件本身（.psx、各 chunk.zip / frame.zip）的哈希：辅助 DSM 那一趟前后必须一样（证明没保存、正式 DSM 没被换掉）。"""
+    psx = Path(psx)
+    files = [psx] + sorted(Path(str(psx)[:-4] + ".files").glob("*/*.zip")) + \
+        sorted(Path(str(psx)[:-4] + ".files").glob("*/*/*.zip"))
+    fp = {}
+    for f in files:
+        if f.is_file() and f.parent.name not in ("elevation", "orthomosaic", "dense_cloud", "depth_maps", "point_cloud",
+                                                 "thumbnails") and not f.parent.name.startswith("elevation"):
+            fp[str(f)] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return fp
+
+
+def survey_clip_analyze(psx, metashape, epsg, resolution, dom_raw, site_dir, name, export_dom=False, log=None,
+                        progress=None, stop_event=None, **timeouts):
+    """裁边分析：Metashape 里建不插值辅助 DSM（export_dom=True 时顺便导出没裁的 DOM 到 dom_raw）→ 标准库读出三条判据的
+    分析网格 → 存 <工点名>_裁边分析.json.gz。辅助 DSM 用完就删，Metashape 新写的数据目录也删。返回分析 dict。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    site_dir = Path(site_dir)
+    tmp = Path(tempfile.mkdtemp(prefix="uav_clipan_"))
+    aux = site_dir / (name + "_辅助DSM.不插值.tmp.tif")
+    events, steps = [], []
+    before_dirs, before_fp = _psx_frame_dirs(psx), _psx_fingerprint(psx)
+
+    def on_event(e):
+        k = e.get("ev")
+        if k == "start":
+            log("Metashape 版本 %s（裁边分析：建不插值的辅助 DSM，只判断、不输出，工程不保存）" % e.get("version", ""))
+        elif k == "stage":
+            progress({"open": 0.02, "dom_raw": 0.05, "aux_dem": 0.35, "aux_export": 0.9}.get(e["stage"], 0.0),
+                     {"open": "打开工程", "dom_raw": "导出没裁的 DOM", "aux_dem": "建不插值辅助 DSM",
+                      "aux_export": "导出辅助 DSM"}.get(e["stage"], e["stage"]))
+        elif k == "progress":
+            a, b, lab = {"dom_raw": (0.05, 0.35, "导出没裁的 DOM"), "aux_dem": (0.35, 0.9, "建不插值辅助 DSM"),
+                         "aux_export": (0.9, 0.98, "导出辅助 DSM")}.get(e.get("stage"), (0, 0, ""))
+            if lab:
+                progress(a + (b - a) * e.get("pct", 0) / 100.0, "%s %d%%" % (lab, e.get("pct", 0)))
+        elif k == "secs":
+            steps.append((e["stage"], e["secs"]))
+        elif k == "error":
+            log("Metashape 脚本出错：\n%s" % e.get("msg", ""))
+
+    params = {"psx": str(psx), "epsg": int(epsg), "resolution": float(resolution or 0), "nodata": SURVEY_NODATA,
+              "bigtiff": SURVEY_BIGTIFF, "aux": str(aux), "aux_res": SURVEY_CLIP_AUX_RES,
+              "dom_raw": str(dom_raw) if export_dom else ""}
+    try:
+        try:
+            events, rc = _run_ms_script(metashape, SURVEY_AUX_SCRIPT, params, tmp, on_event, stop_event, **timeouts)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            for d in sorted(_psx_frame_dirs(psx) - before_dirs):   # Metashape 给辅助 DSM 新建的数据目录（工程里没引用）
+                if Path(d).name.startswith("elevation"):
+                    shutil.rmtree(d, ignore_errors=True)
+            if _psx_fingerprint(psx) != before_fp:
+                raise RuntimeError("裁边分析那一趟之后工程文件变了（不应该保存），请检查工程：%s" % psx)
+        errs = [e for e in events if e.get("ev") == "error"]
+        if errs:
+            raise RuntimeError("裁边分析时 Metashape 出错：%s" % (
+                errs[-1].get("msg", "").strip().splitlines() or ["未知错误"])[-1])
+        if rc != 0:
+            raise RuntimeError("裁边分析时 Metashape 异常退出，退出码 %s（0x%08X）" % (rc, rc & 0xFFFFFFFF))
+        if not any(e.get("ev") == "done" for e in events) or not aux.is_file():
+            raise RuntimeError("裁边分析没跑完（进度文件里没有完成标记或没有辅助 DSM）")
+        el = ([e for e in events if e.get("ev") == "elevation"] or [None])[0]
+        progress(0.98, "统计三条判据")
+        t = tiff_strip_info(dom_raw)
+        if el and (abs(t["origin"][0] - el["left"]) > 1e-6 or abs(t["origin"][1] - el["top"]) > 1e-6):
+            raise RuntimeError("没裁的 DOM 左上角 (%.6f, %.6f) 和工程里 DSM 的 (%.6f, %.6f) 对不上" % (
+                t["origin"][0], t["origin"][1], el["left"], el["top"]))
+        nx, ny = survey_clip_grid(t["width"], t["height"], t["px"][0])
+        ok = survey_dom_coverage(dom_raw, nx, ny, log=log)
+        cnt, blk = survey_aux_counts(aux, nx, ny, log=log)
+        an = {"version": 1, "nx": nx, "ny": ny, "cell": SURVEY_CLIP_GRID, "left": t["origin"][0], "top": t["origin"][1],
+              "px": t["px"][0], "dom_w": t["width"], "dom_h": t["height"], "epsg": int(epsg),
+              "aux_res": SURVEY_CLIP_AUX_RES, "aux_interpolation": "DisabledInterpolation",
+              "aux_valid": sum(cnt) / float(max(1, nx * ny * 25)), "made": datetime.datetime.now().isoformat(" ", "seconds"),
+              "steps": steps, "dom_ok": ok, "cnt": cnt, "blk": blk}
+        survey_write_analysis(site_dir / (name + SURVEY_CLIP_ANALYSIS), an)
+        return an
+    finally:
+        for f in (aux, aux.with_suffix(".tfw")):
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+
+# 内嵌脚本：只读重开工程，把范围线加成外边界（内环加成内边界＝挖掉），DOM、DSM 用同一个窗口同一条线重新导出。只用 Python 3.8 语法。
+SURVEY_CLIP_SCRIPT = r'''# -*- coding: utf-8 -*-
+# 由「无人机照片工具」影像处理页签生成：只重新导出（不重建），在 Metashape 内嵌的 Python 里运行。
+import json
+import sys
+import time
+import traceback
+
+P = json.load(open(sys.argv[-1], "r", encoding="utf-8"))
+_pf = open(P["progress"], "a", encoding="utf-8")
+
+
+def ev(kind, **kw):
+    kw["ev"] = kind
+    kw["t"] = round(time.time(), 1)
+    _pf.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    _pf.flush()
+
+
+class Prog(object):
+    def __init__(self, stage):
+        self.stage = stage
+        self.last = -1
+
+    def __call__(self, p):
+        p = int(p)
+        if p != self.last:
+            self.last = p
+            ev("progress", stage=self.stage, pct=p)
+
+
+app = None
+try:
+    try:
+        import Metashape
+    except ImportError:
+        import PhotoScan as Metashape
+    app = Metashape.app
+    ev("start", version=str(app.version), python=sys.version.split()[0])
+    CS = Metashape.CoordinateSystem
+    crs = CS("EPSG::%d" % P["epsg"])
+    ev("stage", stage="open")
+    doc = Metashape.Document()
+    doc.open(P["psx"], read_only=True)
+    ch = doc.chunk
+    if ch.shapes is None:
+        ch.shapes = Metashape.Shapes()
+    for old in list(ch.shapes):                # 工程里原有的形状不参与裁剪（只读打开，不会存回去）
+        old.boundary_type = Metashape.Shape.NoBoundary
+    ch.shapes.crs = crs
+    n_out = n_in = 0
+    area = 0.0
+    for k, ring in enumerate(P["rings"]):
+        sh = ch.shapes.addShape()
+        sh.type = Metashape.Shape.Type.Polygon
+        sh.has_z = False
+        sh.label = "DOM/DSM 范围线 %d" % (k + 1)
+        sh.vertices = [Metashape.Vector([p[0], p[1], 0.0]) for p in ring["pts"]]
+        if ring["outer"]:
+            sh.boundary_type = Metashape.Shape.OuterBoundary
+            n_out += 1
+            area += sh.area()
+        else:
+            sh.boundary_type = Metashape.Shape.InnerBoundary
+            n_in += 1
+            area -= sh.area()
+    ev("shape", outer=n_out, inner=n_in, area=area)
+    el = ch.elevation
+    if el is None or ch.orthomosaic is None:
+        raise RuntimeError("工程里没有 DSM 或 DOM，没法按范围线重新导出")
+    res = P["resolution"] or 0
+    px = P["px"]
+    ox, oy = P["origin"]
+    c0, r0, c1, r1 = P["window"]                 # 列/行号（相对原点），右下不含；不超出工程里 DSM 的范围
+    c0 = max(c0, int(round((el.left - ox) / px)))
+    c1 = min(c1, int(round((el.right - ox) / px)))
+    r0 = max(r0, int(round((oy - el.top) / px)))
+    r1 = min(r1, int(round((oy - el.bottom) / px)))
+    if c1 <= c0 or r1 <= r0:
+        raise RuntimeError("范围线和工程的 DSM 范围不相交")
+    box = Metashape.BBox()
+    box.min = Metashape.Vector([ox + c0 * px, oy - (r1 + P["tail"]) * px])
+    box.max = Metashape.Vector([ox + (c1 + P["tail"]) * px, oy - r0 * px])
+    ev("window", window=[c0, r0, c1, r1], region=[box.min.x, box.min.y, box.max.x, box.max.y])
+    op = Metashape.OrthoProjection()
+    op.crs = crs
+    info = {}
+    for key, src, bands, nbytes in (("dsm", Metashape.ElevationData, 1, 4), ("dom", Metashape.OrthomosaicData, 4, 1)):
+        r = ch.elevation if key == "dsm" else ch.orthomosaic
+        w, h = c1 - c0, r1 - r0
+        ic = Metashape.ImageCompression()
+        ic.tiff_compression = Metashape.ImageCompression.TiffCompressionDeflate
+        ic.tiff_big = w * h * bands * nbytes > P["bigtiff"]
+        ic.tiff_tiled = False
+        ic.tiff_overviews = False
+        kw = dict(source_data=src, image_format=Metashape.ImageFormatTIFF, projection=op, region=box,
+                  save_world=True, image_compression=ic, clip_to_boundary=True, progress=Prog("clip_" + key))
+        if res:
+            kw.update(resolution_x=res, resolution_y=res)
+        if key == "dsm":
+            kw.update(nodata_value=P["nodata"], save_alpha=False)
+        else:
+            kw.update(save_alpha=True, white_background=False)
+        t0 = time.time()
+        ch.exportRaster(P[key], **kw)
+        ev("secs", stage="clip_" + key, secs=round(time.time() - t0, 1))
+        info[key] = {"native": r.resolution, "res": res or r.resolution, "width": w, "height": h, "bigtiff": ic.tiff_big}
+    ev("rasters", info=info)
+    ev("done")
+except Exception:
+    ev("error", msg=traceback.format_exc())
+finally:
+    _pf.close()
+    if app is not None:
+        app.quit()
+'''
+
+
+def survey_clip_export(metashape, psx, epsg, polygon, resolution, dom, dsm, nodata=SURVEY_NODATA,
+                       bigtiff=SURVEY_BIGTIFF, origin=None, log=None, progress=None, stop_event=None, **timeouts):
+    """只重新导出：只读重开工程 → 范围线加成外边界（内环＝内边界，挖掉）→ DOM、DSM 用同一个窗口同一条线导出
+    （线外透明 / NoData）。dom、dsm 是导出到的路径（调用者负责换名）。origin = 像元网格的左上角（没裁的 DOM/DSM 的，
+    或已裁过的同一网格上的）。返回 dict：region、ncol、nrow、steps、rasters。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    if not origin:
+        raise ValueError("缺少原 GeoTIFF 的左上角，算不了像元网格")
+    polys = _as_polygons(polygon)
+    px = float(resolution)
+    region, ncol, nrow = survey_clip_window(polys, origin, px)
+    c0 = int(round((region[0] - origin[0]) / px))
+    r0 = int(round((origin[1] - region[3]) / px))
+    rings = []
+    for o, hs in polys:
+        rings.append({"outer": True, "pts": [list(p) for p in o]})
+        rings.extend({"outer": False, "pts": [list(p) for p in h]} for h in hs)
+    tmp = Path(tempfile.mkdtemp(prefix="uav_clip_"))
+    events, stage_secs = [], []
+
+    def on_event(e):
+        k = e.get("ev")
+        if k == "start":
+            log("Metashape 版本 %s（按范围线重新导出，不重建）" % e.get("version", ""))
+        elif k == "stage":
+            progress(0.05, "只读重开工程")
+        elif k == "progress":
+            if e.get("stage") == "clip_dom":
+                progress(min(0.97, 0.2 + 0.75 * e.get("pct", 0) / 100.0), "按范围线导出 DOM %d%%" % e.get("pct", 0))
+            elif e.get("stage") == "clip_dsm":
+                progress(min(0.19, 0.02 + 0.16 * e.get("pct", 0) / 100.0), "按范围线导出 DSM %d%%" % e.get("pct", 0))
+        elif k == "shape":
+            log("范围线已加成裁剪边界：外环 %d 个%s，面积 %.1f m²" % (
+                e["outer"], "、内环（挖掉）%d 个" % e["inner"] if e["inner"] else "", e["area"]))
+        elif k == "window":
+            w = e["window"]
+            log("裁边窗口：东 %.2f～%.2f、北 %.2f～%.2f（%d × %d 像元，%g 米）" % (
+                e["region"][0], e["region"][2], e["region"][1], e["region"][3], w[2] - w[0], w[3] - w[1], px))
+        elif k == "secs":
+            stage_secs.append((e["stage"], e["secs"]))
+        elif k == "error":
+            log("Metashape 脚本出错：\n%s" % e.get("msg", ""))
+
+    params = {"psx": str(psx), "epsg": int(epsg), "rings": rings, "window": [c0, r0, c0 + ncol, r0 + nrow],
+              "origin": [origin[0], origin[1]], "px": px, "tail": SURVEY_CLIP_INSET_TAIL,
+              "resolution": float(resolution or 0), "nodata": nodata, "bigtiff": bigtiff, "dom": str(dom), "dsm": str(dsm)}
+    try:
+        events, rc = _run_ms_script(metashape, SURVEY_CLIP_SCRIPT, params, tmp, on_event, stop_event, **timeouts)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    errs = [e for e in events if e.get("ev") == "error"]
+    if errs:
+        raise RuntimeError("按范围线重新导出时 Metashape 出错：%s" % (
+            errs[-1].get("msg", "").strip().splitlines() or ["未知错误"])[-1])
+    if rc != 0:
+        raise RuntimeError("按范围线重新导出时 Metashape 异常退出，退出码 %s（0x%08X）" % (rc, rc & 0xFFFFFFFF))
+    if not any(e.get("ev") == "done" for e in events):
+        raise RuntimeError("按范围线重新导出没跑完（进度文件里没有完成标记）")
+    win = ([e for e in events if e.get("ev") == "window"] or [{"region": region}])[0]
+    return {"region": win["region"], "ncol": ncol, "nrow": nrow, "steps": stage_secs,
+            "rasters": ([e["info"] for e in events if e.get("ev") == "rasters"] or [{}])[0]}
+
+
+def _raster_box(path):
+    t = tiff_strip_info(path)
+    return {"left": t["origin"][0], "top": t["origin"][1], "w": t["width"], "h": t["height"], "px": t["px"][0],
+            "right": t["origin"][0] + t["width"] * t["px"][0], "bottom": t["origin"][1] - t["height"] * t["px"][1]}
+
+
+def _survey_clip_info(mode, inset, density):
+    return {"mode": mode, "inset": inset, "density": density, "source": "", "line_file": "", "kml": "", "shp": "",
+            "polygon": [], "before": None, "after": None, "valid_area": None, "line_area": None, "holes": 0,
+            "components": 0, "second_area": 0.0, "steps": [], "points": 0, "inner_rings": 0, "region": None,
+            "rasters": {}, "fail_area": None, "valid_cells_area": None, "closed_area": None, "analysis": "",
+            "aux_valid": None, "when": "", "set_aside": [], "reclip": False, "secs": None}
+
+
+def survey_auto_range(psx, metashape, epsg, resolution, dom_raw, site_dir, name, info, inset, density,
+                      export_dom=False, use_cache=False, log=None, progress=None, stop_event=None, **timeouts):
+    """自动范围线：有分析缓存且 use_cache 就直接用，否则进 Metashape 做裁边分析；再按 🔒 D-32 算线，结果填进 info。"""
+    log = log or (lambda s: None)
+    cache = Path(site_dir) / (name + SURVEY_CLIP_ANALYSIS)
+    an = None
+    if use_cache and cache.is_file():
+        try:
+            an = survey_read_analysis(cache)
+            log("用上次的裁边分析（%s，%s 做的），不用再进 Metashape 分析" % (cache.name, an.get("made", "")))
+        except (ValueError, OSError, EOFError) as ex:
+            log("裁边分析文件读不了（%s），重新分析" % ex)
+            an = None
+    if an is None:
+        an = survey_clip_analyze(psx, metashape, epsg, resolution, dom_raw, site_dir, name, export_dom=export_dom,
+                                 log=log, progress=progress, stop_event=stop_event, **timeouts)
+        info["steps"].extend(an.get("steps") or [])
+    rl = survey_range_from_analysis(an, inset, density, log=log)
+    info.update(polygon=rl["polygons"], valid_area=rl["valid_area"], line_area=rl["line_area"], holes=rl["holes"],
+                components=rl["components"], second_area=rl["second_area"], points=rl["points"],
+                inner_rings=rl["inner_rings"], fail_area=rl["fail_area"], valid_cells_area=rl["valid_cells_area"],
+                closed_area=rl["closed_area"], largest_area=rl["largest_area"], analysis=str(cache),
+                aux_valid=an.get("aux_valid"), source="自动")
+
+    return info
+
+
+def survey_clip_rasters(psx, metashape, epsg, resolution, dom, dsm, mode=SURVEY_CLIP_AUTO, clip_file=None,
+                        inset=SURVEY_CLIP_INSET, density=SURVEY_CLIP_DENSITY, site_dir=None, name="", report=None,
+                        before_dsm=None, before_dom=None, log=None, progress=None, stop_event=None, **timeouts):
+    """（整套处理里的）裁边：算范围线（自动 / 用户改过的 / 指定的文件）→ 写 KML + SHP → 只重新导出并按线裁。
+    dom、dsm 是要写出来的两张图；没裁的 DSM / DOM 由 before_dsm / before_dom 给（第 1 趟导出的）。返回给报告用的 dict。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    site_dir = Path(site_dir if site_dir is not None else Path(dom).parent)
+    before_dsm = Path(before_dsm) if before_dsm else Path(dsm)
+    info = _survey_clip_info(mode, inset, density)
+    info["before"] = _raster_box(before_dsm)
+    user_line = clip_file
+    if not user_line and mode == SURVEY_CLIP_AUTO and report:
+        user_line = survey_user_range_line(site_dir, name, report)
+        if user_line:
+            log("发现比 处理报告.txt 新的范围线文件，按用户的线裁：%s" % user_line)
+    if user_line:
+        info["polygon"] = survey_read_range_line(user_line, epsg)
+        info["line_file"] = str(user_line)
+        info["source"] = "用户范围线"
+        info["line_area"] = survey_polygons_area(info["polygon"])
+        log("用范围线文件：%s（%d 个多边形、面积 %.0f m²；原样裁，不再往里收）" % (
+            user_line, len(info["polygon"]), info["line_area"]))
+    else:
+        survey_auto_range(psx, metashape, epsg, resolution, before_dom, site_dir, name, info, inset, density, log=log,
+                          progress=lambda f, s: progress(0.5 * f, s), stop_event=stop_event, **timeouts)
+        kml = site_dir / (name + SURVEY_RANGE_KML)
+        shp = site_dir / (name + SURVEY_RANGE_SHP)
+        survey_write_range_kml(kml, info["polygon"], epsg, name)
+        survey_write_range_shp(shp, info["polygon"], epsg, name)
+        info["kml"], info["shp"] = str(kml), str(shp)
+        log("范围线已另存（想手改可以用任何 GIS 软件打开，改完用「按范围线重新裁剪…」只重新导出）：%s；%s（+.shx/.dbf/.prj）" % (
+            kml.name, shp.name))
+    if not info["polygon"]:
+        raise RuntimeError("没有范围线，裁不了")
+    tmp_dom = Path(str(dom) + ".裁边中.tif")
+    tmp_dsm = Path(str(dsm) + ".裁边中.tif")
+    try:
+        res = survey_clip_export(metashape, psx, epsg, info["polygon"], resolution, tmp_dom, tmp_dsm,
+                                 origin=(info["before"]["left"], info["before"]["top"]), log=log,
+                                 progress=lambda f, s: progress(0.5 + 0.5 * f, s), stop_event=stop_event, **timeouts)
+        info["steps"].extend(res["steps"])
+        info["rasters"] = res.get("rasters") or {}
+        info["region"] = res["region"]
+        for tmp_path, final in ((tmp_dom, Path(dom)), (tmp_dsm, Path(dsm))):
+            tw = tmp_path.with_suffix(".tfw")
+            if not tmp_path.is_file() or not tw.is_file():
+                raise RuntimeError("按范围线重新导出的文件不在：%s" % tmp_path.name)
+            if final.exists():
+                final.unlink()
+            os.replace(str(tmp_path), str(final))
+            os.replace(str(tw), str(final.with_suffix(".tfw")))
+        info["after"] = _raster_box(dsm)
+        _log_clip_box(log, info["after"])
+    finally:
+        for f in (tmp_dom, tmp_dsm, tmp_dom.with_suffix(".tfw"), tmp_dsm.with_suffix(".tfw")):
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    return info
+
+
+def _log_clip_box(log, a):
+    log("按范围线裁完：外框 东 %.2f～%.2f、北 %.2f～%.2f（%.0f × %.0f 米，%d × %d 像元）" % (
+        a["left"], a["right"], a["bottom"], a["top"], a["right"] - a["left"], a["top"] - a["bottom"], a["w"], a["h"]))
+
+
+SURVEY_RECLIP_SOURCES = ("dir", "file", "auto", "smart")   # 工点目录里的线 / 用户选的文件 / 不换线、按参数重新自动算 /
+# smart（命令行不给 --line 时）：工点目录里的线比 处理报告.txt 新（用户改过）就用它，否则重新自动算
+
+
+def survey_reclip_site(site_dir, metashape, source="dir", line_file=None, inset=SURVEY_CLIP_INSET,
+                       density=SURVEY_CLIP_DENSITY, log=None, progress=None, stop_event=None, **timeouts):
+    """「按范围线重新裁剪」（D-32，给用户留手动裁的余地）：一个已完成的工点只重新导出 DOM/DSM，不碰空三和建模。
+    source：dir（工点目录里的 <工点名>_范围线.shp/.kml，哪个新用哪个）/ file（line_file，任意 KML 或 SHP）/
+    auto（不换线，按 inset、density 重新自动算；有分析缓存就不用再进 Metashape 分析）。
+    先导到临时名，检查通过才替换 DOM/DSM；旧范围线改名 <工点名>_范围线_上次_<时间>.*，新线按原名写；报告的裁边段改写。
+    返回 dict（status：完成 / 失败 / 已取消，reason，clip）。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    site = Path(os.path.abspath(site_dir))
+    name = site.name
+    t0 = time.time()
+    when = datetime.datetime.now()
+    stamp = when.strftime("%Y%m%d_%H%M%S")
+    res = {"name": name, "dir": str(site), "status": "失败", "reason": "", "clip": None, "secs": None}
+    psx, dom, dsm, rep = site / (name + ".psx"), site / (name + "DOM.tif"), site / (name + "DSM.tif"), site / SURVEY_REPORT
+    tmp_dom, tmp_dsm = Path(str(dom) + ".裁边中.tif"), Path(str(dsm) + ".裁边中.tif")
+    dom_raw = site / (name + "DOM.未裁.tmp.tif")
+    log("—— 按范围线重新裁剪：%s（%s）" % (name, {"dir": "用工点目录里的范围线", "file": "用选的文件 %s" % line_file,
+                                            "auto": "重新自动算，往里收 %g 米、点云密度门槛 %g%%" % (inset, density),
+                                            "smart": "命令行没给 --line"}.get(source, source)))
+    try:
+        if source not in SURVEY_RECLIP_SOURCES:
+            raise ValueError("范围线来源只能是 %s" % "/".join(SURVEY_RECLIP_SOURCES))
+        if source == "smart":
+            source = "dir" if survey_user_range_line(site, name, rep) else "auto"
+            log("工点目录里%s改过的范围线 → %s" % ("有" if source == "dir" else "没有",
+                                            "用它" if source == "dir" else "按往里收 %g 米、点云密度门槛 %g%% 重新自动算" % (
+                                                inset, density)))
+        for f, what in ((psx, "工程 .psx"), (dom, "DOM"), (dsm, "DSM"), (rep, SURVEY_REPORT)):
+            if not f.is_file():
+                raise ValueError("不是已完成的工点（缺%s）：%s" % (what, f))
+        state = survey_read_report(rep).get("状态", "")
+        if state not in ("完成", "部分对齐"):
+            raise ValueError("处理报告的状态是「%s」，只有完成 / 部分对齐的工点能重新裁剪" % state)
+        g = geotiff_info(dom)
+        epsg, px = g["epsg"], g["res"][0]
+        if not epsg or not (SURVEY_EPSG_MIN <= int(epsg) <= SURVEY_EPSG_MAX):
+            raise ValueError("DOM 的坐标系是 EPSG:%s，不是 CGCS2000 3 度带" % epsg)
+        origin = g["origin"]                    # 已裁过的 DOM 和没裁的在同一个像元网格上，用它的左上角对齐
+        info = _survey_clip_info(SURVEY_CLIP_AUTO if source == "auto" else "file", inset, density)
+        info["reclip"], info["when"] = True, when.strftime("%Y-%m-%d %H:%M:%S")
+        info["before"] = _raster_box(dsm)
+        if source == "auto":
+            survey_auto_range(psx, metashape, int(epsg), px, dom_raw, site, name, info, inset, density,
+                              export_dom=True, use_cache=True, log=log, progress=lambda f, s: progress(0.5 * f, s),
+                              stop_event=stop_event, **timeouts)
+            info["source"] = "自动重新算"
+
+        else:
+            line = survey_site_range_line(site, name) if source == "dir" else line_file
+            if not line or not Path(line).is_file():
+                raise ValueError("找不到范围线文件：%s" % (line or (site / (name + SURVEY_RANGE_SHP))))
+            info["polygon"] = survey_read_range_line(line, int(epsg))
+            info["line_area"] = survey_polygons_area(info["polygon"])
+            info["line_file"] = str(Path(line).resolve())
+            info["source"] = "工点目录里改过的线" if source == "dir" else "用户选的文件"
+            info["inner_rings"] = sum(len(hs) for o, hs in info["polygon"])
+            log("范围线：%s（%d 个多边形、%d 个内环（挖掉）、面积 %.0f m²；原样裁，不再往里收、不按点云判据删减）" % (
+                line, len(info["polygon"]), info["inner_rings"], info["line_area"]))
+        r = survey_clip_export(metashape, psx, int(epsg), info["polygon"], px, tmp_dom, tmp_dsm, origin=origin, log=log,
+                               progress=lambda f, s: progress(0.5 + 0.45 * f if source == "auto" else 0.95 * f, s),
+                               stop_event=stop_event, **timeouts)
+        info["steps"].extend(r["steps"])
+        info["rasters"], info["region"] = r.get("rasters") or {}, r["region"]
+        for f in (tmp_dom, tmp_dsm):
+            for x in (f, f.with_suffix(".tfw")):
+                if not x.is_file():
+                    raise RuntimeError("按范围线重新导出的文件不在：%s" % x.name)
+        progress(0.97, "检查结果")
+        problems, rinfo = check_survey_rasters(tmp_dom, tmp_dsm, int(epsg), px)
+        problems += check_survey_raster_pair(rinfo)
+        if problems:
+            raise RuntimeError("重新导出的 DOM/DSM 没通过检查（原来的没动）：" + "；".join(problems))
+        # 检查都过了才动原文件：旧线改名保留 → 写新线 → 换 DOM/DSM → 改报告
+        info["set_aside"] = [str(p) for p in survey_set_aside_range_lines(site, name, stamp)]
+        if info["set_aside"]:
+            log("旧范围线改名保留：%s" % "、".join(Path(p).name for p in info["set_aside"]))
+        kml, shp = site / (name + SURVEY_RANGE_KML), site / (name + SURVEY_RANGE_SHP)
+        survey_write_range_kml(kml, info["polygon"], int(epsg), name)
+        survey_write_range_shp(shp, info["polygon"], int(epsg), name)
+        info["kml"], info["shp"] = str(kml), str(shp)
+        for tmp_path, final in ((tmp_dom, dom), (tmp_dsm, dsm)):
+            os.replace(str(tmp_path), str(final))
+            os.replace(str(tmp_path.with_suffix(".tfw")), str(final.with_suffix(".tfw")))
+        info["after"] = _raster_box(dsm)
+        _log_clip_box(log, info["after"])
+        log(_reclip_box_note(info["before"], info["after"]).strip())
+        info["secs"] = time.time() - t0
+        problems, rinfo = check_survey_rasters(dom, dsm, int(epsg), px)
+        _survey_report_replace_clip(rep, info, rinfo)
+        res.update(status="完成", clip=info)
+        log("重新裁剪完成：%s，用时 %.1f 分钟（只重新导出，没重建）" % (name, info["secs"] / 60.0))
+    except (AlignCancelled, KeyboardInterrupt):
+        res.update(status="已取消", reason="用户取消；原来的 DOM/DSM、范围线都没动")
+        log("已取消（原来的 DOM/DSM、范围线都没动）")
+    except Exception as ex:
+        res.update(status="失败", reason=str(ex))
+        log("失败（原来的 DOM/DSM、范围线都没动）：%s" % ex)
+    finally:
+        res["secs"] = time.time() - t0
+        for f in (tmp_dom, tmp_dsm, dom_raw):
+            for x in (f, f.with_suffix(".tfw")):
+                if x.exists():
+                    try:
+                        x.unlink()
+                    except OSError:
+                        pass
+    return res
+
+
+def survey_reclip_sites(out_dir):
+    """输出目录里能「按范围线重新裁剪」的工点（有 .psx、DOM、DSM、处理报告且状态完成/部分对齐）：[(工点名, 目录)]。"""
+    out = []
+    try:
+        subs = sorted((d for d in Path(out_dir).iterdir() if d.is_dir()), key=lambda d: d.name)
+    except OSError:
+        return out
+    for d in subs:
+        n = d.name
+        if all((d / f).is_file() for f in (n + ".psx", n + "DOM.tif", n + "DSM.tif", SURVEY_REPORT)):
+            if survey_read_report(d / SURVEY_REPORT).get("状态", "") in ("完成", "部分对齐"):
+                out.append((n, str(d)))
+    return out
+
+
+def run_survey_clip(site_dirs, metashape, source="dir", line_file=None, inset=SURVEY_CLIP_INSET,
+                    density=SURVEY_CLIP_DENSITY, log=None, progress=None, on_item=None, stop_event=None, **timeouts):
+    """多个工点依次「按范围线重新裁剪」；本机有别的 Metashape 在跑就等。返回 {"rows", "exit"}：exit 0 全部成功 / 1 有失败 /
+    3 取消。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    on_item = on_item or (lambda d, phase, text: None)
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    rows, cancelled = [], False
+    for pos, d in enumerate(site_dirs, 1):
+        waited = False
+        while not stopped() and other_metashape_running():
+            if not waited:
+                log("本机已有别的 Metashape 在跑，等它结束（每 %d 秒看一次）…" % BATCH_WAIT_POLL)
+                waited = True
+            if stop_event is not None:
+                stop_event.wait(BATCH_WAIT_POLL)
+            else:
+                time.sleep(BATCH_WAIT_POLL)
+        if stopped():
+            cancelled = True
+            break
+        on_item(d, "start", "运行中")
+        r = survey_reclip_site(d, metashape, source, line_file, inset, density, log=log,
+                               progress=lambda f, s, pos=pos: progress(f, "第 %d/%d 个 · %s" % (pos, len(site_dirs), s)),
+                               stop_event=stop_event, **timeouts)
+        rows.append(r)
+        on_item(d, "done", r["status"])
+        if r["status"] == "已取消":
+            cancelled = True
+            break
+    log("")
+    for r in rows:
+        log("  %s：%s%s（%.1f 分钟）" % (r["name"], r["status"], "，" + r["reason"] if r["reason"] else "", (r["secs"] or 0) / 60.0))
+    code = 3 if cancelled else 1 if any(r["status"] != "完成" for r in rows) or len(rows) < len(site_dirs) else 0
+    return {"rows": rows, "exit": code, "cancelled": cancelled}
+
+
+def _survey_result(it, out_dir, metashape, dom_dsm, resolution, keypoints, tiepoints, clip=SURVEY_CLIP_AUTO,
+                   clip_inset=SURVEY_CLIP_INSET, clip_file=None, clip_density=SURVEY_CLIP_DENSITY):
+    return {"name": it["name"], "dir": it["dir"], "out_dir": str(out_dir), "status": "失败", "reason": "",
+            "metashape": metashape, "version": "", "returncode": None, "done": False,
+            "start": datetime.datetime.now(), "secs": None, "total": None, "n_gps": it.get("n_gps"), "located": None,
+            "aligned": None, "unaligned": [], "tiepoints": None, "rms": None, "epsg": it.get("epsg"),
+            "epsg_src": it.get("epsg_src", ""), "lon": it.get("lon"), "lat": it.get("lat"), "near": it.get("near"),
+            "auto_epsg": it.get("auto_epsg"), "samples": [], "ref_mean": None, "steps": [], "xml": "", "xml_info": None,
+            "fix_stats": None, "dom_dsm": dom_dsm, "resolution": resolution, "rasters": None, "raster_info": None,
+            "region": None, "dom": "", "dsm": "", "keypoints": keypoints, "tiepoints_limit": tiepoints, "warnings": [],
+            "exported": False, "low_ratio": False, "clip_mode": clip if dom_dsm else SURVEY_CLIP_NONE,
+            "clip_inset": clip_inset, "clip_density": clip_density, "clip_file": clip_file or "", "clip": None}
+
+
+def survey_one(it, out_dir, metashape, dom_dsm=False, resolution=SURVEY_RESOLUTION, keypoints=SURVEY_KEYPOINTS,
+               tiepoints=SURVEY_TIEPOINTS, log=None, progress=None, stop_event=None, clip=SURVEY_CLIP_AUTO,
+               clip_inset=SURVEY_CLIP_INSET, clip_file=None, clip_density=SURVEY_CLIP_DENSITY, **timeouts):
+    """处理一个工点，结果全部写在 out_dir（<输出>\\<工点名>\\）：.psx、XML、（DOM/DSM）、处理报告.txt、metashape_日志.txt。
+    clip：auto（D-32 三条判据自动裁边，默认）/ none（不裁，和 v1.0 一样）/ file（按 clip_file 的范围线裁）。
+    返回结果 dict（status：完成 / 部分对齐 / 失败 / 已取消）。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    name = it["name"]
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    psx = out / (name + ".psx")
+    xml_final = out / (name + "_BlocksExchange.xml")
+    xml_raw = out / (name + "_BlocksExchange.未修正.xml.tmp")
+    xml_d10 = out / (name + "_BlocksExchange.无坐标系.xml.tmp")
+    dom, dsm = out / (name + "DOM.tif"), out / (name + "DSM.tif")
+    dsm_raw = out / (name + "DSM.未裁.tmp.tif")   # 裁边时先导出的「没裁」的 DSM、DOM，裁完就删
+    dom_raw = out / (name + "DOM.未裁.tmp.tif")
+    res = _survey_result(it, out, metashape, dom_dsm, resolution, keypoints, tiepoints, clip, clip_inset, clip_file,
+                         clip_density)
+    do_clip = bool(dom_dsm) and clip != SURVEY_CLIP_NONE
+    span = _SURVEY_SPAN[bool(dom_dsm)]
+    t_start = time.time()
+    tmp = Path(tempfile.mkdtemp(prefix="uav_survey_"))
+    events = []
+
+    def on_event(e):
+        kind = e.get("ev")
+        if kind == "start":
+            res["version"] = e.get("version", "")
+            log("Metashape 版本 %s（内嵌 Python %s）" % (res["version"], e.get("python", "")))
+        elif kind == "stage":
+            a, b, label = span.get(e["stage"], (0, 0, e["stage"]))
+            progress(a / 100.0, label)
+            log("%s…  %s" % (label, datetime.datetime.now().strftime("%H:%M")))
+        elif kind == "progress":
+            a, b, label = span.get(e["stage"], (0, 0, e["stage"]))
+            pct = e.get("pct", 0)
+            progress((a + (b - a) * pct / 100.0) / 100.0, "%s %d%%" % (label, pct))
+        elif kind == "secs":
+            if e["stage"] != "save":
+                res["steps"].append((e["stage"], e["secs"]))
+        elif kind == "refs":
+            res["located"], res["ref_mean"], res["samples"] = e["located"], e["mean"], e["samples"]
+            log("相机参考：%d/%d 张照片带 GPS，已从经纬度换算到 %s（如 %s：%.7f, %.7f → %.2f, %.2f）" % (
+                e["located"], e["total"], e["crs"], e["samples"][0][0], e["samples"][0][1][0], e["samples"][0][1][1],
+                e["samples"][0][2][0], e["samples"][0][2][1]) if e["samples"] else
+                "相机参考：%d/%d 张照片带 GPS" % (e["located"], e["total"]))
+        elif kind == "aligned":
+            res["aligned"], res["total"], res["unaligned"] = e["aligned"], e["total"], e["unaligned"]
+            res["tiepoints"], res["rms"] = e["tiepoints"], e["rms"]
+            log("对齐 %d/%d，连接点 %d；相机参考误差 RMS %s" % (
+                e["aligned"], e["total"], e["tiepoints"], _survey_rms_text(e["rms"])))
+            if e["unaligned"]:
+                log("未对齐：%s" % "、".join(e["unaligned"]))
+        elif kind == "low_ratio":
+            res["low_ratio"] = True
+        elif kind == "exported":
+            res["exported"] = True
+            log("已导出 Blocks Exchange（%d 张相机，去掉未对齐 %d 张）" % (e["cameras"], e["dropped"]))
+        elif kind == "region":
+            res["region"] = e
+            b = e["box"]
+            if e.get("mode") == "tie":
+                d = e["default"]
+                log("DOM/DSM 范围：东 %.1f～%.1f、北 %.1f～%.1f（%.0f × %.0f 米）＝自动区域框（%.0f × %.0f 米）∪ 连接点 %g%%～%g%% "
+                    "分位范围%s" % (b[0], b[2], b[1], b[3], b[2] - b[0], b[3] - b[1], d[2] - d[0], d[3] - d[1],
+                                 e["pct"][0], e["pct"][1], "；%s边超出相机范围 ± %g 米，已收回" % ("、".join(e["sides"]), e["limit"])
+                                 if e["sides"] else ""))
+            else:
+                log("DOM/DSM 范围：东 %.1f～%.1f、北 %.1f～%.1f（%.0f × %.0f 米）%s" % (
+                    b[0], b[2], b[1], b[3], b[2] - b[0], b[3] - b[1],
+                    "；Metashape 自动的框伸出相机范围 %g 米以上，已收回" % SURVEY_REGION_LIMIT if e["clamped"] else ""))
+        elif kind == "rasters":
+            res["rasters"] = e["info"]
+        elif kind == "done":
+            res["done"] = True
+        elif kind == "error":
+            log("Metashape 脚本出错：\n%s" % e.get("msg", ""))
+
+    def finish_xml():
+        progress(0.99 if dom_dsm else 0.97, "修正 XML")
+        res["fix_stats"] = fix_blocks_exchange(xml_raw, xml_d10)
+        xml_raw.unlink()
+        problems, _ = check_blocks_exchange(xml_d10, res["aligned"])
+        problems = [p for p in problems if "D-10" not in p]  # 坐标系下一步再加；这里只看照片数、路径和 Pose/Metadata
+        if problems:
+            raise RuntimeError("XML 没通过检查：" + "；".join(problems))
+        add_epsg_srs(xml_d10, xml_final, res["epsg"])
+        xml_d10.unlink()
+        res["xml"] = str(xml_final)
+        problems, info = check_bx_epsg(xml_final, res["epsg"], res["aligned"], res["ref_mean"])
+        res["xml_info"] = info
+        if problems:
+            raise RuntimeError("XML 没通过检查：" + "；".join(problems))
+        log("XML 检查通过：%d 张照片，坐标系 EPSG:%d（%s），照片中心平均 %.1f, %.1f" % (
+            info["photos"], res["epsg"], survey_srs_name(res["epsg"]), info["center_mean"][0], info["center_mean"][1]))
+
+    log("—— 影像处理：%s（%d 张，%s，%s）" % (name, it["n"], survey_srs_label(it.get("epsg")) or "没有坐标系",
+                                         "出 XML + DOM/DSM" if dom_dsm else "只出 XML"))
+    log("输出：%s" % out)
+    progress(0.0, "启动 Metashape")
+    try:
+        if not res["epsg"]:
+            raise ValueError("没有坐标系：照片不带定位，自动选不了带；请在列表里给这个工点手动选一个 CGCS2000 3 度带")
+        photos = survey_site_photos(it["dir"])
+        res["total"] = len(photos)
+        if not photos:
+            raise ValueError("工点里没有照片：%s" % it["dir"])
+        if len(photos) != it["n"]:
+            res["warnings"].append("扫描时 %d 张，开跑时 %d 张，按开跑时的用" % (it["n"], len(photos)))
+            log("注意：%s" % res["warnings"][-1])
+        params = {"name": name, "photos": [str(p) for p in photos], "psx": str(psx), "xml_raw": str(xml_raw),
+                  "epsg": int(res["epsg"]), "downscale": SURVEY_DOWNSCALE, "keypoint_limit": int(keypoints),
+                  "tiepoint_limit": int(tiepoints), "min_ratio": SURVEY_MIN_RATIO, "min_gps": SURVEY_MIN_GPS,
+                  "dom_dsm": bool(dom_dsm), "resolution": float(resolution or 0), "depth_downscale": SURVEY_DEPTH_DOWNSCALE,
+                  "nodata": SURVEY_NODATA, "bigtiff": SURVEY_BIGTIFF, "region_limit": SURVEY_REGION_LIMIT,
+                  "region_limit_clip": SURVEY_REGION_LIMIT_CLIP, "region_tie_pct": list(SURVEY_REGION_TIE_PCT),
+                  "dom": str(dom), "dsm": str(dsm), "clip": do_clip, "dsm_uncropped": str(dsm_raw),
+                  "dom_uncropped": str(dom_raw)}
+        events, rc = _run_ms_script(metashape, SURVEY_SCRIPT, params, tmp, on_event, stop_event, **timeouts)
+        res["returncode"] = rc
+        errs = [e for e in events if e.get("ev") == "error"]
+        if errs:
+            if res["exported"] and xml_raw.is_file():  # DOM/DSM 出错时 XML 已经导出：照样修正好留给用户
+                try:
+                    finish_xml()
+                except Exception as ex:
+                    log("XML 也没弄好：%s" % ex)
+            msg = (errs[-1].get("msg", "").strip().splitlines() or ["未知错误"])[-1]
+            raise RuntimeError("Metashape 脚本出错：%s（完整信息见 metashape_日志.txt）%s" % (
+                msg, "；XML 已导出可用，DOM/DSM 没做完" if res["xml"] else ""))
+        if rc != 0:
+            raise RuntimeError("Metashape 异常退出，退出码 %s（0x%08X）" % (rc, rc & 0xFFFFFFFF))
+        if not res["done"]:
+            raise RuntimeError("Metashape 退出了，但进度文件里没有完成标记（脚本没有跑完）")
+        if res["low_ratio"]:
+            raise RuntimeError("对齐率 %.0f%%（%d/%d）低于 %.0f%%，判失败；没有导出 XML" % (
+                100.0 * res["aligned"] / res["total"], res["aligned"], res["total"], SURVEY_MIN_RATIO * 100))
+        if not xml_raw.is_file():
+            raise RuntimeError("Metashape 没有导出 Blocks Exchange XML")
+        finish_xml()
+        if dom_dsm:
+            if do_clip:   # D-32：三条判据算范围线，DOM/DSM 用同一条线、同一个窗口重新导出（不重建）
+                progress(0.96, "按范围线裁边")
+                log("")
+                log("—— 自动裁边：%s" % ("按 %s 的范围线" % Path(clip_file).name if clip == "file" else
+                                         "DOM 有影像 + 不插值的密集点云真有点 + 点云够密（门槛 %g%%），往里收 %g 米" % (
+                                             clip_density, clip_inset)))
+                res["clip"] = survey_clip_rasters(psx, metashape, res["epsg"], resolution, dom, dsm, mode=clip,
+                                                  clip_file=clip_file, inset=clip_inset, density=clip_density,
+                                                  site_dir=out, name=name, report=out / SURVEY_REPORT,
+                                                  before_dsm=dsm_raw, before_dom=dom_raw, log=log,
+                                                  progress=lambda f, s: progress(0.96 + 0.038 * f, s),
+                                                  stop_event=stop_event, **timeouts)
+                res["steps"].extend(res["clip"]["steps"])
+                if res["clip"].get("rasters"):
+                    res["rasters"] = res["clip"]["rasters"]
+            problems, info = check_survey_rasters(dom, dsm, res["epsg"], resolution)
+            res["raster_info"] = info
+            res["dom"], res["dsm"] = str(dom), str(dsm)
+            problems += check_survey_raster_pair(info)
+            if problems:
+                raise RuntimeError("DOM/DSM 没通过检查：" + "；".join(problems))
+            for k in ("DOM", "DSM"):
+                g = info[k]
+                log("%s：%d × %d，%g 米，%s%s，%.0f MB%s" % (
+                    k, g["width"], g["height"], g["res"][0], g["dtype"], "×%d" % g["bands"] if g["bands"] > 1 else "",
+                    g["size"] / 1048576.0, "，BigTIFF" if g["bigtiff"] else ""))
+            if do_clip and res["clip"]:
+                res["warnings"].append("裁边用的是%s范围线，DOM/DSM 线外透明 / NoData，外框和像元网格一致"
+                                       % ("用户" if res["clip"]["source"] == "用户范围线" else "自动算的"))
+        res["status"] = "完成" if res["aligned"] == res["total"] else "部分对齐"
+        log("%s：对齐 %d/%d%s" % (res["status"], res["aligned"], res["total"],
+                                "（未对齐的没写进 XML，清单见报告）" if res["unaligned"] else ""))
+        progress(1.0, res["status"])
+    except (AlignCancelled, KeyboardInterrupt):
+        res["status"] = "已取消"
+        res["reason"] = "用户取消，Metashape 已被强制结束；本目录里的结果不完整，不要使用"
+        log("已取消")
+        (out / "已取消.txt").write_text("用户在 %s 取消了这个工点，本目录里的结果不完整，不要使用。\n"
+                                       % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    except Exception as ex:
+        res["status"] = "失败"
+        res["reason"] = str(ex)
+        log("失败：%s" % ex)
+    finally:
+        res["secs"] = time.time() - t_start
+        for f in (xml_raw, xml_d10):
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        kept = []
+        for raw, final in ((dsm_raw, dsm), (dom_raw, dom)):   # 裁边没做成：把没裁的 DSM/DOM 留下（改名成正式名字），别让工作白做
+            if raw.exists() and not final.exists():
+                try:
+                    os.replace(str(raw), str(final))
+                    if raw.with_suffix(".tfw").exists():
+                        os.replace(str(raw.with_suffix(".tfw")), str(final.with_suffix(".tfw")))
+                    kept.append(final.name)
+                except OSError:
+                    pass
+            for f in (raw, raw.with_suffix(".tfw")):
+                if f.exists():
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        if kept:
+            res["warnings"].append("裁边没做成，保留的是没裁的 %s（可以之后用「按范围线重新裁剪…」再裁）" % "、".join(kept))
+
+        _write_metashape_log(out / "metashape_日志.txt", res, events, tmp / "console.txt")
+        _write_survey_report(out / SURVEY_REPORT, res)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return res
+
+
+def _survey_rms_text(rms):
+    if not rms:
+        return "-"
+    return "%.2f 米（X %.2f、Y %.2f、Z %.2f，%d 张）" % (rms[3], rms[0], rms[1], rms[2], rms[4])
+
+
+def _survey_raster_lines(raster_info, rasters, paths):
+    lines = []
+    for k, key in (("DOM", "dom"), ("DSM", "dsm")):
+        g = (raster_info or {}).get(k)
+        r = (rasters or {}).get(key) or {}
+        if g:
+            ox, oy = g["origin"]
+            lines.append("  %s：%s；%d × %d 像素，%g 米（Metashape 原始 %.4f 米），左上角 %.3f, %.3f，%s × %d 波段，%.0f MB%s" % (
+                k, paths[key], g["width"], g["height"], g["res"][0], r.get("native") or 0, ox, oy, g["dtype"],
+                g["bands"], g["size"] / 1048576.0, "，BigTIFF" if g["bigtiff"] else ""))
+    return lines
+
+
+def _survey_clip_lines(c):
+    """报告的裁边段（整套处理和「按范围线重新裁剪」共用）。"""
+    lines = []
+    auto = c["source"].startswith("自动")
+    if c.get("reclip"):
+        lines.append("  重新裁剪：%s（%s v%s「按范围线重新裁剪」，只重新导出 DOM/DSM，没重建；用时 %.1f 分钟）" % (
+            c["when"], APP_NAME, APP_VERSION, (c.get("secs") or 0) / 60.0))
+    if auto:
+        lines.append("  裁边：%s：DOM 有影像 + 不插值的密集点云真有点 + 点云够密 → 补缝 → 最大连片 → 填洞 → 往里收 %g 米" % (
+            c["source"], c["inset"]))
+        lines.append("  判据：①每个 %g 米格里没裁的 DOM alpha > 0 的像元 ≥ %d%%；②不插值（DisabledInterpolation）辅助 DSM"
+                     "（%g 米，只判断、不输出，用完已删）在格里有真实点；③%g 米块里有点的 %g 米子格 ≥ 点云密度门槛" % (
+                         SURVEY_CLIP_GRID, int(SURVEY_CLIP_DOM_FRAC * 100), SURVEY_CLIP_AUX_RES, SURVEY_CLIP_BLOCK,
+                         SURVEY_CLIP_AUX_RES))
+        lines.append("  点云密度门槛：%g%%；往里收：%g 米" % (c["density"], c["inset"]))
+        fa = c.get("fail_area")
+        if fa:
+            lines.append("  三条各淘汰（%g 米网格上按 ①→②→③ 依次算）：①影像不足 %.0f m²、②没有真实点 %.0f m²、③点云不够密 %.0f m²；"
+                         "三条都满足 %.0f m²" % (SURVEY_CLIP_GRID, fa[0], fa[1], fa[2], c.get("valid_cells_area") or 0))
+            lines.append("  补缝（扩 %g 米再收 %g 米）后 %.0f m²；最大连片（共 %s 片%s）、填掉 %d 个内部 < %g m² 的洞后 %.0f m²" % (
+                SURVEY_CLIP_CLOSE, SURVEY_CLIP_CLOSE, c.get("closed_area") or 0, c.get("components") or "-",
+                "，其余 %.0f m² 舍掉" % ((c.get("closed_area") or 0) - (c.get("largest_area") or 0)) if
+                (c.get("components") or 0) > 1 else "", c.get("holes") or 0, SURVEY_CLIP_HOLE, c.get("valid_area") or 0))
+        if c.get("analysis"):
+            lines.append("  裁边分析：%s（只改往里收 / 点云密度门槛重新裁时直接用它，不用再进 Metashape 分析）" % Path(c["analysis"]).name)
+    else:
+        src = c["source"]
+        lines.append("  裁边：%s（直接用这条线裁，不再往里收、不按点云判据删减）" % (
+            "用户范围线" if src == "用户范围线" else "用户改的范围线：" + src))
+    if c.get("line_file"):
+        lines.append("  范围线来源：%s" % c["line_file"])
+    polys = _as_polygons(c["polygon"]) if c.get("polygon") else []
+    lines.append("  范围线面积：%.0f m²（%d 个多边形，外环 %d 个点%s）" % (
+        c.get("line_area") or 0, len(polys), sum(len(o) - 1 for o, hs in polys),
+        "，内环（挖掉）%d 个" % sum(len(hs) for o, hs in polys) if any(hs for o, hs in polys) else ""))
+    if c.get("kml"):
+        lines.append("  范围线另存：%s、%s（+.shx/.dbf/.prj；想手改就用任何 GIS 软件改，改完点「按范围线重新裁剪…」）" % (
+            Path(c["kml"]).name, Path(c["shp"]).name))
+    if c.get("set_aside"):
+        lines.append("  旧范围线改名保留：%s" % "、".join(Path(p).name for p in c["set_aside"]))
+    bf, af = c.get("before"), c.get("after")
+    if bf:
+        lines.append("  裁剪前外框：东 %.2f～%.2f、北 %.2f～%.2f（%.0f × %.0f 米，%d × %d 像素）" % (
+            bf["left"], bf["right"], bf["bottom"], bf["top"], bf["right"] - bf["left"],
+            bf["top"] - bf["bottom"], bf["w"], bf["h"]))
+    if af:
+        lines.append("  裁剪后外框：东 %.2f～%.2f、北 %.2f～%.2f（%.0f × %.0f 米，%d × %d 像素）" % (
+            af["left"], af["right"], af["bottom"], af["top"], af["right"] - af["left"],
+            af["top"] - af["bottom"], af["w"], af["h"]))
+        dx = (bf["right"] - bf["left"]) - (af["right"] - af["left"]) if bf else 0
+        dy = (bf["top"] - bf["bottom"]) - (af["top"] - af["bottom"]) if bf else 0
+        lines.append("  外框变化：东西%s %.1f 米、南北%s %.1f 米；DOM 与 DSM 同一条线、同一个像元网格"
+                     "（左上角、像元大小、行列数都一致，已自动核对）" % (
+                         "缩了" if dx >= 0 else "大了", abs(dx), "缩了" if dy >= 0 else "大了", abs(dy)))
+        if c.get("reclip") and bf:
+            lines.append(_reclip_box_note(bf, af))
+    return lines
+
+
+def _reclip_box_note(bf, af):
+    """「按范围线重新裁剪」后外框会变（T12 复核建议②）：叠新旧图时别以为软件错了。"""
+    if (bf["w"], bf["h"]) == (af["w"], af["h"]) and abs(bf["left"] - af["left"]) < 1e-6 and abs(bf["top"] - af["top"]) < 1e-6:
+        return "  外框没变：%d×%d 像元" % (af["w"], af["h"])
+    return "  外框已随范围线改变：旧 %d×%d → 新 %d×%d 像元（左上角 东 %.2f → %.2f、北 %.2f → %.2f；像元网格不变）" % (
+        bf["w"], bf["h"], af["w"], af["h"], bf["left"], af["left"], bf["top"], af["top"])
+
+
+def _survey_report_replace_clip(path, c, raster_info):
+    """「按范围线重新裁剪」后改写 处理报告.txt：DOM/DSM 两行和裁边段换成新的（其余原样），注意行里的裁边说明也换掉。"""
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    keys = ("  DOM：", "  DSM：", "  裁边", "  重新裁剪：", "  判据：", "  点云密度门槛：", "  三条各淘汰", "  补缝",
+            "  裁边分析：", "  范围线", "  旧范围线", "  有效面积：", "  算法：", "  裁剪前外框：", "  裁剪后外框：", "  外框变化：",
+            "  外框已随范围线改变：", "  外框没变：")
+    idx = [i for i, ln in enumerate(lines) if ln.startswith(keys)]
+    new = _survey_raster_lines(raster_info, c.get("rasters"), {"dom": str(path.parent / (path.parent.name + "DOM.tif")),
+                                                               "dsm": str(path.parent / (path.parent.name + "DSM.tif"))})
+    new += _survey_clip_lines(c)
+    if idx:
+        lines = lines[:idx[0]] + new + [ln for i, ln in enumerate(lines[idx[0]:], idx[0]) if i not in idx]
+    else:
+        k = next((i for i, ln in enumerate(lines) if ln.startswith("Metashape 退出码：")), len(lines))
+        lines = lines[:k] + new + lines[k:]
+    note = "注意：裁边用的是%s范围线（%s 按范围线重新裁剪），DOM/DSM 线外透明 / NoData，外框和像元网格一致" % (
+        "自动算的" if c["source"].startswith("自动") else "用户", c["when"])
+    lines = [note if ln.startswith("注意：裁边用的是") else ln for ln in lines]
+    if not any(ln.startswith("注意：裁边用的是") for ln in lines):
+        k = next((i for i, ln in enumerate(lines) if ln.startswith("状态：")), 0)
+        lines.insert(k + 1, note)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _write_survey_report(path, res):
+    lines = ["影像处理报告（%s v%s）" % (APP_NAME, APP_VERSION), "",
+             "状态：%s" % res["status"]]
+    if res["reason"]:
+        lines.append("原因：%s" % res["reason"])
+    for w in res["warnings"]:
+        lines.append("注意：%s" % w)
+    if res["aligned"] is not None and res["total"]:
+        lines.append("对齐：%d/%d" % (res["aligned"], res["total"]))
+    lines.append("相机参考误差RMS：%s" % _survey_rms_text(res["rms"]))
+    lines.append("DOM/DSM：%s" % ("是（%s）" % ("分辨率 %g 米" % res["resolution"] if res["resolution"] else "分辨率自动")
+                                 if res["dom_dsm"] else "否"))
+    lines += ["", "工点：%s" % res["name"], "照片目录：%s（只读，没改）" % res["dir"], "输出目录：%s" % res["out_dir"],
+              "Metashape：%s（版本 %s）" % (res["metashape"], res["version"] or "未知"),
+              "开始时间：%s；总耗时 %.1f 分钟" % (res["start"].strftime("%Y-%m-%d %H:%M:%S"), (res["secs"] or 0) / 60.0)]
+    if res["steps"]:
+        lab = dict(_SURVEY_STEP_LABEL)
+        lines.append("各步耗时：" + "，".join("%s %.1f 分钟" % (lab.get(k, k), s / 60.0) for k, s in res["steps"]))
+    epsg = res["epsg"]
+    if epsg:
+        auto = "自动（带定位照片平均经度 %.4f°，中央经线 = 3 × round(经度 / 3)）" % res["lon"] if res["lon"] is not None else "自动"
+        lines.append("坐标系：EPSG:%d  %s（东坐标不带带号）；来源：%s%s" % (
+            epsg, survey_srs_name(epsg), auto if res["epsg_src"] == "自动" else "手动指定" + (
+                "（自动会选 %s）" % survey_srs_label(res["auto_epsg"]) if res["auto_epsg"] and res["auto_epsg"] != epsg else ""),
+            "；靠近分带线（离 %.1f° 不到 %g°）" % (survey_cm(res["auto_epsg"] or epsg) + (1.5 if res["lon"] > survey_cm(
+                res["auto_epsg"] or epsg) else -1.5), SURVEY_NEAR_ZONE) if res["near"] and res["lon"] is not None else ""))
+        lines.append("换算：照片 GPS 经纬度（WGS84，与 CGCS2000 只差厘米级）按 CGCS2000 经纬度（EPSG:4490）"
+                     "用 Metashape 换算到 EPSG:%d 作相机参考；姿态参考没用；没有去定位" % epsg)
+        for s in res["samples"]:
+            lines.append("  %s：经度 %.8f、纬度 %.8f、高 %.2f → 东 %.3f、北 %.3f、高 %.2f" % (
+                s[0], s[1][0], s[1][1], s[1][2], s[2][0], s[2][1], s[2][2]))
+    lines.append("参数：对齐精度 最高（downscale=%d）、通用预选 开、参考预选 开、关键点 %d、连接点 %d；对齐后用相机参考 optimizeCameras 一次"
+                 % (SURVEY_DOWNSCALE, res["keypoints"], res["tiepoints_limit"]))
+    lines.append("照片：%s 张，带定位 %s 张%s" % (res["total"] if res["total"] is not None else "-",
+                                          res["located"] if res["located"] is not None else res["n_gps"],
+                                          "（扫描时 %s 张）" % res["n_gps"] if res["located"] is not None else ""))
+    if res["aligned"] is not None:
+        lines.append("对齐率：%.1f%%（低于 %.0f%% 判失败）" % (100.0 * res["aligned"] / res["total"], SURVEY_MIN_RATIO * 100))
+        lines.append("未对齐照片：%s" % ("无" if not res["unaligned"] else "%d 张（没写进 XML，.psx 里保留）" % len(res["unaligned"])))
+        lines += ["  " + u for u in res["unaligned"]]
+        lines.append("连接点：%s" % res["tiepoints"])
+    if res["xml"]:
+        lines.append("Blocks Exchange：%s" % res["xml"])
+        lines.append("  坐标系写 <SRS>：Id 1 / %s / EPSG:%d，<Block> 挂 <SRSId>1</SRSId>；去掉 Metashape 写的坐标系和 <Pose> 下的 "
+                     "<Metadata>（%d 个）；照片路径是原片的绝对路径" % (survey_srs_name(epsg), epsg,
+                                                     (res["fix_stats"] or {}).get("Pose/Metadata", 0)))
+        if res["xml_info"]:
+            lines.append("  照片 %d 张；ImagePath 缺失 %d 个" % (res["xml_info"]["photos"], res["xml_info"]["missing"]))
+    if res["dom_dsm"]:
+        lines.append("DOM/DSM 参数：深度图 超高（downscale=%d）、深度过滤 适中；DSM 由密集点云生成（插值开），DOM 以 DSM 为表面；"
+                     "Deflate 压缩，DSM NoData %g，DOM RGBA（透明区 alpha=0）" % (SURVEY_DEPTH_DOWNSCALE, SURVEY_NODATA))
+        rg = res["region"]
+        if rg and rg.get("mode") == "tie":
+            b, d, t = rg["box"], rg["default"], rg.get("tie")
+            box_text = lambda v: "东 %.2f～%.2f、北 %.2f～%.2f（%.0f × %.0f 米）" % (
+                v[0], v[2], v[1], v[3], v[2] - v[0], v[3] - v[1])
+            lines.append("  范围：%s；勾了自动裁边：平面范围 = 自动区域框 ∪ 连接点分位数范围，限制在已对齐相机范围 ± %g 米以内，"
+                         "高程用自动区域框的（D-33）" % (box_text(b), rg["limit"]))
+            lines.append("  自动区域框：%s" % box_text(d))
+            lines.append("  连接点范围：%s" % ("东、北各自 %g%%～%g%% 分位数 %s，共 %d 个连接点" % (
+                rg["pct"][0], rg["pct"][1], box_text(t), rg["n_tie"]) if t else "没有连接点，只用自动区域框"))
+            lines.append("  ± %g 米限制：%s" % (rg["limit"], "%s边超出，收到相机范围 ± %g 米" % (
+                "、".join(rg["sides"]), rg["limit"]) if rg["sides"] else "没收过"))
+        elif rg:
+            b = res["region"]["box"]
+            lines.append("  范围：东 %.2f～%.2f、北 %.2f～%.2f（%.0f × %.0f 米）；%s" % (
+                b[0], b[2], b[1], b[3], b[2] - b[0], b[3] - b[1],
+                "Metashape 自动的区域框伸出已对齐相机范围 %g 米以上，那一边收到 相机范围 ± %g 米" % (
+                    SURVEY_REGION_LIMIT, SURVEY_REGION_LIMIT) if res["region"]["clamped"] else "用 Metashape 对齐后自动给的区域框"))
+        lines += _survey_raster_lines(res["raster_info"], res["rasters"], res)
+        if res.get("clip"):
+            lines += _survey_clip_lines(res["clip"])
+        elif res["dom_dsm"]:
+            lines.append("  裁边：没裁（同 v1.0；整幅导出）")
+    lines.append("Metashape 退出码：%s；完成标记：%s" % (res["returncode"], "是" if res["done"] else "否"))
+    lines += ["", "精度说明：" + SURVEY_ACCURACY_NOTE,
+              "在 ContextCapture 里：新建工程 → 导入区块（Import blocks）选上面的 XML；照片都应找到、坐标系显示 %s、"
+              "不用再空三。" % (survey_srs_name(epsg) if epsg else "CGCS2000 3 度带")]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_survey_summary(path, rows):
+    """汇总 CSV：UTF-8 带 BOM、每格加引号（同批量迁移）。先写临时文件再替换。"""
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(SURVEY_CSV_FIELDS)
+        for r in rows:
+            w.writerow([r.get(k, "") for k in SURVEY_CSV_FIELDS])
+    os.replace(str(tmp), str(path))
+
+
+def _survey_row(it, dom_dsm):
+    row = dict((k, "") for k in SURVEY_CSV_FIELDS)
+    row.update({"序号": it["idx"], "工点": it["name"], "照片数": it["n"], "带定位张数": it["n_gps"],
+                "坐标系": survey_srs_label(it["epsg"]), "坐标系来源": it["epsg_src"] if it["epsg"] else "",
+                "DOM/DSM": "是" if dom_dsm else "否"})
+    return row
+
+
+def _survey_fill(row, rep):
+    r = survey_read_report(rep)
+    row.update({"对齐": r["对齐"], "相机参考误差RMS": r["相机参考误差RMS"].split("（")[0].strip(), "报告": str(rep)})
+    try:
+        lines = Path(rep).read_text(encoding="utf-8-sig").splitlines()
+        un = [ln for ln in lines if ln.startswith("未对齐照片：")]
+        row["未对齐数"] = 0 if un and un[0].endswith("无") else int(re.search(r"(\d+) 张", un[0]).group(1)) if un else ""
+        dd = [ln for ln in lines if ln.startswith("DOM/DSM：")]
+        if dd:
+            row["DOM/DSM"] = "是" if dd[0][len("DOM/DSM："):].startswith("是") else "否"
+    except (OSError, AttributeError, IndexError):
+        pass
+
+
+def run_survey_batch(items, out_dir, metashape, plan=False, dom_dsm=False, resolution=SURVEY_RESOLUTION,
+                     keypoints=SURVEY_KEYPOINTS, tiepoints=SURVEY_TIEPOINTS, log=None, progress=None, on_item=None,
+                     stop_event=None, summary=None, wait_poll=BATCH_WAIT_POLL, clip=SURVEY_CLIP_AUTO,
+                     clip_inset=SURVEY_CLIP_INSET, clip_file=None, clip_density=SURVEY_CLIP_DENSITY, **timeouts):
+    """按顺序处理 items（survey_scan 的结果里选中的）：已有结果 / 跳过的照写一行；待处理和用户勾上的定位不足串行调 survey_one。
+    本机有别的 Metashape 在跑就等；上次失败/已取消的工点重跑前旧结果目录改名保留（同 D-27）；取消时当前工点停下、剩下的不开始。
+    clip：auto（默认，DOM/DSM 自动裁边）/ none（同 v1.0）/ file（按 clip_file 的范围线裁）。
+    每个工点写一次汇总 CSV。返回 {"rows", "summary", "cancelled", "exit", "counts"}；exit：0 全部完成/部分对齐/跳过 / 1 有失败 / 3 取消。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    on_item = on_item or (lambda it, phase, text: None)
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    out_dir = Path(os.path.abspath(out_dir))
+    for it in items:
+        r = Path(os.path.abspath(it["dir"]))
+        if out_dir == r or r in out_dir.parents:
+            raise ValueError("输出目录不能放在照片目录里面（原片目录只读）：%s" % out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = Path(summary) if summary else out_dir / ("影像处理汇总_%s.csv" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    rows, cancelled = [], False
+    todo = [it for it in items if survey_runnable(it)]
+    log("—— 影像处理：选中 %d 个工点，其中要处理 %d 个%s；%s" % (
+        len(items), len(todo), "（只列计划）" if plan else "",
+        "出 XML + DOM/DSM（%s%s）" % ("分辨率 %g 米" % resolution if resolution else "分辨率自动",
+                                    "，自动裁边，往里收 %g 米、点云密度门槛 %g%%" % (clip_inset, clip_density) if dom_dsm and clip == SURVEY_CLIP_AUTO
+                                    else "，不裁边" if dom_dsm else "") if dom_dsm else "只出 XML"))
+    log("不去定位：照片 GPS 换算到各工点的 CGCS2000 3 度带作相机参考（%s）" % SURVEY_ACCURACY_NOTE)
+    log("输出目录：%s" % out_dir)
+    write_survey_summary(summary, rows)
+    for pos, it in enumerate(items, 1):
+        tag = "[%d/%d · 序号 %d] %s" % (pos, len(items), it["idx"], it["name"])
+        row = _survey_row(it, dom_dsm)
+        prev = None
+        if survey_runnable(it) and not plan:
+            state, rep, rdir = survey_result_state(out_dir, it["name"])  # 开跑前再看一次
+            if state == "done":
+                it["status"], it["report"] = "已有结果", str(rep)
+            elif state:
+                prev = (state, rdir)
+        if not survey_runnable(it):
+            row["状态"] = "跳过：已有结果" if it["status"] == "已有结果" else it["status"]
+            if it["report"]:
+                _survey_fill(row, it["report"])
+            log("%s → %s" % (tag, row["状态"]))
+            on_item(it, "done", it["status"])
+        elif plan:
+            row["状态"] = "计划运行"
+            log("%s（%d 张，带定位 %d）→ %s%s%s" % (
+                tag, it["n"], it["n_gps"], survey_srs_label(it["epsg"]) or "没有坐标系（会失败，请手动指定）",
+                "（%s）" % it["epsg_src"] if it["epsg"] else "", "；%s，旧结果目录会改名保留后重跑" % it["status"]
+                if it["status"] != SURVEY_TODO else ""))
+        else:
+            waited = False
+            while not stopped() and other_metashape_running():
+                if not waited:
+                    log("%s：本机已有别的 Metashape 在跑，等它结束（每 %d 秒看一次）… %s" % (
+                        tag, wait_poll, datetime.datetime.now().strftime("%H:%M")))
+                    on_item(it, "wait", "等待其他 Metashape")
+                    progress(0.0, "第 %d/%d 个 · 等待其他 Metashape" % (pos, len(items)))
+                    waited = True
+                if stop_event is not None:
+                    stop_event.wait(wait_poll)
+                else:
+                    time.sleep(wait_poll)
+            if stopped():
+                cancelled = True
+                on_item(it, "done", it["status"])
+                log("已取消：%s 及之后的 %d 个工点都没有开始" % (it["name"], len(items) - pos + 1))
+                break
+            log("")
+            log("%s → 开始（%d 张，%s）%s %s" % (tag, it["n"], survey_srs_label(it["epsg"]) or "没有坐标系",
+                                          "，定位不足（用户勾选）" if it["status"] == SURVEY_LOW_GPS else "",
+                                          datetime.datetime.now().strftime("%H:%M")))
+            on_item(it, "start", "运行中")
+            iprog = lambda f, s, pos=pos: progress(f, "第 %d/%d 个 · %s" % (pos, len(items), s))
+            t0 = time.time()
+            res = None
+            try:
+                if prev:
+                    batch_set_aside(prev[1], prev[0], log)
+                res = survey_one(it, survey_result_dir(out_dir, it["name"]), metashape, dom_dsm, resolution, keypoints,
+                                 tiepoints, log=log, progress=iprog, stop_event=stop_event, clip=clip,
+                                 clip_inset=clip_inset, clip_file=clip_file, clip_density=clip_density, **timeouts)
+                status = res["status"]
+            except ValueError as ex:
+                log("失败：%s" % ex)
+                status = "失败"
+            except (AlignCancelled, KeyboardInterrupt):
+                log("已取消")
+                status = "已取消"
+            row["耗时分钟"] = _fmt_minutes(time.time() - t0)
+            row["状态"] = status
+            rep = survey_result_dir(out_dir, it["name"]) / SURVEY_REPORT
+            if rep.is_file():
+                _survey_fill(row, rep)
+            it["status"] = status
+            log("  → %s  对齐 %s  相机参考误差 %s  用时 %s 分钟" % (status, row["对齐"] or "-", row["相机参考误差RMS"] or "-",
+                                                      row["耗时分钟"]))
+            on_item(it, "done", it["status"])
+            cancelled = status == "已取消" or stopped()
+        rows.append(row)
+        write_survey_summary(summary, rows)
+        if cancelled:
+            if pos < len(items):
+                log("已取消：剩下 %d 个工点没有开始" % (len(items) - pos))
+            break
+    log("")
+    log("汇总表：%s" % summary)
+    counts = {}
+    for r in rows:
+        counts[r["状态"]] = counts.get(r["状态"], 0) + 1
+    for st, c in counts.items():
+        log("  %s：%d 个" % (st, c))
+    code = 3 if cancelled else 1 if "失败" in counts else 0
+    return {"rows": rows, "summary": str(summary), "cancelled": cancelled, "exit": code, "counts": counts}
+
+
+# ---------------------------------------------------------------------------
 # 图形界面
 # ---------------------------------------------------------------------------
 
@@ -3218,14 +6554,84 @@ def run_gui():
     root.title("%s v%s" % (APP_NAME, APP_VERSION))
     def gui_exception(exc_type, exc_value, exc_tb):
         import traceback
-        messagebox.showerror(APP_NAME, "发生未处理错误，界面已恢复：\n%s" % "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        text = "发生未处理错误，界面已恢复：\n%s" % "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            ui_box.showerror(APP_NAME, text)
+        except Exception:  # 统一弹窗本身出错时退回系统弹窗
+            messagebox.showerror(APP_NAME, text)
     root.report_callback_exception = gui_exception
-    root.geometry("820x620")  # CTk 按屏幕缩放自动放大
     root.minsize(700, 540)
+    cfg0 = load_config()
 
-    def button(parent, text, command=None, primary=False, **kw):
+    # ---- 窗口（T10，D-30）：默认 1000×760、不超过屏幕可用区 90%；记住大小、位置、是否最大化 ----
+    # CTk 的 geometry() 读出来的宽高已去掉 DPI 缩放（逻辑尺寸），设进去时再乘缩放；位置是屏幕像素。
+    # 所以原样记 geometry() 的字符串，高分屏上不会越开越大。
+    import ctypes
+    from ctypes import wintypes
+
+    def work_area():
+        """主屏可用区（屏幕像素，去掉任务栏）：(左, 上, 右, 下)。"""
+        try:
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0):  # SPI_GETWORKAREA
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+    def on_screen(x, y, w):
+        """标题栏中间那一点在某个显示器上，才算没跑到屏幕外。"""
+        try:
+            f = ctypes.windll.user32.MonitorFromPoint
+            f.argtypes, f.restype = [wintypes.POINT, wintypes.DWORD], ctypes.c_void_p
+            return bool(f(wintypes.POINT(int(x + w / 2), int(y + 12)), 0))  # MONITOR_DEFAULTTONULL
+        except Exception:
+            l, t, r, b = work_area()
+            return l <= x + w / 2 < r and t <= y + 12 < b
+
+    win_scale = root._get_window_scaling()
+    wl, wt, wr, wb = work_area()
+    m_geo = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str((cfg0.get("window") or {}).get("geometry", "")))
+    if m_geo:  # 记住的大小：最多铺满可用区
+        w0, h0 = min(int(m_geo.group(1)), int((wr - wl) / win_scale)), min(int(m_geo.group(2)), int((wb - wt) / win_scale))
+    else:
+        w0, h0 = min(1000, int((wr - wl) * 0.9 / win_scale)), min(760, int((wb - wt) * 0.9 / win_scale))
+    w0, h0 = max(w0, 700), max(h0, 540)
+    if m_geo and on_screen(int(m_geo.group(3)), int(m_geo.group(4)), w0 * win_scale):
+        x0, y0 = int(m_geo.group(3)), int(m_geo.group(4))
+    else:  # 第一次打开，或记住的位置跑到屏幕外了（拔了副屏等）：居中
+        x0, y0 = wl + max(0, int((wr - wl - w0 * win_scale) / 2)), wt + max(0, int((wb - wt - h0 * win_scale) / 2) - 20)
+    win_state = {"normal": "%dx%d+%d+%d" % (w0, h0, x0, y0)}  # 菜单栏挂上之后再设（见「菜单」后面），否则高度被菜单栏吃掉一截
+
+    def track_geometry(ev):  # 记下没最大化时的大小位置；最大化着关窗也存这个
+        if ev.widget is root and root.state() == "normal":
+            win_state["normal"] = root.geometry()
+
+    warn = ("#E65100", "#EF6C00")  # 运行中可点的「取消」「中止」：橙色
+    warn_hover = ("#BF360C", "#E65100")
+    btn_colors = {
+        "primary": (ctk.ThemeManager.theme["CTkButton"]["fg_color"], ctk.ThemeManager.theme["CTkButton"]["hover_color"],
+                    ctk.ThemeManager.theme["CTkButton"]["text_color"]),
+        "secondary": (secondary["fg_color"], secondary["hover_color"], secondary["text_color"]),
+        "stop": (warn, warn_hover, ("white", "white")),
+    }
+    btn_off = {"primary": ("gray74", "gray33"), "stop": ("gray74", "gray33"), "secondary": ("gray90", "gray20")}
+    btn_off_text = ("gray50", "gray55")
+
+    def button(parent, text, command=None, primary=False, role=None, **kw):
+        """role：primary（蓝，「开始」等）/ secondary（灰）/ stop（「取消」「中止」，可点时橙色）。"""
         kw.setdefault("width", 72 if text == "浏览…" else 88)
-        return ctk.CTkButton(parent, text=text, command=command, **({} if primary else secondary), **kw)
+        on = kw.pop("state", "normal") != "disabled"
+        b = ctk.CTkButton(parent, text=text, command=command, **kw)
+        b.role = role or ("primary" if primary else "secondary")
+        set_btn(b, on)
+        return b
+
+    def set_btn(b, on):
+        """按钮可点/不可点一眼看得出：不可点时底色变灰、字变浅（T10 小毛病 1）。"""
+        fg, hover, text = btn_colors[b.role]
+        b.configure(state="normal" if on else "disabled", fg_color=fg if on else btn_off[b.role], hover_color=hover,
+                    text_color=text, text_color_disabled=btn_off_text)
 
     def spinbox(parent, var, from_, to, increment, width):
         """代替 ttk.Spinbox：输入框 + −/+ 按钮（上下方向键同样加减），范围和步长同原来。"""
@@ -3253,20 +6659,282 @@ def run_gui():
     def set_enabled(w, on):
         if isinstance(w, ctk.CTkLabel):
             w.configure(text_color=label_color if on else label_color_disabled)
+        elif isinstance(w, ctk.CTkButton):
+            set_btn(w, on)
         else:
             w.configure(state="normal" if on else "disabled")
 
-    def log_box(parent, height):
-        return ctk.CTkTextbox(parent, height=height, wrap="none", font=ctk.CTkFont(size=12))
+    # ---- 折行（T10 小毛病 4）：按像素宽度自己折，中文任意两字之间可断，英文词、数字、路径片段不拆 ----
+    wrap_tok = re.compile(r"[（《「『“‘(\[]*(?:[A-Za-z0-9_\-.,/\\:*%+#@&=~'\"|<>]+|\S)[，。；：、）》」』”’！？,.;:)\]…]*|\s+")
 
-    def nbsp(s):  # Tk 只在空格处折行，中文长句会整段挤到下一行；换成不换行空格后按字折行
-        return s.replace(" ", " ")
+    def wrap_text(text, font, width):
+        measure = lambda s: int(root.tk.call("font", "measure", font, s))
+        out = []
+        for para in text.split("\n"):
+            line = ""
+            for tok in wrap_tok.findall(para):
+                if line.strip() and measure(line + tok) > width:
+                    out.append(line.rstrip())
+                    line = tok.lstrip()
+                else:
+                    line += tok
+                while len(line) > 1 and measure(line) > width:  # 一个词比一行还长（长路径）：只好按字断
+                    k = len(line) - 1
+                    while k > 1 and measure(line[:k]) > width:
+                        k -= 1
+                    out.append(line[:k])
+                    line = line[k:]
+            out.append(line.rstrip())
+        return "\n".join(out)
+
+    def set_wrapped(lbl, text=None, width=None):
+        """CTkLabel 显示按宽度折好的文字；width 是屏幕像素，不给就用上次的。"""
+        if text is not None:
+            lbl.raw_text = text
+        if width is not None:
+            lbl.wrap_px = max(int(200 * win_scale), width)
+        lbl.configure(text=wrap_text(lbl.raw_text, lbl._label.cget("font"), lbl.wrap_px))
+        sync_forms()  # 说明文字行数变了，表单自然高度跟着变
 
     def hint(parent, text=""):
-        lbl = ctk.CTkLabel(parent, text=nbsp(text), text_color=hint_color, wraplength=640, justify="left", anchor="w")
-        parent.bind("<Configure>", lambda ev: lbl.configure(
-            wraplength=max(300, int(ev.width / lbl._get_widget_scaling()) - 24)), add="+")
+        lbl = ctk.CTkLabel(parent, text="", text_color=hint_color, justify="left", anchor="w")
+        set_wrapped(lbl, text, int(640 * win_scale))
+
+        def on_resize(ev):
+            w = ev.width - int(24 * win_scale)
+            if abs(w - lbl.wrap_px) > 2:
+                set_wrapped(lbl, width=w)
+        parent.bind("<Configure>", on_resize, add="+")
         return lbl
+
+    # ---- 统一弹窗（T10 小毛病 5）：信息/警告/错误/询问同一套 CTk 弹窗：左边圆形图标，右边文字，按钮靠右 ----
+    dialog_icons = {"info": (("#1565C0", "#42A5F5"), "i"), "warning": (("#E65100", "#FFA726"), "!"),
+                    "error": (("#C62828", "#EF5350"), "×"), "question": (("#1565C0", "#42A5F5"), "?")}
+
+    def dialog_icon(parent, kind):
+        color, sym = dialog_icons[kind]
+        return ctk.CTkLabel(parent, text=sym, width=34, height=34, corner_radius=17, fg_color=color,
+                            text_color="white", font=ctk.CTkFont(size=18, weight="bold"))
+
+    def show_modal(dlg, focus=None):
+        """弹窗放在主窗口中间偏上，模态，等它关掉。"""
+        dlg.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - dlg.winfo_reqheight()) // 3)
+        dlg.geometry("+%d+%d" % (x, y))
+        target = getattr(focus, "_entry", focus or dlg)
+
+        def take_focus():  # CTkToplevel 刚出来时会闪一下（换标题栏颜色/图标）把焦点弄丢，前一秒内多给几次
+            if dlg.winfo_exists() and dlg.focus_get() is not target:
+                dlg.lift()
+                target.focus_force()
+        for ms in (150, 400, 800):
+            dlg.after(ms, take_focus)
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        root.wait_window(dlg)
+
+    def dialog(kind, title, message, buttons, default=0, cancel=0):
+        """返回按下的按钮序号；关窗、Esc 返回 cancel；回车按 default。按钮从左到右照 buttons 的顺序，靠右放。"""
+        dlg = ctk.CTkToplevel(root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.transient(root)
+        res = {"i": cancel}
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=(18, 10))
+        dialog_icon(body, kind).pack(side="left", anchor="n", padx=(0, 14))
+        text = str(message)
+        if text.count("\n") > 22 or len(text) > 1600:  # 很长（如出错堆栈）：放可滚动的文本框
+            tb = ctk.CTkTextbox(body, width=520, height=320, wrap="word")
+            tb.insert("1.0", text)
+            tb.configure(state="disabled")
+            tb.pack(side="left", fill="both", expand=True)
+        else:
+            lbl = ctk.CTkLabel(body, text="", justify="left", anchor="nw")
+            set_wrapped(lbl, text, int(440 * win_scale))
+            lbl.pack(side="left", anchor="n", pady=(6, 0))
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 16))
+
+        def done(i):
+            res["i"] = i
+            dlg.destroy()
+
+        bs = []
+        for i, t in enumerate(buttons):
+            bs.append(ctk.CTkButton(row, text=t, width=88, command=lambda i=i: done(i), **({} if i == default else secondary)))
+        for b in reversed(bs):
+            b.pack(side="right", padx=(8, 0))
+        dlg.bind("<Return>", lambda ev: done(default))
+        dlg.bind("<Escape>", lambda ev: done(cancel))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: done(cancel))
+        dlg.ui_kind, dlg.ui_buttons = kind, bs  # 给 scripts/test_gui.py 看
+        show_modal(dlg)
+        return res["i"]
+
+    import types
+    ui_box = types.SimpleNamespace(  # 用法同 tkinter.messagebox（title, message）；scripts/test_gui.py 换成记录器
+        showinfo=lambda title, message, **kw: dialog("info", title, message, ["确定"]) and None,
+        showwarning=lambda title, message, **kw: dialog("warning", title, message, ["确定"]) and None,
+        showerror=lambda title, message, **kw: dialog("error", title, message, ["确定"]) and None,
+        askyesno=lambda title, message, icon="question", **kw: dialog(icon, title, message, ["是", "否"], 0, 1) == 0,
+    )
+    root.ui_box = ui_box
+
+    # ---- 日志区（T10，D-30）：每个页签上方表单、下方日志，中间一条可拖动的分隔条；窗口变大多出的高度全给日志 ----
+    LOG_MAX_LINES = 5000  # 日志框最多显示这么多行，超出的从头删；完整日志照旧写文件
+    log_tags = (("bad", ("失败", "拒绝"), ("#C62828", "#E57373")),
+                ("warn", ("跳过", "需人工核对"), ("#E65100", "#FFB74D")),
+                ("good", ("自动通过", "完成"), ("#2E7D32", "#81C784")))
+    log_zero = re.compile(r"(失败|跳过|拒绝)[^\d\n，,；;]{0,3}0(?![\d.])")  # 「失败 0」「跳过：0」这种不算
+    sash_color = ("gray78", "gray32")
+    log_font = ctk.CTkFont(size=min(18, max(10, int(cfg0.get("log_font_size") or 12))))
+    logs, panes = [], {}
+    pane_cfg = cfg0.get("panes") or {}
+
+    def log_tag(line):
+        s = log_zero.sub("", line)
+        for tag, words, _ in log_tags:
+            if any(w in s for w in words):
+                return tag
+        return None
+
+    def log_add(lg, s):
+        tb = lg["tb"]
+        for line in str(s).split("\n"):
+            tag = log_tag(line)
+            if tag:
+                tb.insert("end", line + "\n", tag)
+            else:
+                tb.insert("end", line + "\n")
+        n = int(tb.index("end-1c").split(".")[0]) - 1
+        if n > LOG_MAX_LINES:
+            tb.delete("1.0", "%d.0" % (n - LOG_MAX_LINES + 1))
+        if lg["auto"].get() and not lg["see"]:  # 一批日志只滚一次
+            lg["see"] = True
+            tb.after_idle(lambda: (lg.__setitem__("see", False), tb.see("end")))
+
+    def log_clear(lg):
+        lg["tb"].delete("1.0", "end")
+
+    def log_copy(lg):
+        root.clipboard_clear()
+        root.clipboard_append(lg["tb"].get("1.0", "end-1c"))
+
+    def log_set_file(lg, path):
+        lg["file"] = str(path) if path else None
+        log_refresh_open(lg)
+
+    def log_refresh_open(lg):
+        on = bool(lg["file"]) and os.path.isfile(lg["file"])
+        if on != (lg["b_open"].cget("state") == "normal"):
+            set_btn(lg["b_open"], on)
+
+    def log_open(lg):
+        if lg["file"] and os.path.isfile(lg["file"]):
+            os.startfile(lg["file"])
+
+    def log_min_height():
+        return (logs[0]["bar"].winfo_reqheight() if logs else int(30 * win_scale)) + \
+            int(3 * log_font.metrics("linespace") * ctk.ScalingTracker.get_widget_scaling(root)) + int(14 * win_scale)
+
+    def log_font_step(d):
+        n = min(18, max(10, log_font.cget("size") + d))
+        log_font.configure(size=n)
+        for lg in logs:
+            lg["size"].configure(text=str(n))
+        for p in panes.values():
+            p["pw"].paneconfigure(p["log"], minsize=log_min_height())
+
+    def apply_mode(mode=None):
+        i = 1 if (mode or ctk.get_appearance_mode()).lower() == "dark" else 0
+        try:
+            for p in panes.values():
+                p["pw"].configure(bg=sash_color[i])
+            for lg in logs:
+                for tag, _, c in log_tags:
+                    lg["tb"].tag_config(tag, foreground=c[i])
+        except tk.TclError:  # 窗口已经关了
+            pass
+
+    sync_state = {"pending": False}
+
+    def sync_forms():
+        """没被用户拖过分隔条的页签：表单那一格始终等于表单的自然高度（窗口变窄说明文字多折一行时不裁掉底下的按钮）。"""
+        def run():
+            sync_state["pending"] = False
+            root.update_idletasks()  # 先让说明文字的新行数算进表单的自然高度
+            for p in panes.values():
+                nat = p["form"].winfo_reqheight()
+                if p["h"] is None and nat > 1 and str(p["pw"].panecget(p["form"], "height")) != str(nat):
+                    p["pw"].paneconfigure(p["form"], height=nat)
+        if not sync_state["pending"]:
+            sync_state["pending"] = True
+            root.after(30, run)
+
+    def paned_tab(name):
+        """建一个页签：返回 (表单 frame, 日志 dict)。表单照旧用 grid 排；日志在分隔条下面。"""
+        t = nb.add(name)
+        bg = nb.cget("fg_color")  # 浅/深两色；t.cget 拿到的是当前模式的单色，换深色时不跟着变
+        pw = tk.PanedWindow(t, orient="vertical", bd=0, sashwidth=int(7 * win_scale), sashrelief="flat",
+                            sashcursor="sb_v_double_arrow", opaqueresize=True, showhandle=False)
+        pw.pack(fill="both", expand=True)
+        form = ctk.CTkFrame(pw, fg_color=bg, corner_radius=0)
+        logf = ctk.CTkFrame(pw, fg_color=bg, corner_radius=0)
+        lg = {"name": name, "file": None, "auto": tk.BooleanVar(value=True), "see": False}
+        bar = ctk.CTkFrame(logf, fg_color="transparent")
+        bar.pack(fill="x", pady=(4, 2))
+        ctk.CTkLabel(bar, text="日志", text_color=hint_color).pack(side="left", padx=(0, 8))
+        button(bar, "复制全部", lambda: log_copy(lg), width=72, height=24).pack(side="left")
+        button(bar, "清空", lambda: log_clear(lg), width=48, height=24).pack(side="left", padx=(4, 0))
+        lg["b_open"] = button(bar, "打开完整日志", lambda: log_open(lg), width=100, height=24, state="disabled")
+        lg["b_open"].pack(side="left", padx=(4, 0))
+        ctk.CTkCheckBox(bar, text="自动滚到底", variable=lg["auto"], checkbox_width=18, checkbox_height=18,
+                        command=lambda: lg["auto"].get() and lg["tb"].see("end")).pack(side="left", padx=(12, 0))
+        button(bar, "+", lambda: log_font_step(1), width=26, height=24).pack(side="right")
+        lg["size"] = ctk.CTkLabel(bar, text=str(log_font.cget("size")), width=26)
+        lg["size"].pack(side="right")
+        button(bar, "−", lambda: log_font_step(-1), width=26, height=24).pack(side="right")
+        ctk.CTkLabel(bar, text="字号", text_color=hint_color).pack(side="right", padx=(0, 4))
+        lg["bar"] = bar
+        lg["tb"] = ctk.CTkTextbox(logf, wrap="none", font=log_font)
+        lg["tb"].pack(fill="both", expand=True)
+        logs.append(lg)
+        pw.add(form, stretch="never", minsize=int(30 * win_scale))
+        pw.add(logf, stretch="always", minsize=log_min_height())
+        h = pane_cfg.get(name)
+        h = h if isinstance(h, (int, float)) and h > 0 else None
+        if h:  # 记住的分隔条位置（逻辑像素，即表单那一格的高度）
+            pw.paneconfigure(form, height=int(h * ctk.ScalingTracker.get_widget_scaling(root)))
+        p = {"pw": pw, "form": form, "log": logf, "h": h}  # h：用户拖定的表单高度（逻辑像素）；None＝跟着表单内容走
+
+        def on_sash_release(ev):  # 拖完分隔条：记下表单高度；拖回表单自然高度附近就当没拖过
+            if not pw.winfo_ismapped():
+                return
+            form.update_idletasks()
+            y, nat = pw.sash_coord(0)[1], form.winfo_reqheight()
+            p["h"] = None if abs(y - nat) <= int(4 * win_scale) else round(y / ctk.ScalingTracker.get_widget_scaling(root))
+            sync_forms()
+        pw.bind("<ButtonRelease-1>", on_sash_release, add="+")
+        panes[name] = p
+        apply_mode()
+        sync_forms()
+        return form, lg
+
+    def remember_window():
+        """关窗前把窗口大小、位置、是否最大化、各页签分隔条、日志字号写进 config.json。"""
+        cfg = load_config()
+        cfg["window"] = {"geometry": root.geometry() if root.state() == "normal" else win_state["normal"],
+                         "zoomed": root.state() == "zoomed"}
+        cfg["panes"] = {name: p["h"] for name, p in panes.items() if p["h"]}
+        cfg["log_font_size"] = log_font.cget("size")
+        save_config(cfg)
+
+    root.ui_t10 = {"logs": logs, "panes": panes, "log_add": log_add}  # 给 scripts/test_gui.py 查日志区和分隔条
 
     # ---- 菜单：外观（跟随系统 / 浅色 / 深色）；帮助 → 检查更新 / 项目主页 ----
     import webbrowser
@@ -3290,13 +6958,13 @@ def run_gui():
                 return
             if err is not None:
                 if manual:
-                    messagebox.showwarning(APP_NAME, "检查更新失败（可能没联网或打不开 GitHub）：\n%s" % err)
+                    ui_box.showwarning(APP_NAME, "检查更新失败（可能没联网或打不开 GitHub）：\n%s" % err)
             elif info["newer"]:
                 msg = "发现新版本 v%s（当前 v%s）。\n\n%s\n\n打开下载页面？" % (info["latest"], APP_VERSION, info["notes"][:600])
-                if messagebox.askyesno(APP_NAME + " - 有新版本", msg):
+                if ui_box.askyesno(APP_NAME + " - 有新版本", msg):
                     webbrowser.open(info["url"])
             elif manual:
-                messagebox.showinfo(APP_NAME, "已经是最新版本（v%s）。" % APP_VERSION)
+                ui_box.showinfo(APP_NAME, "已经是最新版本（v%s）。" % APP_VERSION)
 
         threading.Thread(target=worker, daemon=True).start()
         root.after(300, poll_update)
@@ -3323,18 +6991,24 @@ def run_gui():
     m_help.add_checkbutton(label="启动时自动检查更新", variable=var_auto_update, command=toggle_auto_update)
     m_help.add_separator()
     m_help.add_command(label="项目主页（GitHub）", command=lambda: webbrowser.open(HOMEPAGE_URL))
-    m_help.add_command(label="关于", command=lambda: messagebox.showinfo(
+    m_help.add_command(label="关于", command=lambda: ui_box.showinfo(
         APP_NAME, "%s v%s\n开源许可：MIT\n界面库：CustomTkinter（MIT）\n%s" % (APP_NAME, APP_VERSION, HOMEPAGE_URL)))
     menubar.add_cascade(label="帮助", menu=m_help)
     root.config(menu=menubar)
+    root.update_idletasks()  # 先让菜单栏占好位置再设大小，不然高度少一截、每次打开越来越矮
+    root.geometry(win_state["normal"])
+    root.bind("<Configure>", track_geometry, add="+")
+    if (cfg0.get("window") or {}).get("zoomed"):
+        root.after(300, lambda: root.state("zoomed"))
     if var_auto_update.get():
         root.after(1500, start_update_check)
 
     nb = ctk.CTkTabview(root, anchor="nw")
     nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    ctk.AppearanceModeTracker.add(apply_mode, root)  # 换浅色/深色时分隔条和日志着色跟着换
 
     # ---- 页签 1：剔除定位 ----
-    tab = nb.add("剔除定位")
+    tab, lg1 = paned_tab("剔除定位")
     tab.columnconfigure(1, weight=1)
 
     v_src = tk.StringVar()
@@ -3398,22 +7072,17 @@ def run_gui():
     lbl_prog.grid(row=0, column=1, padx=6)
     btn_start = button(bar, "开始", primary=True)
     btn_start.grid(row=0, column=2)
-    btn_stop = button(bar, "中止", state="disabled")
+    btn_stop = button(bar, "中止", role="stop", state="disabled")
     btn_stop.grid(row=0, column=3, padx=(6, 0))
     btn_restore = button(bar, "从备份还原", width=100)
     btn_restore.grid(row=0, column=4, padx=(6, 0))
 
-    txt = log_box(tab, 220)
-    txt.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-    tab.rowconfigure(5, weight=1)
-
     def append_log(s):
-        txt.insert("end", s + "\n")
-        txt.see("end")
+        log_add(lg1, s)
 
     def poll():
         try:
-            while True:
+            for _ in range(500):  # 一次最多处理这么多条，别让界面卡住
                 kind, val = q.get_nowait()
                 if kind == "log":
                     append_log(val)
@@ -3422,83 +7091,85 @@ def run_gui():
                     pb.set(i / max(n, 1))
                     lbl_prog.configure(text="%d / %d" % (i, n))
                 elif kind == "done":
-                    btn_start.configure(state="normal")
-                    btn_stop.configure(state="disabled")
+                    set_btn(btn_start, True)
+                    set_btn(btn_stop, False)
                     if isinstance(val, Exception):
                         append_log("出错：%s" % val)
-                        messagebox.showerror(APP_NAME, str(val))
+                        ui_box.showerror(APP_NAME, str(val))
                     else:
+                        log_set_file(lg1, val.get("日志"))
                         residual_count = val.get("残留", 0)
                         msg = "完成：成功 %d，跳过 %d，失败 %d 张、残留 %d 个文件\n日志路径：%s" % (val["成功"], val["跳过"], val.get("失败", 0), residual_count, val["日志"])
-                        (messagebox.showwarning if val.get("失败", 0) or residual_count else messagebox.showinfo)(APP_NAME, msg)
+                        (ui_box.showwarning if val.get("失败", 0) or residual_count else ui_box.showinfo)(APP_NAME, msg)
         except queue.Empty:
             pass
         root.after(100, poll)
 
     def ask_inplace_confirm(count, message=None, prompt=None):
         """原地抹除确认框（警示色）：须输入照片目录名；取消/关窗返回 None，确认返回输入的文字（同 askstring）。
-        message/prompt 不给就用「剔除定位」页签的文字。"""
+        message/prompt 不给就用「剔除定位」页签的文字。版式同统一弹窗（图标在左、按钮靠右）；
+        焦点在输入框，回车不确认，必须点「确认抹除」（T10 小毛病 2）。"""
         dlg = ctk.CTkToplevel(root)
         dlg.title(APP_NAME + " - 警告：不可恢复")
         dlg.resizable(False, False)
         dlg.transient(root)
         result = {"text": None}
         v_name = tk.StringVar()
-        ctk.CTkLabel(dlg, text="⚠ 警告：不可恢复！", text_color=danger,
-                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=20, pady=(18, 4))
-        ctk.CTkLabel(dlg, text=message or "会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。" % count, text_color=danger,
-                     font=ctk.CTkFont(weight="bold"), wraplength=440, justify="left").pack(anchor="w", padx=20, pady=4)
-        ctk.CTkLabel(dlg, text=prompt or "请输入照片目录的名字（不是完整路径）以确认：").pack(anchor="w", padx=20, pady=(8, 2))
-        ent = ctk.CTkEntry(dlg, textvariable=v_name, width=440, border_color=danger)
-        ent.pack(padx=20, pady=(0, 12))
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=(18, 10))
+        dialog_icon(body, "error").pack(side="left", anchor="n", padx=(0, 14))
+        col = ctk.CTkFrame(body, fg_color="transparent")
+        col.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(col, text="⚠ 警告：不可恢复！", text_color=danger,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 4))
+        lbl = ctk.CTkLabel(col, text="", text_color=danger, font=ctk.CTkFont(weight="bold"), justify="left", anchor="w")
+        set_wrapped(lbl, message or "会直接修改 %d 张原照片，定位信息删除后不能从照片里找回。" % count, int(440 * win_scale))
+        lbl.pack(anchor="w", pady=4)
+        ctk.CTkLabel(col, text=prompt or "请输入照片目录的名字（不是完整路径）以确认：").pack(anchor="w", pady=(8, 2))
+        ent = ctk.CTkEntry(col, textvariable=v_name, width=440, border_color=danger)
+        ent.pack(anchor="w")
 
         def ok():
             result["text"] = v_name.get()
             dlg.destroy()
 
         row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row.pack(fill="x", padx=20, pady=(0, 18))
-        button(row, "取消", dlg.destroy).pack(side="right")
+        row.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(row, text="取消", width=88, command=dlg.destroy, **secondary).pack(side="right", padx=(8, 0))
         ctk.CTkButton(row, text="确认抹除", width=100, command=ok, fg_color=danger,
-                      hover_color=danger_hover).pack(side="right", padx=(0, 8))
-        ent.bind("<Return>", lambda ev: ok())
+                      hover_color=danger_hover).pack(side="right", padx=(8, 0))
+        ent.bind("<Return>", lambda ev: "break")  # 回车不确认
         dlg.bind("<Escape>", lambda ev: dlg.destroy())
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        dlg.after(150, lambda: (dlg.lift(), dlg.focus_force(), ent.focus_set()))
-        try:
-            dlg.wait_visibility()
-            dlg.grab_set()
-        except tk.TclError:
-            pass
-        root.wait_window(dlg)
+        show_modal(dlg, ent)
         return result["text"]
 
     def start():
         src, dst = v_src.get().strip(), v_dst.get().strip()
         if not src:
-            messagebox.showwarning(APP_NAME, "请先选择输入目录")
+            ui_box.showwarning(APP_NAME, "请先选择输入目录")
             return
         rec, att, inplace, backup = v_rec.get(), v_att.get(), v_inplace.get(), v_backup.get()
         confirm = None
         if inplace:
             count = sum(1 for p in collect_files(src, rec) if p.suffix.lower() in JPEG_EXTS)
             if not v_backup.get():
-                if not messagebox.askyesno(APP_NAME + " - 警告：不可恢复", "已关闭定位备份，抹除后无法还原。仍要继续吗？"):
+                if not ui_box.askyesno(APP_NAME + " - 警告：不可恢复", "已关闭定位备份，抹除后无法还原。仍要继续吗？", icon="warning"):
                     return
             confirm = ask_inplace_confirm(count)
             if confirm is None:
                 return
             if confirm != Path(src).name:
-                messagebox.showwarning(APP_NAME, "确认目录名不正确，未修改任何文件")
+                ui_box.showwarning(APP_NAME, "确认目录名不正确，未修改任何文件")
                 return
         else:
             if not dst:
                 dst = str(default_output_dir(src)); v_dst.set(dst)
             err = check_dirs(src, dst)
             if err:
-                messagebox.showwarning(APP_NAME, err); return
-        txt.delete("1.0", "end"); pb.set(0)
-        btn_start.configure(state="disabled"); btn_stop.configure(state="normal")
+                ui_box.showwarning(APP_NAME, err); return
+        log_clear(lg1); log_set_file(lg1, None); pb.set(0)
+        set_btn(btn_start, False); set_btn(btn_stop, True)
         stop = threading.Event(); state["stop"] = stop
 
         def work():
@@ -3522,23 +7193,24 @@ def run_gui():
     def restore_start():
         src = v_src.get().strip()
         if not src:
-            messagebox.showwarning(APP_NAME, "请先选择照片目录"); return
+            ui_box.showwarning(APP_NAME, "请先选择照片目录"); return
         backup = filedialog.askopenfilename(title="选择定位备份", filetypes=[("ZIP", "*.zip")])
         if not backup: return
-        if not messagebox.askyesno(APP_NAME + " - 确认还原", "将直接修改原照片并写回定位信息，确定继续吗？"):
+        if not ui_box.askyesno(APP_NAME + " - 确认还原", "将直接修改原照片并写回定位信息，确定继续吗？", icon="warning"):
             return
         try:
             res = restore_gps(src, backup, v_rec.get(), log=append_log)
+            log_set_file(lg1, res["日志"])
             msg = "还原完成：成功 %d，跳过 %d，失败 %d\n日志：%s" % (res["成功"], res["跳过"], res["失败"], res["日志"])
-            (messagebox.showwarning if res["失败"] else messagebox.showinfo)(APP_NAME, msg)
+            (ui_box.showwarning if res["失败"] else ui_box.showinfo)(APP_NAME, msg)
         except Exception as ex:
-            messagebox.showerror(APP_NAME, str(ex))
+            ui_box.showerror(APP_NAME, str(ex))
     btn_start.configure(command=start)
     btn_stop.configure(command=lambda: state["stop"] and state["stop"].set())
     btn_restore.configure(command=restore_start)
 
     # ---- 页签 2：空三 ----
-    tab2 = nb.add("空三")
+    tab2, lg2 = paned_tab("空三")
     tab2.columnconfigure(1, weight=1)
     v_ms = tk.StringVar(value=find_metashape())
     v_pdir = tk.StringVar()
@@ -3601,36 +7273,32 @@ def run_gui():
     lbl2.grid(row=0, column=1, padx=6)
     btn2_start = button(bar2, "开始", primary=True)
     btn2_start.grid(row=0, column=2)
-    btn2_stop = button(bar2, "取消", state="disabled")
+    btn2_stop = button(bar2, "取消", role="stop", state="disabled")
     btn2_stop.grid(row=0, column=3, padx=(6, 0))
-
-    txt2 = log_box(tab2, 180)
-    txt2.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-    tab2.rowconfigure(7, weight=1)
 
     def poll2():
         try:
-            while True:
+            for _ in range(500):
                 kind, val = q2.get_nowait()
                 if kind == "log":
-                    txt2.insert("end", val + "\n")
-                    txt2.see("end")
+                    log_add(lg2, val)
                 elif kind == "prog":
                     pb2.set(int(val[0] * 1000) / 1000)
                     lbl2.configure(text=val[1][:30])
                 elif kind == "done":
-                    btn2_start.configure(state="normal")
-                    btn2_stop.configure(state="disabled")
+                    set_btn(btn2_start, True)
+                    set_btn(btn2_stop, False)
                     if isinstance(val, AlignCancelled):
                         lbl2.configure(text="已取消")
-                        messagebox.showwarning(APP_NAME, "已取消。输出目录里的结果不完整，不要使用。")
+                        ui_box.showwarning(APP_NAME, "已取消。输出目录里的结果不完整，不要使用。")
                     elif isinstance(val, Exception):
                         lbl2.configure(text="失败")
-                        txt2.insert("end", "出错：%s\n" % val)
-                        txt2.see("end")
-                        messagebox.showerror(APP_NAME, str(val))
+                        log_add(lg2, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
                     else:
                         ok = [r for r in val if r["status"] == "成功"]
+                        logs2 = [Path(r["out_dir"]) / "metashape_日志.txt" for r in val if r.get("out_dir")]
+                        log_set_file(lg2, next((f for f in reversed(logs2) if f.is_file()), None))
                         lines = []
                         for r in val:
                             a = "，对齐 %s/%s" % (r["aligned"], r["total"]) if r["aligned"] is not None else ""
@@ -3638,7 +7306,7 @@ def run_gui():
                                                        "\n  " + r["reason"] if r["reason"] else ""))
                         full = len(ok) == len(val) and all(r["aligned"] == r["total"] for r in ok)
                         lbl2.configure(text="完成" if len(ok) == len(val) else "有失败")
-                        (messagebox.showinfo if full else messagebox.showwarning)(
+                        (ui_box.showinfo if full else ui_box.showwarning)(
                             APP_NAME, "成功 %d / 共 %d 个工程\n\n%s" % (len(ok), len(val), "\n".join(lines)))
         except queue.Empty:
             pass
@@ -3648,25 +7316,26 @@ def run_gui():
         ms, pdir, out = v_ms.get().strip(), v_pdir.get().strip(), v_out.get().strip()
         err = check_metashape(ms)
         if err:
-            messagebox.showwarning(APP_NAME, err)
+            ui_box.showwarning(APP_NAME, err)
             return
         if not pdir:
-            messagebox.showwarning(APP_NAME, "请先选择照片目录")
+            ui_box.showwarning(APP_NAME, "请先选择照片目录")
             return
         try:
             kp, tp = int(v_kp.get()), int(v_tp.get())
         except ValueError:
-            messagebox.showwarning(APP_NAME, "关键点上限、连接点上限要填整数")
+            ui_box.showwarning(APP_NAME, "关键点上限、连接点上限要填整数")
             return
         cfg = load_config()
         cfg["metashape"] = ms
         save_config(cfg)
         acc = {"高": "high", "中": "medium", "低": "low"}[v_acc.get()]
-        txt2.delete("1.0", "end")
+        log_clear(lg2)
+        log_set_file(lg2, None)
         pb2.set(0)
         lbl2.configure(text="")
-        btn2_start.configure(state="disabled")
-        btn2_stop.configure(state="normal")
+        set_btn(btn2_start, False)
+        set_btn(btn2_stop, True)
         stop = threading.Event()
         st2["stop"] = stop
         rec, auto = v_arec.get(), v_auto.get()
@@ -3694,7 +7363,7 @@ def run_gui():
     root.after(200, poll2)
 
     # ---- 页签 3：控制点（D-16、D-17） ----
-    tab3 = nb.add("控制点")
+    tab3, lg3 = paned_tab("控制点")
     tab3.columnconfigure(1, weight=1)
     cfg3 = load_config()
     v3_mode = tk.StringVar(value="transfer")
@@ -3781,7 +7450,7 @@ def run_gui():
         for mode, ws in mode_widgets:
             for w in ws:
                 set_enabled(w, mode == m)
-        lbl3_help.configure(text=nbsp(helps[m]))
+        set_wrapped(lbl3_help, helps[m])
 
     v3_mode.trace_add("write", on_mode)
     on_mode()
@@ -3796,35 +7465,32 @@ def run_gui():
     lbl3.grid(row=0, column=1, padx=6)
     btn3_start = button(bar3, "开始", primary=True)
     btn3_start.grid(row=0, column=2)
-    btn3_stop = button(bar3, "取消", state="disabled")
+    btn3_stop = button(bar3, "取消", role="stop", state="disabled")
     btn3_stop.grid(row=0, column=3, padx=(6, 0))
-    txt3 = log_box(tab3, 110)
-    txt3.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
-    tab3.rowconfigure(12, weight=1)
 
     def poll3():
         try:
-            while True:
+            for _ in range(500):
                 kind, val = q3.get_nowait()
                 if kind == "log":
-                    txt3.insert("end", val + "\n")
-                    txt3.see("end")
+                    log_add(lg3, val)
                 elif kind == "prog":
                     pb3.set(int(val[0] * 1000) / 1000)
                     lbl3.configure(text=val[1][:30])
                 elif kind == "done":
-                    btn3_start.configure(state="normal")
-                    btn3_stop.configure(state="disabled")
+                    set_btn(btn3_start, True)
+                    set_btn(btn3_stop, False)
                     if isinstance(val, AlignCancelled):
                         lbl3.configure(text="已取消")
-                        messagebox.showwarning(APP_NAME, "已取消。输出目录里的结果不完整，不要使用。")
+                        ui_box.showwarning(APP_NAME, "已取消。输出目录里的结果不完整，不要使用。")
                     elif isinstance(val, Exception):
                         lbl3.configure(text="失败")
-                        txt3.insert("end", "出错：%s\n" % val)
-                        txt3.see("end")
-                        messagebox.showerror(APP_NAME, str(val))
+                        log_add(lg3, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
                     else:
                         r = val
+                        if r.get("out_dir") and (Path(r["out_dir"]) / "metashape_日志.txt").is_file():
+                            log_set_file(lg3, Path(r["out_dir"]) / "metashape_日志.txt")
                         lbl3.configure(text=r["status"])
                         head = "判定：%s" % r["status"]
                         body = ["输出：%s" % r["out_dir"]]
@@ -3843,14 +7509,14 @@ def run_gui():
                         if auto:
                             body.insert(0, "%s 号细化挪动过大，已自动排除（改作检查点）" % "、".join(auto))
                         if r["status"] == "自动通过" and not r["unaligned"]:
-                            messagebox.showinfo(APP_NAME, "\n".join([head] + body))
+                            ui_box.showinfo(APP_NAME, "\n".join([head] + body))
                         elif r["status"] in ("自动通过", "需人工核对"):
                             extra = ["%s 号：%s" % (n, "；".join(w)) for n, w in r["bad"]]
                             if extra:
                                 extra.insert(0, "\n需人工核对的点（处理步骤见 控制点报告.txt）：")
-                            messagebox.showwarning(APP_NAME + " - " + r["status"], "\n".join([head] + body + extra))
+                            ui_box.showwarning(APP_NAME + " - " + r["status"], "\n".join([head] + body + extra))
                         else:
-                            messagebox.showerror(APP_NAME, "%s\n%s\n\n%s" % (head, r["reason"], "\n".join(body)))
+                            ui_box.showerror(APP_NAME, "%s\n%s\n\n%s" % (head, r["reason"], "\n".join(body)))
         except queue.Empty:
             pass
         root.after(200, poll3)
@@ -3860,21 +7526,21 @@ def run_gui():
         ms = v3_ms.get().strip()
         err = check_metashape(ms)
         if err:
-            messagebox.showwarning(APP_NAME, err)
+            ui_box.showwarning(APP_NAME, err)
             return
         try:
             acc = _check_gcp_accuracy(v3_acc.get().strip())
             shift = _check_max_shift(v3_shift.get().strip())
         except ValueError as ex:
-            messagebox.showwarning(APP_NAME, str(ex))
+            ui_box.showwarning(APP_NAME, str(ex))
             return
         excl = parse_exclude(v3_excl.get())
         ref, pdir, psx, csvp, ccp, out = (v.get().strip() for v in (v3_ref, v3_pdir, v3_psx, v3_csv, v3_cc, v3_out))
         if mode == "transfer" and (not ref or not pdir):
-            messagebox.showwarning(APP_NAME, "请选择参考期工程和新一期照片目录")
+            ui_box.showwarning(APP_NAME, "请选择参考期工程和新一期照片目录")
             return
         if mode == "init" and (not psx or not csvp):
-            messagebox.showwarning(APP_NAME, "请选择空三工程和控制点 CSV")
+            ui_box.showwarning(APP_NAME, "请选择空三工程和控制点 CSV")
             return
         cfg = load_config()
         cfg["metashape"] = ms
@@ -3883,11 +7549,12 @@ def run_gui():
         else:
             cfg["gcp_csv"] = csvp
         save_config(cfg)
-        txt3.delete("1.0", "end")
+        log_clear(lg3)
+        log_set_file(lg3, None)
         pb3.set(0)
         lbl3.configure(text="")
-        btn3_start.configure(state="disabled")
-        btn3_stop.configure(state="normal")
+        set_btn(btn3_start, False)
+        set_btn(btn3_stop, True)
         stop = threading.Event()
         st3["stop"] = stop
         auto = v3_auto.get()
@@ -3917,7 +7584,7 @@ def run_gui():
     root.after(200, poll3)
 
     # ---- 页签 4：批量迁移（D-24）：扫描上级目录 → 按规则表配参考期 → 筛选勾选 → 一期接一期跑 ----
-    tab4 = nb.add("批量迁移")
+    tab4, lg4 = paned_tab("批量迁移")
     tab4.columnconfigure(1, weight=1)
     cfg4 = load_config()
     v4_root = tk.StringVar(value=cfg4.get("batch_root", ""))
@@ -4044,7 +7711,8 @@ def run_gui():
     lbl4_count = ctk.CTkLabel(tb4, text="", text_color=hint_color)
     lbl4_count.pack(side="left", padx=(10, 0))
 
-    lst4 = ctk.CTkScrollableFrame(tab4, height=150)
+    lst4 = ctk.CTkScrollableFrame(tab4, height=90)  # 默认矮一点把高度让给日志；往下拖分隔条时列表跟着变高（这一行 weight=1）
+    lst4._scrollbar.configure(height=60)  # CTk 竖滚动条默认要 200 高，会把列表撑高（customtkinter 版本钉死 5.2.2）
     lst4.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
     lst4.columnconfigure(6, weight=1)
     tab4.rowconfigure(7, weight=1)
@@ -4133,20 +7801,20 @@ def run_gui():
     def scan4():
         root_dir, out = v4_root.get().strip(), v4_out.get().strip()
         if not root_dir or not out:
-            messagebox.showwarning(APP_NAME, "请选择照片上级目录和输出目录")
+            ui_box.showwarning(APP_NAME, "请选择照片上级目录和输出目录")
             return
         rules = rules_now()
         if not any(r["key"] for r in rules):
-            messagebox.showwarning(APP_NAME, "规则表至少要有一条带关键词的规则")
+            ui_box.showwarning(APP_NAME, "规则表至少要有一条带关键词的规则")
             return
         errs = check_batch_rules(rules)
         if errs:
-            messagebox.showwarning(APP_NAME, "\n".join(errs))
+            ui_box.showwarning(APP_NAME, "\n".join(errs))
             return
         try:
             items = batch_scan(root_dir, rules, os.path.abspath(out), skip=_split_names(v4_skip.get()))
         except (ValueError, OSError) as ex:
-            messagebox.showwarning(APP_NAME, str(ex))
+            ui_box.showwarning(APP_NAME, str(ex))
             return
         save4()
         st4["items"], st4["scanned"] = items, scan_key()
@@ -4180,22 +7848,16 @@ def run_gui():
     lbl4.grid(row=0, column=1, padx=6)
     btn4_start = button(bar4, "开始", primary=True)
     btn4_start.grid(row=0, column=2)
-    btn4_stop = button(bar4, "取消", state="disabled")
+    btn4_stop = button(bar4, "取消", role="stop", state="disabled")
     btn4_stop.grid(row=0, column=3, padx=(6, 0))
-    txt4 = log_box(tab4, 70)
-    txt4.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
-    LOG4_KEEP = 1500  # 日志框只留最近这么多行，完整日志在输出目录的 批量迁移日志_<时间>.txt
 
     def poll4():
         try:
             for _ in range(500):  # 一次最多处理这么多条，别让界面卡住
                 kind, val = q4.get_nowait()
                 if kind == "log":
-                    txt4.insert("end", val + "\n")
-                    n = int(txt4.index("end-1c").split(".")[0])
-                    if n > LOG4_KEEP:
-                        txt4.delete("1.0", "%d.0" % (n - LOG4_KEEP))
-                    txt4.see("end")
+                    log_add(lg4, val)  # 日志框只留最近 5000 行，完整日志在输出目录的 批量迁移日志_<时间>.txt
+                    log_refresh_open(lg4)
                 elif kind == "prog":
                     pb4.set(int(val[0] * 1000) / 1000)
                     lbl4.configure(text=val[1][:44])
@@ -4206,19 +7868,19 @@ def run_gui():
                             set_row_status(r, text)
                     update_count()
                 elif kind == "done":
-                    btn4_start.configure(state="normal")
-                    btn4_scan.configure(state="normal")
-                    btn4_stop.configure(state="disabled")
+                    set_btn(btn4_start, True)
+                    set_btn(btn4_scan, True)
+                    set_btn(btn4_stop, False)
                     st4["scanned"] = None  # 状态都变了，再跑要先重新扫描
                     st4["running"] = False
                     if st4["closing"]:  # 用户点了关窗口：当前这一期已停好，现在关
+                        remember_window()
                         root.destroy()
                         return
                     if isinstance(val, Exception):
                         lbl4.configure(text="失败")
-                        txt4.insert("end", "出错：%s\n" % val)
-                        txt4.see("end")
-                        messagebox.showerror(APP_NAME, str(val))
+                        log_add(lg4, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
                         continue
                     res, logf = val
                     body = ["%s：%d 期" % kv for kv in res["counts"].items()]
@@ -4236,12 +7898,12 @@ def run_gui():
                         if last and last["状态"] == "已取消":
                             body.append("\n被取消的「%s」结果不完整，不要使用；重新扫描会显示「待运行（上次已取消）」，"
                                         "重跑时旧结果目录改名保留。" % last["期次"])
-                        messagebox.showwarning(APP_NAME + " - 已取消",
+                        ui_box.showwarning(APP_NAME + " - 已取消",
                                                "已取消：已完成的期次结果都保留，剩下的没有开始。\n\n" + "\n".join(body))
                     else:
                         lbl4.configure(text="完成")
                         bad = res["exit"] != 0
-                        (messagebox.showwarning if bad else messagebox.showinfo)(
+                        (ui_box.showwarning if bad else ui_box.showinfo)(
                             APP_NAME + " - 批量迁移完成", ("有需人工核对或失败的期次，详见汇总表和各期的控制点报告.txt。\n\n"
                                                     if bad else "") + "\n".join(body))
         except queue.Empty:
@@ -4250,19 +7912,19 @@ def run_gui():
 
     def start4():
         if not st4["items"] or st4["scanned"] is None:
-            messagebox.showwarning(APP_NAME, "请先点「扫描」")
+            ui_box.showwarning(APP_NAME, "请先点「扫描」")
             return
         if scan_key() != st4["scanned"]:
-            messagebox.showwarning(APP_NAME, "目录或规则表在扫描后改过了，请先重新扫描")
+            ui_box.showwarning(APP_NAME, "目录或规则表在扫描后改过了，请先重新扫描")
             return
         ms = v4_ms.get().strip()
         err = check_metashape(ms)
         if err:
-            messagebox.showwarning(APP_NAME, err)
+            ui_box.showwarning(APP_NAME, err)
             return
         chosen = [r["item"] for r in st4["rows"] if r["var"].get()]
         if not any(it["status"].startswith("待运行") for it in chosen):
-            messagebox.showwarning(APP_NAME, "勾选的期次里没有「待运行」的")
+            ui_box.showwarning(APP_NAME, "勾选的期次里没有「待运行」的")
             return
         out = os.path.abspath(v4_out.get().strip())
         mode, root_dir, confirm = v4_mode.get(), v4_root.get().strip(), None
@@ -4277,24 +7939,25 @@ def run_gui():
             if confirm is None:
                 return
             if confirm != Path(os.path.abspath(root_dir)).name:
-                messagebox.showwarning(APP_NAME, "确认名不正确，未修改任何文件")
+                ui_box.showwarning(APP_NAME, "确认名不正确，未修改任何文件")
                 return
             try:
                 check_batch_in_place(root_dir, chosen, confirm)
             except ValueError as ex:
-                messagebox.showwarning(APP_NAME, str(ex))
+                ui_box.showwarning(APP_NAME, str(ex))
                 return
         save4()
-        txt4.delete("1.0", "end")
+        log_clear(lg4)
         pb4.set(0)
         lbl4.configure(text="")
-        btn4_start.configure(state="disabled")
-        btn4_scan.configure(state="disabled")
-        btn4_stop.configure(state="normal")
+        set_btn(btn4_start, False)
+        set_btn(btn4_scan, False)
+        set_btn(btn4_stop, True)
         stop = threading.Event()
         st4["stop"] = stop
         st4["running"] = True
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_set_file(lg4, Path(out) / ("批量迁移日志_%s.txt" % stamp))  # 文件建好后「打开完整日志」变可点
 
         def work():
             logf = Path(out) / ("批量迁移日志_%s.txt" % stamp)
@@ -4323,13 +7986,14 @@ def run_gui():
 
     def on_close():  # 跑批时误点关窗口：先问，确认后停在当前这一期，停好再关
         if not st4["running"]:
+            remember_window()
             root.destroy()
             return
         if st4["closing"]:
             return
-        if messagebox.askyesno(APP_NAME + " - 批量迁移正在运行",
+        if ui_box.askyesno(APP_NAME + " - 批量迁移正在运行",
                                "批量迁移正在运行。关掉窗口会停在当前这一期：当前这一期取消（结果不完整，下次扫描显示"
-                               "「待运行（上次已取消）」可重跑），剩下的不开始。\n\n确定要停止并关闭吗？"):
+                               "「待运行（上次已取消）」可重跑），剩下的不开始。\n\n确定要停止并关闭吗？", icon="warning"):
             st4["closing"] = True
             stop4()
             lbl4.configure(text="正在停止当前这一期，停好后自动关闭…")
@@ -4338,6 +8002,687 @@ def run_gui():
     btn4_stop.configure(command=stop4)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(200, poll4)
+
+    # ---- 页签 5：影像处理（D-29，T9）：扫描工点 → 勾选、改坐标系 → 一个接一个空三，出 CGCS2000 XML（可选 DOM/DSM） ----
+    tab5, lg5 = paned_tab("影像处理")
+    tab5.columnconfigure(1, weight=1)
+    cfg5 = load_config()
+    v5_root = tk.StringVar(value=cfg5.get("survey_root", ""))
+    v5_out = tk.StringVar(value=cfg5.get("survey_out", ""))
+    v5_ms = tk.StringVar(value=find_metashape())
+    v5_filter = tk.StringVar()
+    v5_skip = tk.StringVar(value=cfg5.get("survey_skip", ""))
+    v5_domdsm = tk.BooleanVar(value=False)  # 卡面：默认不勾，不记 config
+    v5_res = tk.StringVar(value="%g" % SURVEY_RESOLUTION)
+    v5_kp = tk.StringVar(value=str(SURVEY_KEYPOINTS))
+    v5_tp = tk.StringVar(value=str(SURVEY_TIEPOINTS))
+    v5_clip = tk.BooleanVar(value=bool(cfg5.get("survey_clip", True)))   # D-31：自动裁边，默认勾，记 config
+    v5_inset = tk.StringVar(value=str(cfg5.get("survey_inset") or "%g" % SURVEY_CLIP_INSET))
+    v5_density = tk.StringVar(value=str(cfg5.get("survey_density") or "%g" % SURVEY_CLIP_DENSITY))   # D-32，记 config
+    srs_choices = [survey_srs_label(e) for e in range(SURVEY_EPSG_MIN, SURVEY_EPSG_MAX + 1)]
+    v5_unify = tk.StringVar(value=survey_srs_label(4543))
+    st5 = {"stop": None, "items": [], "rows": [], "scanned": None, "running": False, "scanning": False, "closing": False,
+           "cache": {}}
+    q5 = queue.Queue()
+    rows5 = (
+        ("照片上级目录：", v5_root, lambda: pick_dir(v5_root, "选择照片上级目录（每个直接含照片的文件夹算一个工点，只读）")),
+        ("输出目录：", v5_out, lambda: pick_dir(v5_out, "选择输出目录（每个工点的工程、XML、DOM/DSM 和汇总表都写在这里）")),
+        ("Metashape 程序：", v5_ms, lambda: pick_file(v5_ms, "选择 Metashape Pro 程序（metashape.exe）",
+                                                   [("Metashape", "metashape.exe photoscan.exe"), ("程序", "*.exe")])),
+    )
+    for r, (label, var, cmd) in enumerate(rows5):
+        ctk.CTkLabel(tab5, text=label).grid(row=r, column=0, sticky="w", pady=2)
+        ctk.CTkEntry(tab5, textvariable=var).grid(row=r, column=1, sticky="ew", pady=2)
+        button(tab5, "浏览…", cmd).grid(row=r, column=2, padx=(6, 0), pady=2)
+
+    of5 = ctk.CTkFrame(tab5, fg_color="transparent")
+    of5.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+    cb5_domdsm = ctk.CTkCheckBox(of5, text="同时出 DOM、DSM（超高质量，很慢）", variable=v5_domdsm)
+    cb5_domdsm.grid(row=0, column=0, sticky="w")
+    lbl5_res = ctk.CTkLabel(of5, text="分辨率（米，填「自动」＝原始）：")
+    lbl5_res.grid(row=0, column=1, sticky="w", padx=(16, 4))
+    e5_res = ctk.CTkEntry(of5, textvariable=v5_res, width=64)
+    e5_res.grid(row=0, column=2, sticky="w")
+    ctk.CTkLabel(of5, text="关键点：").grid(row=0, column=3, sticky="w", padx=(16, 4))
+    ctk.CTkEntry(of5, textvariable=v5_kp, width=64).grid(row=0, column=4, sticky="w")
+    ctk.CTkLabel(of5, text="连接点：").grid(row=0, column=5, sticky="w", padx=(10, 4))
+    ctk.CTkEntry(of5, textvariable=v5_tp, width=64).grid(row=0, column=6, sticky="w")
+    cb5_clip = ctk.CTkCheckBox(of5, text="自动裁边（背景透明）", variable=v5_clip)   # D-31
+    cb5_clip.grid(row=1, column=0, sticky="w", pady=(4, 0))
+    lbl5_inset = ctk.CTkLabel(of5, text="往里收（0～30 米）：")
+    lbl5_inset.grid(row=1, column=1, sticky="w", padx=(16, 4), pady=(4, 0))
+    e5_inset = ctk.CTkEntry(of5, textvariable=v5_inset, width=64)
+    e5_inset.grid(row=1, column=2, sticky="w", pady=(4, 0))
+    lbl5_density = ctk.CTkLabel(of5, text="点云密度门槛（10～90 %）：")
+    lbl5_density.grid(row=1, column=3, columnspan=2, sticky="w", padx=(16, 4), pady=(4, 0))
+    e5_density = ctk.CTkEntry(of5, textvariable=v5_density, width=64)
+    e5_density.grid(row=1, column=5, columnspan=2, sticky="w", pady=(4, 0))
+
+    def update_res_state(*_):
+        for w in (lbl5_res, e5_res):
+            set_enabled(w, v5_domdsm.get())
+        set_enabled(cb5_clip, v5_domdsm.get())          # 勾选框本身只看 DOM/DSM：不然一取消勾就再也勾不回来
+        for w in (lbl5_inset, e5_inset, lbl5_density, e5_density):
+            set_enabled(w, v5_domdsm.get() and v5_clip.get())
+    v5_domdsm.trace_add("write", update_res_state)
+    v5_clip.trace_add("write", update_res_state)
+    update_res_state()
+
+    uf5 = ctk.CTkFrame(tab5, fg_color="transparent")
+    uf5.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+    uf5.columnconfigure(4, weight=1)
+    ctk.CTkLabel(uf5, text="坐标系全部统一为：").grid(row=0, column=0, sticky="w")
+    om5_unify = ctk.CTkOptionMenu(uf5, variable=v5_unify, values=["自动（按工点）"] + srs_choices, width=170)
+    om5_unify.grid(row=0, column=1, sticky="w")
+    btn5_unify = button(uf5, "统一", width=56)
+    btn5_unify.grid(row=0, column=2, sticky="w", padx=(6, 0))
+    ctk.CTkLabel(uf5, text="跳过这些工点（逗号分隔）：").grid(row=0, column=3, sticky="w", padx=(16, 4))
+    ctk.CTkEntry(uf5, textvariable=v5_skip).grid(row=0, column=4, sticky="ew")
+    hint(tab5, "每个直接含照片的文件夹算一个工点，下面的子文件夹（如 正摄）并进来，所有照片都用。本页签不去定位：照片 GPS "
+               "换算到工点的 CGCS2000 3 度带（不带带号）作相机参考，按照片平均经度自动选最近的带，可在列表里逐个改，"
+               "改过的记住；精度取决于机载 GPS（米级），没用控制点。带定位不到一半的、在子目录里的（如 无正射影像 下面的）"
+               "默认不勾。完成/部分对齐的工点算已有结果、跳过；上次失败或已取消的重跑前旧结果目录改名保留。"
+               "输出：<输出目录>\\<工点名>\\ 里的 .psx、<工点名>_BlocksExchange.xml（CC 直接导入）、处理报告.txt；"
+               "勾了 DOM/DSM 再加 <工点名>DOM.tif/.tfw、<工点名>DSM.tif/.tfw。"
+               "勾了 DOM/DSM 时默认自动裁边：只留「DOM 有影像 + 密集点云真有点（不靠插值）+ 点云够密」的地方，"
+               "补上细缝、取最大的一片、填掉小洞、再往里收一点。「往里收」是沿边界往里缩多少米（0 不缩、默认 3 米）；"
+               "「点云密度门槛」是每 1 米见方里有真实点的 0.1 米小格要占多少（默认 50 %，调低留得多、调高裁得狠，"
+               "拉花处点又稀又乱会被裁掉）。DOM 和 DSM 用同一条线、同一个像元网格裁，线外 DOM 透明、DSM 是 NoData。"
+               "范围线另存 <工点名>_范围线.kml（WGS84 经纬度）和 <工点名>_范围线.shp（同 DOM 坐标系）；想手动改，"
+               "用任何 GIS 软件改了线（可以挖洞、加块），点「按范围线重新裁剪…」只重新导出，几分钟。跟正摄还是斜飞无关。"
+               "筛选只影响显示；四个勾选按钮只作用于当前显示的行，「只勾待处理」不勾子目录里的。").grid(
+        row=5, column=0, columnspan=3, sticky="w", pady=(0, 2))
+
+    tb5 = ctk.CTkFrame(tab5, fg_color="transparent")
+    tb5.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(2, 2))
+    btn5_scan = button(tb5, "扫描", primary=True)
+    btn5_scan.pack(side="left")
+    ctk.CTkLabel(tb5, text="筛选：").pack(side="left", padx=(12, 0))
+    ctk.CTkEntry(tb5, textvariable=v5_filter, width=120).pack(side="left")
+    bulk5 = []
+    for t in ("全选", "全不选", "反选", "只勾待处理"):
+        b = button(tb5, t, width=56 if len(t) <= 3 else 88)
+        b.pack(side="left", padx=(6, 0))
+        bulk5.append(b)
+    lbl5_count = ctk.CTkLabel(tb5, text="", text_color=hint_color)
+    lbl5_count.pack(side="left", padx=(10, 0))
+    btn5_reclip = button(tb5, "按范围线重新裁剪…", width=150)   # D-32：给用户留手动裁的余地
+    btn5_reclip.pack(side="right")
+
+    lst5 = ctk.CTkScrollableFrame(tab5, height=90)  # 同批量迁移：默认矮，往下拖分隔条列表跟着变高
+    lst5._scrollbar.configure(height=60)
+    lst5.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
+    lst5.columnconfigure(2, weight=1)
+    tab5.rowconfigure(7, weight=1)
+    cols5 = (("", 28, "w"), ("序号", 36, "e"), ("工点", 260, "w"), ("照片数", 52, "e"), ("带定位", 52, "e"),
+             ("坐标系", 200, "w"), ("状态", 120, "w"), ("备注", 90, "w"))
+    for c, (t, w, a) in enumerate(cols5):
+        if t:
+            ctk.CTkLabel(lst5, text=t, width=w, anchor=a, text_color=hint_color, height=20).grid(
+                row=0, column=c, sticky="ew", padx=(0, 6))
+    status_color5 = {"待处理（": ("#6A1B9A", "#CE93D8"), "完成": ("#2E7D32", "#81C784"), "部分对齐": ("#E65100", "#FFB74D"),
+                     "定位不足": ("#E65100", "#FFB74D"), "失败": danger, "已取消": hint_color,
+                     "运行中": ("#1565C0", "#64B5F6"), "等待其他 Metashape": ("#1565C0", "#64B5F6")}
+
+    def color_of5(text):
+        for k, c in status_color5.items():
+            if text.startswith(k):
+                return c
+        return hint_color if text.startswith("跳过") or text == "已有结果" else label_color
+
+    def visible5(row):
+        f = v5_filter.get().strip().lower()
+        return f in row["item"]["rel"].lower()
+
+    def update_count5(*_):
+        rs = st5["rows"]
+        sel = [r for r in rs if r["var"].get()]
+        lbl5_count.configure(text="已勾 %d 个（要处理 %d）；显示 %d/%d" % (
+            len(sel), sum(survey_runnable(r["item"]) for r in sel), sum(visible5(r) for r in rs), len(rs)))
+
+    def apply_filter5(*_):
+        for r in st5["rows"]:
+            for w in r["widgets"]:
+                if visible5(r):
+                    w.grid()
+                else:
+                    w.grid_remove()
+        update_count5()
+
+    v5_filter.trace_add("write", apply_filter5)
+
+    def bulk5_do(kind):
+        for r in st5["rows"]:
+            if visible5(r):
+                it = r["item"]
+                r["var"].set({"全选": True, "全不选": False, "反选": not r["var"].get(),
+                              "只勾待处理": it["status"].startswith(SURVEY_TODO) and not it["nested"]}[kind])
+        update_count5()
+
+    for b in bulk5:
+        b.configure(command=lambda t=b.cget("text"): bulk5_do(t))
+
+    def set_row_status5(row, text):
+        row["status"].configure(text=text, text_color=color_of5(text))
+
+    def srs_text(it):
+        return ("自动 " + survey_srs_label(it["auto_epsg"]) if it["auto_epsg"] else "自动（无定位）") \
+            if it["epsg_src"] == "自动" else survey_srs_label(it["epsg"])
+
+    def save_manual5(name, epsg):
+        cfg = load_config()
+        m = dict(cfg.get("survey_epsg") or {})
+        if epsg:
+            m[name] = int(epsg)
+        else:
+            m.pop(name, None)
+        cfg["survey_epsg"] = m
+        save_config(cfg)
+
+    def set_srs5(row, choice, save=True):
+        """列表里改了某个工点的坐标系：选「自动…」回到自动，选具体的带记为手动（按工点名记进 config）。"""
+        it = row["item"]
+        if choice.startswith("自动"):
+            it["epsg"], it["epsg_src"] = it["auto_epsg"], "自动"
+            if save:
+                save_manual5(it["name"], None)
+        else:
+            it["epsg"], it["epsg_src"] = parse_survey_epsg(choice), "手动"
+            if save:
+                save_manual5(it["name"], it["epsg"])
+        row["srs_var"].set(srs_text(it))
+        row["srs"].configure(text_color=("#1565C0", "#64B5F6") if it["epsg_src"] == "手动" else label_color)
+
+    def unify5():
+        if not st5["rows"]:
+            ui_box.showwarning(APP_NAME, "请先点「扫描」")
+            return
+        choice = v5_unify.get()
+        cfg = load_config()
+        m = dict(cfg.get("survey_epsg") or {})
+        for r in st5["rows"]:
+            set_srs5(r, choice, save=False)
+            if choice.startswith("自动"):
+                m.pop(r["item"]["name"], None)
+            else:
+                m[r["item"]["name"]] = r["item"]["epsg"]
+        cfg["survey_epsg"] = m
+        save_config(cfg)
+        q5.put(("log", "坐标系：%d 个工点全部%s" % (len(st5["rows"]), "改回自动（按工点）" if choice.startswith("自动")
+                                                  else "统一为 %s（记为手动）" % choice)))
+
+    btn5_unify.configure(command=unify5)
+
+    def note_of(it):
+        return "、".join(x for x, on in (("靠近分带线", it["near"]), ("子目录", it["nested"])) if on)
+
+    def make_row5(i, it):
+        var = tk.BooleanVar(value=it["default"])
+        row = {"item": it, "var": var, "srs_var": tk.StringVar()}
+        ws = [ctk.CTkCheckBox(lst5, text="", width=28, checkbox_width=20, checkbox_height=20, variable=var,
+                              command=update_count5)]
+        for c, text in ((1, str(it["idx"])), (2, it["rel"]), (3, str(it["n"])), (4, str(it["n_gps"]))):
+            t, w, a = cols5[c]
+            ws.append(ctk.CTkLabel(lst5, text=text, width=w, anchor=a, height=22))
+        om = ctk.CTkOptionMenu(lst5, variable=row["srs_var"], width=cols5[5][1], height=22, dynamic_resizing=False,
+                               values=[("自动 " + survey_srs_label(it["auto_epsg"])) if it["auto_epsg"] else "自动（无定位）"]
+                               + srs_choices, command=lambda choice, row=row: set_srs5(row, choice))
+        ws.append(om)
+        ws.append(ctk.CTkLabel(lst5, text="", width=cols5[6][1], anchor="w", height=22))
+        ws.append(ctk.CTkLabel(lst5, text=note_of(it), width=cols5[7][1], anchor="w", height=22, text_color=hint_color))
+        for c, w in enumerate(ws):
+            w.grid(row=i, column=c, sticky="ew", padx=(0, 6), pady=(0, 1))
+        tooltip(ws[2], lambda it=it: it["dir"])
+        row.update(widgets=ws, status=ws[6], srs=om)
+        row["srs_var"].set(srs_text(it))
+        om.configure(text_color=("#1565C0", "#64B5F6") if it["epsg_src"] == "手动" else label_color)
+        set_row_status5(row, it["status"])
+        st5["rows"].append(row)
+
+    def fill_list5(items, done):
+        """换列表内容：几百个 CTk 控件一次建完界面会卡一两秒，所以每次只删/建 80 毫秒，分批用 after 接着做；做完调 done()。"""
+        old, todo = st5["rows"], list(enumerate(items, 1))
+        st5["rows"] = []
+
+        def step():
+            t0 = time.time()
+            while old and time.time() - t0 < 0.08:
+                for w in old.pop()["widgets"]:
+                    w.destroy()
+            while not old and todo and time.time() - t0 < 0.08:
+                make_row5(*todo.pop(0))
+            if old or todo:
+                root.after(1, step)
+                return
+            apply_filter5()
+            done()
+        step()
+
+    def scan_key5():
+        return (v5_root.get().strip(), os.path.abspath(v5_out.get().strip()) if v5_out.get().strip() else "",
+                tuple(_split_names(v5_skip.get())))
+
+    def save5():
+        cfg = load_config()
+        cfg.update(survey_root=v5_root.get().strip(), survey_out=v5_out.get().strip(),
+                   survey_skip=",".join(_split_names(v5_skip.get())), survey_clip=bool(v5_clip.get()),
+                   survey_inset=v5_inset.get().strip(), survey_density=v5_density.get().strip())
+        if v5_ms.get().strip():
+            cfg["metashape"] = v5_ms.get().strip()
+        save_config(cfg)
+
+    def set_busy5(busy):
+        """扫描或运行时：扫描、开始、统一、各行坐标系不可点，取消可点。"""
+        set_btn(btn5_scan, not busy)
+        set_btn(btn5_start, not busy)
+        set_btn(btn5_unify, not busy)
+        set_btn(btn5_reclip, not busy)
+        set_btn(btn5_stop, busy)
+        for r in st5["rows"]:
+            r["srs"].configure(state="disabled" if busy else "normal")
+
+    def scan5():
+        root_dir, out = v5_root.get().strip(), v5_out.get().strip()
+        if not root_dir or not out:
+            ui_box.showwarning(APP_NAME, "请选择照片上级目录和输出目录")
+            return
+        if not os.path.isdir(root_dir):
+            ui_box.showwarning(APP_NAME, "照片上级目录不存在：%s" % root_dir)
+            return
+        save5()
+        key, skip = scan_key5(), _split_names(v5_skip.get())
+        manual = dict(load_config().get("survey_epsg") or {})
+        stop = threading.Event()
+        st5["stop"], st5["scanning"] = stop, True
+        set_busy5(True)
+        pb5.set(0)
+        lbl5.configure(text="扫描中…")
+        q5.put(("log", "扫描 %s …（第一次要读每张照片开头的定位，网络盘上几千张约一两分钟）" % root_dir))
+
+        def work():
+            try:
+                items = survey_scan(root_dir, os.path.abspath(out), skip=skip, manual=manual, cache=st5["cache"],
+                                    progress=lambda i, n, s: q5.put(("prog", (i / float(n) if n else 0,
+                                                                              "扫描 %d/%d 张 · %s" % (i, n, s)))),
+                                    stop_event=stop)
+                q5.put(("scanned", (items, key)))
+            except AlignCancelled:
+                q5.put(("scanned", None))
+            except Exception as ex:
+                q5.put(("scanned", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    btn5_scan.configure(command=scan5)
+
+    bar5 = ctk.CTkFrame(tab5, fg_color="transparent")
+    bar5.grid(row=8, column=0, columnspan=3, sticky="ew")
+    bar5.columnconfigure(0, weight=1)
+    pb5 = ctk.CTkProgressBar(bar5, mode="determinate")
+    pb5.set(0)
+    pb5.grid(row=0, column=0, sticky="ew")
+    lbl5 = ctk.CTkLabel(bar5, text="", width=260)
+    lbl5.grid(row=0, column=1, padx=6)
+    btn5_start = button(bar5, "开始", primary=True)
+    btn5_start.grid(row=0, column=2)
+    btn5_stop = button(bar5, "取消", role="stop", state="disabled")
+    btn5_stop.grid(row=0, column=3, padx=(6, 0))
+
+    def scanned5(val):
+        pb5.set(0)
+        if val is None or isinstance(val, Exception):
+            st5["scanning"] = False
+            set_busy5(False)
+            lbl5.configure(text="扫描已取消" if val is None else "")
+            log_add(lg5, "扫描已取消" if val is None else "扫描出错：%s" % val)
+            if val is not None:
+                ui_box.showwarning(APP_NAME, str(val))
+            return
+        items, key = val
+        lbl5.configure(text="正在列出 %d 个工点…" % len(items))
+        fill_list5(items, lambda: listed5(items, key))
+
+    def listed5(items, key):
+        st5["items"], st5["scanned"] = items, key
+        st5["scanning"] = False
+        set_busy5(False)
+        lbl5.configure(text="扫描完成：%d 个工点" % len(items))
+        cnt = {}
+        for it in items:
+            cnt[it["status"]] = cnt.get(it["status"], 0) + 1
+        log_add(lg5, "扫描完成：共 %d 个工点（在子目录里、默认不勾的 %d 个）；%s" % (
+            len(items), sum(it["nested"] for it in items), "，".join("%s %d" % kv for kv in cnt.items())))
+        zones = {}
+        for it in items:
+            if it["epsg"]:
+                zones.setdefault(survey_srs_label(it["epsg"]), []).append(it["name"])
+        log_add(lg5, "坐标系：%s" % "；".join("%s %d 个" % (k, len(v)) for k, v in sorted(zones.items())))
+        near = [it["name"] for it in items if it["near"]]
+        if near:
+            log_add(lg5, "注意：这些工点的照片平均经度离分带线不到 %g°，自动选的带可能和以往成果不同，请核对（可在列表里改，"
+                         "或用「坐标系全部统一为」）：%s" % (SURVEY_NEAR_ZONE, "、".join(near)))
+        nogps = [it["name"] for it in items if not it["epsg"]]
+        if nogps:
+            log_add(lg5, "注意：这些工点没有定位、选不了带，要处理就先手动选坐标系：%s" % "、".join(nogps))
+        again = [it["name"] for it in items if it["status"].startswith(SURVEY_TODO + "（")]
+        if again:
+            log_add(lg5, "这些工点上次失败或已取消，重跑前会把旧结果目录改名保留：%s" % "、".join(again))
+
+    def poll5():
+        try:
+            for _ in range(500):  # 一次最多处理这么多条，别让界面卡住
+                kind, val = q5.get_nowait()
+                if kind == "log":
+                    log_add(lg5, val)
+                    log_refresh_open(lg5)
+                elif kind == "prog":
+                    pb5.set(int(val[0] * 1000) / 1000)
+                    lbl5.configure(text=val[1][:44])
+                elif kind == "scanned":
+                    scanned5(val)
+                elif kind == "item":
+                    it, text = val
+                    for r in st5["rows"]:
+                        if r["item"] is it:
+                            set_row_status5(r, text)
+                    update_count5()
+                elif kind == "reclip_done":
+                    set_busy5(False)
+                    st5["running"] = False
+                    if st5["closing"]:
+                        if not st4["running"]:
+                            remember_window()
+                            root.destroy()
+                        return
+                    if isinstance(val, Exception):
+                        lbl5.configure(text="失败")
+                        log_add(lg5, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
+                        continue
+                    res, logf = val
+                    lbl5.configure(text="已取消" if res["cancelled"] else "完成")
+                    body = ["%s：%s（%.1f 分钟）%s" % (r["name"], r["status"], (r["secs"] or 0) / 60.0,
+                                                    "\n  " + r["reason"] if r["reason"] else "") for r in res["rows"]]
+                    body += ["", "完整日志：%s" % logf]
+                    (ui_box.showwarning if res["exit"] else ui_box.showinfo)(
+                        APP_NAME + " - 按范围线重新裁剪", ("有没做成的工点（原来的 DOM/DSM 没动）。\n\n" if res["exit"] else
+                                                   "只重新导出了 DOM/DSM（没重建）；旧范围线改名保留。\n\n") + "\n".join(body))
+                elif kind == "done":
+                    set_busy5(False)
+                    st5["scanned"] = None  # 状态都变了，再跑要先重新扫描
+                    st5["running"] = False
+                    if st5["closing"]:  # 用户点了关窗口：当前工点已停好，现在关
+                        if not st4["running"]:
+                            remember_window()
+                            root.destroy()
+                        return
+                    if isinstance(val, Exception):
+                        lbl5.configure(text="失败")
+                        log_add(lg5, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
+                        continue
+                    res, logf = val
+                    body = ["%s：%d 个" % kv for kv in res["counts"].items()]
+                    for st_name in ("失败", "部分对齐"):
+                        names = [r["工点"] for r in res["rows"] if r["状态"] == st_name]
+                        if names:
+                            body.append("%s：%s" % (st_name, "、".join(names)))
+                    body += ["", "汇总表：%s" % res["summary"], "完整日志：%s" % logf]
+                    if res["cancelled"]:
+                        lbl5.configure(text="已取消")
+                        last = res["rows"][-1] if res["rows"] else None
+                        if last and last["状态"] == "已取消":
+                            body.append("\n被取消的「%s」结果不完整，不要使用；重新扫描会显示「待处理（上次已取消）」，"
+                                        "重跑时旧结果目录改名保留。" % last["工点"])
+                        ui_box.showwarning(APP_NAME + " - 已取消",
+                                           "已取消：已完成的工点结果都保留，剩下的没有开始。\n\n" + "\n".join(body))
+                    else:
+                        lbl5.configure(text="完成")
+                        bad = res["exit"] != 0
+                        (ui_box.showwarning if bad else ui_box.showinfo)(
+                            APP_NAME + " - 影像处理完成", ("有失败的工点，详见汇总表和各工点的处理报告.txt。\n\n"
+                                                    if bad else "") + "\n".join(body))
+        except queue.Empty:
+            pass
+        root.after(200, poll5)
+
+    def start5():
+        if st4["running"]:
+            ui_box.showwarning(APP_NAME, "「批量迁移」正在运行，等它跑完再开始（两个都要用 Metashape）")
+            return
+        if not st5["items"] or st5["scanned"] is None:
+            ui_box.showwarning(APP_NAME, "请先点「扫描」")
+            return
+        if scan_key5() != st5["scanned"]:
+            ui_box.showwarning(APP_NAME, "目录或跳过名单在扫描后改过了，请先重新扫描")
+            return
+        ms = v5_ms.get().strip()
+        err = check_metashape(ms)
+        if err:
+            ui_box.showwarning(APP_NAME, err)
+            return
+        try:
+            kp, tp = int(v5_kp.get().strip()), int(v5_tp.get().strip())
+            if kp <= 0 or tp < 0:
+                raise ValueError
+        except ValueError:
+            ui_box.showwarning(APP_NAME, "关键点上限要填大于 0 的整数，连接点上限要填不小于 0 的整数")
+            return
+        dom_dsm = v5_domdsm.get()
+        resolution = SURVEY_RESOLUTION
+        clip, clip_file, clip_inset, clip_density = SURVEY_CLIP_NONE, None, SURVEY_CLIP_INSET, SURVEY_CLIP_DENSITY
+        if dom_dsm:
+            try:
+                resolution = parse_survey_resolution(v5_res.get())
+            except ValueError as ex:
+                ui_box.showwarning(APP_NAME, str(ex))
+                return
+            if v5_clip.get():
+                try:
+                    clip_inset = survey_clip_inset(v5_inset.get())
+                    clip_density = survey_clip_density(v5_density.get())
+                except ValueError as ex:
+                    ui_box.showwarning(APP_NAME, str(ex))
+                    return
+                clip = SURVEY_CLIP_AUTO
+        chosen = [r["item"] for r in st5["rows"] if r["var"].get()]
+        todo = [it for it in chosen if survey_runnable(it)]
+        if not todo:
+            ui_box.showwarning(APP_NAME, "勾选的工点里没有要处理的（待处理 / 定位不足）")
+            return
+        nosrs = [it["name"] for it in todo if not it["epsg"]]
+        if nosrs:
+            ui_box.showwarning(APP_NAME, "这些工点没有坐标系（照片不带定位），请先在列表里给它们选一个 CGCS2000 3 度带，"
+                                         "或者不勾：\n" + "\n".join(nosrs))
+            return
+        out = os.path.abspath(v5_out.get().strip())
+        save5()
+        log_clear(lg5)
+        pb5.set(0)
+        lbl5.configure(text="")
+        set_busy5(True)
+        stop = threading.Event()
+        st5["stop"] = stop
+        st5["running"] = True
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        logf = Path(out) / ("影像处理日志_%s.txt" % stamp)
+        log_set_file(lg5, logf)
+
+        def work():
+            try:
+                Path(out).mkdir(parents=True, exist_ok=True)
+                with open(logf, "a", encoding="utf-8") as flog:
+                    def log(s):
+                        flog.write(s + "\n")
+                        flog.flush()
+                        q5.put(("log", s))
+
+                    for it in chosen:
+                        if survey_runnable(it):
+                            log("%s：%s（%s）" % (it["name"], survey_srs_label(it["epsg"]), it["epsg_src"]))
+                    res = run_survey_batch(chosen, out, ms, dom_dsm=dom_dsm, resolution=resolution, keypoints=kp,
+                                           tiepoints=tp, log=log, progress=lambda f, s: q5.put(("prog", (f, s))),
+                                           on_item=lambda it, phase, text: q5.put(("item", (it, text))), stop_event=stop,
+                                           clip=clip, clip_inset=clip_inset, clip_file=clip_file,
+                                           clip_density=clip_density,
+                                           summary=Path(out) / ("影像处理汇总_%s.csv" % stamp))
+                q5.put(("done", (res, str(logf))))
+            except Exception as ex:
+                q5.put(("done", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop5():
+        if st5["stop"] is not None:
+            st5["stop"].set()
+            lbl5.configure(text="正在取消…" if st5["scanning"] else "正在取消…（当前工点停下，剩下的不开始）")
+
+    def on_close5():  # 影像处理在跑时误点关窗口：先问，确认后停在当前工点，停好再关；其余照旧（批量迁移的确认）
+        if not st5["running"]:
+            on_close()
+            return
+        if st5["closing"]:
+            return
+        if ui_box.askyesno(APP_NAME + " - 影像处理正在运行",
+                           "影像处理正在运行。关掉窗口会停在当前工点：当前工点取消（结果不完整，下次扫描显示"
+                           "「待处理（上次已取消）」可重跑），剩下的不开始。\n\n确定要停止并关闭吗？", icon="warning"):
+            st5["closing"] = True
+            stop5()
+            if st4["running"]:
+                st4["closing"] = True
+                stop4()
+            lbl5.configure(text="正在停止当前工点，停好后自动关闭…")
+
+    def reclip5():
+        """「按范围线重新裁剪…」：选输出目录里已完成的工点 + 范围线来源，只重新导出 DOM/DSM（不碰空三和建模）。"""
+        if st4["running"]:
+            ui_box.showwarning(APP_NAME, "「批量迁移」正在运行，等它跑完再重新裁剪（两个都要用 Metashape）")
+            return
+        out = v5_out.get().strip()
+        if not out or not os.path.isdir(out):
+            ui_box.showwarning(APP_NAME, "请先在「输出目录」里选处理结果所在的目录（每个工点一个子目录）")
+            return
+        sites = survey_reclip_sites(out)
+        if not sites:
+            ui_box.showwarning(APP_NAME, "输出目录里没有能重新裁剪的工点（要勾了 DOM/DSM、已完成的：有 .psx、"
+                                         "<工点名>DOM.tif、<工点名>DSM.tif 和 处理报告.txt）：\n%s" % out)
+            return
+        dlg = ctk.CTkToplevel(root)
+        dlg.title(APP_NAME + " - 按范围线重新裁剪")
+        dlg.transient(root)
+        res = {"go": False}
+        v_src = tk.StringVar(value="dir")
+        v_file = tk.StringVar()
+        v_ins = tk.StringVar(value=v5_inset.get().strip() or "%g" % SURVEY_CLIP_INSET)
+        v_den = tk.StringVar(value=v5_density.get().strip() or "%g" % SURVEY_CLIP_DENSITY)
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(14, 6))
+        lbl = ctk.CTkLabel(body, text="", text_color=hint_color, justify="left", anchor="w")
+        set_wrapped(lbl, "只重新导出 DOM/DSM，不碰空三和建模（一个工点几分钟）。先导到临时文件，检查通过才替换；"
+                         "旧的范围线改名保留成 <工点名>_范围线_上次_<时间>.kml/.shp，处理报告的裁边段改写。"
+                         "自己画的线可以有多个多边形（都保留）和内环（挖掉那一块），原样裁、不再往里收。", int(560 * win_scale))
+        lbl.pack(anchor="w")
+        ctk.CTkLabel(body, text="选工点（%s）：" % out).pack(anchor="w", pady=(8, 2))
+        lst = ctk.CTkScrollableFrame(body, height=150, width=int(560 * win_scale))
+        lst.pack(fill="both", expand=True)
+        rows = []
+        for n, d in sites:
+            edited = survey_user_range_line(d, n, Path(d) / SURVEY_REPORT)
+            v = tk.BooleanVar(value=False)
+            ctk.CTkCheckBox(lst, text=n + ("（范围线改过）" if edited else ""), variable=v, checkbox_width=20,
+                            checkbox_height=20).pack(anchor="w", pady=1)
+            rows.append((v, d))
+        ctk.CTkLabel(body, text="范围线来源：").pack(anchor="w", pady=(8, 2))
+        ctk.CTkRadioButton(body, text="用工点目录里的 <工点名>_范围线.kml / .shp（用 GIS 软件改过的；两个都在用较新的）",
+                           variable=v_src, value="dir").pack(anchor="w", pady=1)
+        fr = ctk.CTkFrame(body, fg_color="transparent")
+        fr.pack(fill="x", pady=1)
+        ctk.CTkRadioButton(fr, text="用这个文件（KML 或 SHP）：", variable=v_src, value="file").pack(side="left")
+        e_file = ctk.CTkEntry(fr, textvariable=v_file)
+        e_file.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        button(fr, "浏览…", lambda: (pick_file(v_file, "选择范围线（KML：WGS84 经纬度；SHP：按 .prj，没有 .prj 当作与 DOM "
+                                                    "同坐标系）", [("范围线", "*.kml *.shp")]), v_src.set("file"))).pack(
+            side="left", padx=(6, 0))
+        fa = ctk.CTkFrame(body, fg_color="transparent")
+        fa.pack(fill="x", pady=1)
+        ctk.CTkRadioButton(fa, text="不换线，按这两个参数重新自动算：", variable=v_src, value="auto").pack(side="left")
+        ctk.CTkLabel(fa, text="往里收（米）").pack(side="left", padx=(4, 4))
+        ctk.CTkEntry(fa, textvariable=v_ins, width=56).pack(side="left")
+        ctk.CTkLabel(fa, text="点云密度门槛（%）").pack(side="left", padx=(10, 4))
+        ctk.CTkEntry(fa, textvariable=v_den, width=56).pack(side="left")
+        bar = ctk.CTkFrame(dlg, fg_color="transparent")
+        bar.pack(fill="x", padx=18, pady=(4, 14))
+
+        def go():
+            chosen = [d for v, d in rows if v.get()]
+            if not chosen:
+                ui_box.showwarning(APP_NAME, "请至少勾一个工点")
+                return
+            try:
+                if v_src.get() == "file":
+                    kind, f = parse_survey_clip(v_file.get())
+                    if kind != "file":
+                        raise ValueError("请选一个 .kml 或 .shp 范围线文件")
+                    res["file"] = f
+                res["inset"] = survey_clip_inset(v_ins.get())
+                res["density"] = survey_clip_density(v_den.get())
+            except ValueError as ex:
+                ui_box.showwarning(APP_NAME, str(ex))
+                return
+            if v_src.get() == "dir":
+                nol = [Path(d).name for d in chosen if not survey_site_range_line(d, Path(d).name)]
+                if nol:
+                    ui_box.showwarning(APP_NAME, "这些工点目录里没有范围线文件：\n" + "\n".join(nol))
+                    return
+            res.update(go=True, sites=chosen, src=v_src.get())
+            dlg.destroy()
+
+        ctk.CTkButton(bar, text="关闭", width=88, command=dlg.destroy, **secondary).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(bar, text="开始重新裁剪", width=120, command=go).pack(side="right")
+        dlg.bind("<Escape>", lambda ev: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.ui_reclip = {"rows": rows, "src": v_src, "file": v_file, "inset": v_ins, "density": v_den, "go": go}
+        root.ui_reclip_dlg = dlg                                 # 给 scripts/test_gui.py 看
+        show_modal(dlg)
+        if not res.get("go"):
+            return
+        ms = v5_ms.get().strip()
+        err = check_metashape(ms)
+        if err:
+            ui_box.showwarning(APP_NAME, err)
+            return
+        save5()
+        log_clear(lg5)
+        pb5.set(0)
+        lbl5.configure(text="")
+        set_busy5(True)
+        stop = threading.Event()
+        st5["stop"], st5["running"] = stop, True
+        logf = Path(out) / ("重新裁剪日志_%s.txt" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        log_set_file(lg5, logf)
+
+        def work():
+            try:
+                with open(logf, "a", encoding="utf-8") as flog:
+                    def log(s):
+                        flog.write(s + "\n")
+                        flog.flush()
+                        q5.put(("log", s))
+                    r = run_survey_clip(res["sites"], ms, res["src"], res.get("file"), res["inset"], res["density"],
+                                        log=log, progress=lambda f, s: q5.put(("prog", (f, s))), stop_event=stop)
+                q5.put(("reclip_done", (r, str(logf))))
+            except Exception as ex:
+                q5.put(("reclip_done", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    btn5_reclip.configure(command=reclip5)
+    btn5_start.configure(command=start5)
+    btn5_stop.configure(command=stop5)
+    root.protocol("WM_DELETE_WINDOW", on_close5)
+    root.ui_t9 = {"st5": st5, "q5": q5, "rows": lambda: st5["rows"], "set_srs": set_srs5, "reclip": reclip5}  # 给测试脚本看
+
+    root.after(200, poll5)
 
     # 后续功能在这里加新页签：tab = nb.add("...")
     nb.set("剔除定位")
@@ -4424,8 +8769,50 @@ def main(argv=None):
     bt.add_argument("--plan", action="store_true", help="只列计划、写汇总表，不运行")
     bt.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
     bt.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
+    sv = sub.add_parser("survey-batch", help="影像处理（D-29）：扫描工点，一个接一个用 Metashape 最高精度空三，导出带 CGCS2000 "
+                        "3 度带坐标的 Blocks Exchange（CC 直接导入），可选出 DOM/DSM；不去定位"
+                        "（退出码 0 全部完成或跳过 / 1 有失败 / 2 参数错误 / 3 取消）")
+    sv.add_argument("root", help="照片上级目录（只读）：每个直接含 JPG 的文件夹算一个工点，下面的子文件夹（如 正摄）并进来")
+    sv.add_argument("--out", required=True, help="输出目录：每个工点一个 <工点名> 子目录，汇总表也写在这里；不能在照片目录里面")
+    sv.add_argument("--epsg", default="auto", help="坐标系：auto（默认，每个工点按照片平均经度选最近的 CGCS2000 3 度带）"
+                    "或 4534～4554 的 EPSG 号（整批统一，如 4543）")
+    sv.add_argument("--dom-dsm", action="store_true", help="同时出 DOM、DSM（超高质量，很慢）")
+    sv.add_argument("--clip", default="auto", help="DOM/DSM 裁边：auto＝默认，只认「DOM 有影像 + 不插值的密集点云真有点 + "
+                    "点云够密」的地方，补缝、取最大连片、填掉内部 < 100 m² 的洞、往里收、简化成范围线，DOM 和 DSM 用同一条线"
+                    "同一个像元网格裁；none＝不裁（同 v1.0）；也可以给一个 .kml/.shp 范围线文件，按它裁（原样，不再往里收）")
+    sv.add_argument("--clip-inset", default="%g" % SURVEY_CLIP_INSET,
+                    help="自动裁边往里收多少米（0～%g），默认 %g" % (SURVEY_CLIP_INSET_MAX, SURVEY_CLIP_INSET))
+    sv.add_argument("--clip-density", default="%g" % SURVEY_CLIP_DENSITY,
+                    help="自动裁边的点云密度门槛（%%%%，%g～%g）：1 米块里有真实点的 0.1 米子格占比够这么多才算有效，默认 %g" % (
+                        SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX, SURVEY_CLIP_DENSITY))
+    sv.add_argument("--resolution", default="%g" % SURVEY_RESOLUTION,
+                    help="DOM/DSM 分辨率（米），默认 %g；auto＝Metashape 给的原始分辨率" % SURVEY_RESOLUTION)
+    sv.add_argument("--include", default="", help="只要名字匹配的工点（通配符，逗号分隔，如 \"*弃渣场*\"）")
+    sv.add_argument("--pick", default="", help="按扫描序号选（如 1,3,5-9；先用 --plan 看序号）")
+    sv.add_argument("--skip", default="", help="跳过名单：不处理的工点名，逗号分隔")
+    sv.add_argument("--plan", action="store_true", help="只列计划、写汇总表，不运行")
+    sv.add_argument("--keypoints", type=int, default=SURVEY_KEYPOINTS, help="关键点上限，默认 %d" % SURVEY_KEYPOINTS)
+    sv.add_argument("--tiepoints", type=int, default=SURVEY_TIEPOINTS, help="连接点上限，默认 %d" % SURVEY_TIEPOINTS)
+    sv.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
+    sv.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
+    sc = sub.add_parser("survey-clip", help="按范围线重新裁剪（D-32）：已完成的工点只重新导出 DOM/DSM，不碰空三和建模"
+                        "（退出码 0 成功 / 1 有失败 / 2 参数错误 / 3 取消）")
+    sc.add_argument("sites", nargs="+", help="工点输出目录（<输出目录>\<工点名>，里面有 .psx、DOM/DSM 和 处理报告.txt），可给多个")
+    sc.add_argument("--line", help="范围线 KML（WGS84）或 SHP（按 .prj，没有 .prj 当作与 DOM 同坐标系）：多个多边形都保留，"
+                    "内环＝挖掉，原样裁、不再往里收。不给：工点目录里的 <工点名>_范围线.shp/.kml 比报告新（改过）就用它，"
+                    "否则按 --clip-inset / --clip-density 重新自动算")
+    sc.add_argument("--clip-inset", help="重新自动算时往里收多少米（0～%g），默认 %g；给了就重新自动算" % (
+        SURVEY_CLIP_INSET_MAX, SURVEY_CLIP_INSET))
+    sc.add_argument("--clip-density", help="重新自动算时的点云密度门槛（%%%%，%g～%g），默认 %g；给了就重新自动算" % (
+        SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX, SURVEY_CLIP_DENSITY))
+    sc.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
+    sc.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
     args = ap.parse_args(argv)
+    if args.cmd == "survey-batch":
+        return _cli_survey(args)
+    if args.cmd == "survey-clip":
+        return _cli_survey_clip(args)
     if args.cmd == "gcp-batch":
         return _cli_batch(args)
     if args.cmd == "align":
@@ -4589,5 +8976,127 @@ def _cli_batch(args):
             flog.close()
 
 
+def _cli_survey(args):
+    """退出码：0 全部完成/部分对齐或跳过 / 1 有失败 / 2 参数错误 / 3 取消。
+    不给 --include / --pick 时只处理「默认勾」的工点（同界面：待处理、且不在子目录里）；给了就从全部工点里选。"""
+    flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+    def log(s):
+        _print(s)
+        if flog:
+            flog.write(s + "\n")
+            flog.flush()
+
+    try:
+        try:
+            epsg = parse_survey_epsg(args.epsg)
+            resolution = parse_survey_resolution(args.resolution)
+            clip, clip_file = parse_survey_clip(args.clip)
+            clip_inset = survey_clip_inset(args.clip_inset)
+            clip_density = survey_clip_density(args.clip_density)
+            if not args.dom_dsm and (clip != SURVEY_CLIP_AUTO or args.clip_inset != "%g" % SURVEY_CLIP_INSET or
+                                     args.clip_density != "%g" % SURVEY_CLIP_DENSITY):
+                log("注意：没勾 DOM/DSM，--clip/--clip-inset/--clip-density 不起作用")
+            if args.keypoints <= 0 or args.tiepoints < 0:
+                raise ValueError("关键点上限必须大于 0，连接点上限不能为负")
+            ms = args.metashape or find_metashape()
+            if not args.plan:
+                err = check_metashape(ms)
+                if err:
+                    raise ValueError(err)
+            log("扫描 %s …" % args.root)
+            items = survey_scan(args.root, os.path.abspath(args.out), skip=_split_names(args.skip), epsg=epsg,
+                                progress=lambda i, n, s: (i % 1000 == 0 and i) and log("  已读 %d/%d 张照片的定位" % (i, n)))
+            log("共找到 %d 个工点（在子目录里、默认不处理的 %d 个）：" % (len(items), sum(it["nested"] for it in items)))
+            for it in items:
+                log("  %2d. %s：%d 张，带定位 %d，平均经度 %s → %s（%s）%s；%s%s" % (
+                    it["idx"], it["rel"], it["n"], it["n_gps"], "%.4f°" % it["lon"] if it["lon"] is not None else "-",
+                    survey_srs_label(it["epsg"]) or "没有坐标系", it["epsg_src"], "，靠近分带线" if it["near"] else "",
+                    it["status"], "" if it["default"] else "（默认不处理）"))
+            inc = _split_names(args.include)
+            if args.pick or inc:
+                chosen = items
+                if inc:
+                    chosen = [it for it in chosen if any(fnmatch.fnmatchcase(it["name"].lower(), x.lower()) for x in inc)]
+                    log("按 --include 筛选后剩 %d 个。" % len(chosen))
+                if args.pick:
+                    pick = parse_pick(args.pick, len(items))
+                    chosen = [it for it in chosen if it["idx"] in pick]
+                    log("按 --pick 选中 %d 个。" % len(chosen))
+            else:
+                chosen = [it for it in items if it["default"] or not survey_runnable(it)]
+        except (ValueError, OSError) as ex:
+            log("拒绝执行：%s" % ex)
+            return 2
+        if not chosen:
+            log("没有选中任何工点，结束。")
+            return 0
+        try:
+            res = run_survey_batch(chosen, args.out, ms, plan=args.plan, dom_dsm=args.dom_dsm, resolution=resolution,
+                                   keypoints=args.keypoints, tiepoints=args.tiepoints, log=log, clip=clip,
+                                   clip_inset=clip_inset, clip_file=clip_file, clip_density=clip_density)
+
+        except ValueError as ex:
+            log("拒绝执行：%s" % ex)
+            return 2
+        except KeyboardInterrupt:
+            log("已取消")
+            return 3
+        return res["exit"]
+    finally:
+        if flog:
+            flog.close()
+
+
+def _cli_survey_clip(args):
+    """survey-clip：退出码 0 成功 / 1 有失败 / 2 参数错误 / 3 取消。"""
+    flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+    def log(s):
+        _print(s)
+        if flog:
+            flog.write(s + "\n")
+            flog.flush()
+
+    try:
+        try:
+            line = None
+            if args.line:
+                if args.clip_inset is not None or args.clip_density is not None:
+                    raise ValueError("--line 给的范围线原样裁、不再往里收，不能再给 --clip-inset / --clip-density")
+                kind, line = parse_survey_clip(args.line)
+                if kind != "file":
+                    raise ValueError("--line 要给一个 .kml 或 .shp 文件")
+            inset = survey_clip_inset(args.clip_inset if args.clip_inset is not None else SURVEY_CLIP_INSET)
+            density = survey_clip_density(args.clip_density if args.clip_density is not None else SURVEY_CLIP_DENSITY)
+            source = "file" if line else "auto" if (args.clip_inset is not None or args.clip_density is not None) \
+                else "smart"
+            sites = []
+            for d in args.sites:
+                p = Path(os.path.abspath(d))
+                n = p.name
+                miss = [f for f in (n + ".psx", n + "DOM.tif", n + "DSM.tif", SURVEY_REPORT) if not (p / f).is_file()]
+                if miss:
+                    raise ValueError("不是已完成的工点目录（缺 %s）：%s" % ("、".join(miss), p))
+                sites.append(str(p))
+            ms = args.metashape or find_metashape()
+            err = check_metashape(ms)
+            if err:
+                raise ValueError(err)
+        except (ValueError, OSError) as ex:
+            log("拒绝执行：%s" % ex)
+            return 2
+        try:
+            res = run_survey_clip(sites, ms, source, line, inset, density, log=log)
+        except KeyboardInterrupt:
+            log("已取消")
+            return 3
+        return res["exit"]
+    finally:
+        if flog:
+            flog.close()
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
