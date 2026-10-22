@@ -1,0 +1,13 @@
+# 处理用的地理库（D-34）：numpy、rasterio（含 GDAL）、shapely、pyproj。
+# 版本钉死，升级要另行验证（打包脚本开头会核对已装版本和这里一致，不一致就停）。
+#
+# 说明：
+#   - 这些库只在用到的函数里 import，命令行里不用它们的命令（--help、去定位、空三）
+#     照常工作，启动不会因为它们变慢。
+#   - GDAL 和 PROJ 的数据（proj.db 等）随程序打包带，程序启动时自己指过去，
+#     不读使用者电脑上装过的 GDAL / PROJ / conda / QGIS 的环境变量。
+#   - 打包要用的解释器和这四个库要装在同一套 Python 3.11 环境里（见 scripts/build_installer.ps1）。
+numpy==2.4.6
+rasterio==1.4.4
+shapely==2.1.2
+pyproj==3.7.2

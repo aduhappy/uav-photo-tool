@@ -6,6 +6,8 @@
 !/README.md
 !/LICENSE
 !/requirements-gui.txt
+!/requirements.txt
+!/installer/
 !/src/
 !/scripts/
 

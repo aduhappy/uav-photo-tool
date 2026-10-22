@@ -1,3 +1,7 @@
+# 【已取代，2026-10-22】这个脚本打的是**单文件** exe（--onefile）。
+# 现在打包改成文件夹版 + Inno Setup 安装包 + 免安装 zip，用 scripts/build_installer.ps1（D-34）。
+# 本文件留作参考，不再维护、也不再用。
+#
 # 把 src/uav_photo_tool.py 打包成单文件 exe（PyInstaller --onefile --windowed）
 # 用法：
 #   pwsh -File scripts/build_exe.ps1 [-Python <python.exe>] [-Build <中间文件目录>] [-OutDir <exe 输出目录>]

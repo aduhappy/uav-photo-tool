@@ -233,7 +233,13 @@ def steps_invoke(root, nb):
     R["help_menu"] = menu_entries(help_m)
     R["look_menu"] = menu_entries(look_m)
     hl = {lab: i for i, t, lab in R["help_menu"] if lab}
-    check("帮助菜单四项", set(hl) == {"检查更新", "启动时自动检查更新", "项目主页（GitHub）", "关于"}, list(hl))
+    check("帮助菜单五项（T16 加自检）", set(hl) == {"检查更新", "自检", "启动时自动检查更新", "项目主页（GitHub）", "关于"}, list(hl))
+    n_st = len(R["boxes"])
+    help_m.invoke(hl["自检"])
+    yield (lambda: len(R["boxes"]) > n_st), 120
+    check("自检有结果框", len(R["boxes"]) > n_st, R["boxes"][n_st:])
+    check("自检框里没有失败项", len(R["boxes"]) > n_st and "[失败]" not in (R["boxes"][-1][2] or ""),
+          (R["boxes"][-1][2] or "")[:300] if len(R["boxes"]) > n_st else "（没弹框）")
     help_m.invoke(hl["关于"])
     check("关于", R["boxes"] and R["boxes"][-1][0] == "showinfo" and ("v" + VERSION) in R["boxes"][-1][2], R["boxes"][-1:])
     help_m.invoke(hl["项目主页（GitHub）"])

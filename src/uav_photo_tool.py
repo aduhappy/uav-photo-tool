@@ -42,8 +42,10 @@
   python uav_photo_tool.py survey-clip <工点输出目录>... [--line <KML或SHP>] [--clip-inset 3] [--clip-density 50]
   python uav_photo_tool.py survey-deliver <输出目录> [--to 交付目录] [--site 工点名,...]
   python uav_photo_tool.py check-update
-不带参数启动图形界面（菜单「帮助」里可以检查更新）。
+  python uav_photo_tool.py selftest
+不带参数启动图形界面（菜单「帮助」里可以检查更新、自检）。
 退出码：0 成功（控制点＝自动通过）/ 1 有失败 / 2 拒绝执行 / 3 已取消 / 4 控制点需人工核对 / 10 有新版本（check-update）。
+selftest 的退出码：0 全部通过 / 1 有失败项。
 """
 
 import argparse
@@ -73,7 +75,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -92,6 +94,84 @@ XMP_LOCATION_FIELDS = (
 XMP_ATTITUDE_FIELDS = r"Gimbal\w*|Flight\w*"
 
 TIFF_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+
+
+# ---------------------------------------------------------------------------
+# 地理库的数据路径（D-34）
+#   GDAL 和 PROJ 的数据随包带，程序自己指过去；不看使用者电脑上装过的
+#   GDAL / PROJ / conda / QGIS 留下的环境变量，也不依赖 PATH。
+#   打包版（PyInstaller --onedir）里这些目录都在程序文件夹内；
+#   源码运行时从已装好的库里找。
+# ---------------------------------------------------------------------------
+
+def _bundle_dir():
+    """打包后程序文件所在目录（onedir 时是 exe 同级的 _internal）；源码运行时返回空串。"""
+    return getattr(sys, "_MEIPASS", "") or ""
+
+
+def geo_data_dirs():
+    """返回 (GDAL_DATA 目录, rasterio 的 PROJ 数据目录, pyproj 的 PROJ 数据目录)。
+
+    找不到的返回空串（调用方跳过）。
+
+    注意：rasterio 自带的 PROJ（GDAL 3.10 → PROJ 9.6）和 pyproj 自带的 PROJ（9.5）
+    要各自的 proj.db，两个 proj.db 的格式版本不一样，混用会报
+    "DATABASE.LAYOUT.VERSION ... comes from another PROJ installation"。
+    所以这里分开找：GDAL/PROJ_DATA 用 rasterio 那套，pyproj 用它自己那套。"""
+    base = _bundle_dir()
+    if base:
+        return (os.path.join(base, "rasterio", "gdal_data"),
+                os.path.join(base, "rasterio", "proj_data"),
+                os.path.join(base, "pyproj", "proj_dir", "share", "proj"))
+    import importlib.util
+
+    def pkg_dir(name):
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            return ""
+        if spec is None or not spec.submodule_search_locations:
+            return ""
+        return list(spec.submodule_search_locations)[0]
+
+    ras = pkg_dir("rasterio")
+    pyj = pkg_dir("pyproj")
+    # pyproj 的数据目录，按 pyproj.datadir 自己的优先级找（不用 import pyproj，免得拖慢启动）：
+    #   1) 包内 proj_dir/share/proj   2) sys.prefix/share/proj   3) sys.prefix/Library/share/proj（conda）
+    pyproj_dir = ""
+    for cand in (os.path.join(pyj, "proj_dir", "share", "proj") if pyj else "",
+                 os.path.join(sys.prefix, "share", "proj"),
+                 os.path.join(sys.prefix, "Library", "share", "proj")):
+        if cand and os.path.isfile(os.path.join(cand, "proj.db")):
+            pyproj_dir = cand
+            break
+    return (os.path.join(ras, "gdal_data") if ras else "",
+            os.path.join(ras, "proj_data") if ras else "",
+            pyproj_dir)
+
+
+def setup_geo_env():
+    """把 GDAL/PROJ 的数据指到程序自带的那套。必须在 import rasterio / pyproj 之前调用。
+
+    忽略电脑上已有的 GDAL_DATA / PROJ_DATA / PROJ_LIB（conda、QGIS 等装的），
+    免得它们指向别的版本的 proj.db。返回 pyproj 自己的 PROJ 数据目录（找不到是空串）。"""
+    gdal, rast_proj, pyproj_dir = geo_data_dirs()
+    if gdal and os.path.isdir(gdal):
+        os.environ["GDAL_DATA"] = gdal
+    if rast_proj and os.path.isdir(rast_proj):
+        os.environ["PROJ_DATA"] = rast_proj
+    os.environ.pop("PROJ_LIB", None)   # 老名字（PROJ 9.1 以前）会盖掉 PROJ_DATA
+    return pyproj_dir if (pyproj_dir and os.path.isdir(pyproj_dir)) else ""
+
+
+def subprocess_env():
+    """给子进程（Metashape）用的环境：去掉我们为 GDAL/PROJ 设的变量，
+    免得 Metashape 去读我们包里那套数据。"""
+    env = dict(os.environ)
+    for k in ("GDAL_DATA", "PROJ_DATA", "PROJ_LIB"):
+        env.pop(k, None)
+    return env
+
 
 
 class JpegError(Exception):
@@ -1039,7 +1119,7 @@ def align_one(photo_dir, out_dir, metashape, accuracy="high", keypoints=DEFAULT_
             raise RuntimeError("目录里没有 JPG")
         with open(console, "wb") as fcon:
             proc = subprocess.Popen([metashape, "-r", str(script), str(params)], stdin=subprocess.DEVNULL,
-                                    stdout=fcon, stderr=subprocess.STDOUT, cwd=str(tmp),
+                                    stdout=fcon, stderr=subprocess.STDOUT, cwd=str(tmp), env=subprocess_env(),
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             offset = 0
             partial = ""
@@ -1907,7 +1987,7 @@ def _run_ms_script(metashape, script_text, params, tmp, on_event, stop_event=Non
     t_start = time.time()
     with open(tmp / "console.txt", "wb") as fcon:
         proc = subprocess.Popen([metashape, "-r", str(script), str(pfile)], stdin=subprocess.DEVNULL,
-                                stdout=fcon, stderr=subprocess.STDOUT, cwd=str(tmp),
+                                stdout=fcon, stderr=subprocess.STDOUT, cwd=str(tmp), env=subprocess_env(),
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             offset, partial, stage = 0, "", ""
@@ -6760,6 +6840,181 @@ def run_survey_batch(items, out_dir, metashape, plan=False, dom_dsm=False, resol
 
 
 # ---------------------------------------------------------------------------
+# 自检（selftest，D-34）
+#   检查随包带的 numpy / rasterio（GDAL）/ shapely / pyproj / sqlite3 能不能用。
+#   只在跑 selftest 时才 import 这些库，其它命令不受影响、启动不变慢。
+# ---------------------------------------------------------------------------
+
+SELFTEST_EPSG = 4543        # CGCS2000 / 3 度带，中央经线 102°E
+SELFTEST_TOL_MM = 1.0       # 坐标换算允许的误差：1 毫米
+
+
+def run_selftest(log=None):
+    """自检。在临时目录里写读几种 GeoTIFF、换算一次坐标、做一次几何运算、开一次 sqlite3。
+
+    返回 (是否全部通过, [(名字, 是否通过, 细节), ...])。临时文件跑完删掉。"""
+    import shutil
+    import tempfile
+
+    if log is None:
+        def log(_s):
+            pass
+
+    results = []
+
+    def add(name, ok, detail=""):
+        results.append((name, bool(ok), str(detail)))
+        log("%s %s%s" % ("通过" if ok else "失败", name, ("：" + str(detail)) if detail else ""))
+        return bool(ok)
+
+    tmp = tempfile.mkdtemp(prefix="uav_selftest_")
+    try:
+        # ---- 数据目录在不在程序里 ----
+        gdal, rast_proj, pyproj_dir = geo_data_dirs()
+        add("GDAL/PROJ 数据目录随包带",
+            bool(gdal) and os.path.isdir(gdal) and bool(rast_proj) and os.path.isdir(rast_proj),
+            "GDAL_DATA=%s；PROJ_DATA=%s" % (gdal or "（没找到）", rast_proj or "（没找到）"))
+
+        # ---- numpy / rasterio ----
+        try:
+            import numpy
+            import rasterio
+            from rasterio.enums import Resampling
+            from rasterio.transform import from_origin
+        except Exception as ex:
+            add("导入 numpy / rasterio", False, "%s: %s" % (type(ex).__name__, ex))
+            return False, results
+        add("导入 numpy / rasterio", True,
+            "numpy %s；rasterio %s（GDAL %s）" % (numpy.__version__, rasterio.__version__,
+                                                rasterio.__gdal_version__))
+
+        transform = from_origin(500000.0, 3900000.0, 1.0, 1.0)
+
+        # ---- 1) RGBA + Deflate + 512 分块 + 金字塔 ----
+        try:
+            tif = os.path.join(tmp, "rgba.tif")
+            data = numpy.zeros((4, 64, 64), dtype="uint8")
+            data[0, :, :] = 10
+            data[1, :, :] = 20
+            data[2, :, :] = 30
+            data[3, :, :] = 255
+            data[0, 5:10, 5:10] = 200
+            prof = dict(driver="GTiff", width=64, height=64, count=4, dtype="uint8",
+                        crs="EPSG:%d" % SELFTEST_EPSG, transform=transform,
+                        tiled=True, blockxsize=512, blockysize=512, compress="deflate")
+            with rasterio.open(tif, "w", **prof) as ds:
+                ds.write(data)
+            with rasterio.open(tif, "r+") as ds:
+                ds.build_overviews([2, 4], Resampling.nearest)
+                ds.update_tags(ns="rio_overview", resampling="nearest")
+            with rasterio.open(tif) as ds:
+                ok_crs = ds.crs is not None and ds.crs.to_epsg() == SELFTEST_EPSG
+                ok_px = numpy.array_equal(ds.read(1), data[0]) and numpy.array_equal(ds.read(4), data[3])
+                ovr = list(ds.overviews(1))
+                ok_ovr = len(ovr) >= 2
+                ok_comp = ds.compression is not None and ds.compression.name.upper() == "DEFLATE"
+                ok_tile = tuple(ds.block_shapes[0]) == (512, 512)
+                add("写读 RGBA GeoTIFF（EPSG:4543 / Deflate / 512 分块 / 金字塔）",
+                    ok_crs and ok_px and ok_ovr and ok_comp and ok_tile,
+                    "坐标系=%s；像素一致=%s；金字塔=%s；压缩=%s；分块=%s" % (
+                        ds.crs.to_string() if ds.crs else None, ok_px, ovr,
+                        ds.compression.name if ds.compression else None, tuple(ds.block_shapes[0])))
+        except Exception as ex:
+            add("写读 RGBA GeoTIFF（EPSG:4543 / Deflate / 512 分块 / 金字塔）", False,
+                "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 2) float32 + NoData -9999 ----
+        try:
+            tif = os.path.join(tmp, "dsm.tif")
+            d = numpy.full((1, 32, 32), -9999.0, dtype="float32")
+            d[0, 10:20, 10:20] = 12.5
+            prof = dict(driver="GTiff", width=32, height=32, count=1, dtype="float32",
+                        crs="EPSG:%d" % SELFTEST_EPSG, transform=transform, nodata=-9999.0)
+            with rasterio.open(tif, "w", **prof) as ds:
+                ds.write(d)
+            with rasterio.open(tif) as ds:
+                got = ds.read(1)          # count=1，读出来是二维 (行, 列)
+                ok = (ds.nodata == -9999.0 and numpy.array_equal(got, d[0])
+                      and float(got[15, 15]) == 12.5 and float(got[0, 0]) == -9999.0)
+                add("写读 float32 GeoTIFF（NoData -9999）", ok,
+                    "nodata=%s；中间像元=%s；边角像元=%s" % (ds.nodata, got[15, 15], got[0, 0]))
+        except Exception as ex:
+            add("写读 float32 GeoTIFF（NoData -9999）", False, "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 3) BigTIFF ----
+        try:
+            tif = os.path.join(tmp, "big.tif")
+            prof = dict(driver="GTiff", width=64, height=64, count=1, dtype="uint16",
+                        crs="EPSG:%d" % SELFTEST_EPSG, transform=transform, BIGTIFF="YES")
+            with rasterio.open(tif, "w", **prof) as ds:
+                ds.write(numpy.zeros((1, 64, 64), dtype="uint16"))
+            with rasterio.open(tif) as ds:
+                ok_raster = ds.width == 64 and ds.height == 64
+            with open(tif, "rb") as f:
+                head = f.read(4)
+            is_bigtiff = head[:2] == b"II" and head[2] == 43
+            add("写读 BigTIFF", ok_raster and is_bigtiff,
+                "文件头版本号=%d（43 是 BigTIFF，42 是普通 TIFF）；大小=%d 字节；大小可读=%s" % (
+                    head[2], os.path.getsize(tif), ok_raster))
+        except Exception as ex:
+            add("写读 BigTIFF", False, "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 4) pyproj：WGS84 -> EPSG:4543，和独立算出来的已知值比（<= 1 毫米）----
+        try:
+            import pyproj
+            if pyproj_dir:
+                try:
+                    pyproj.datadir.set_data_dir(pyproj_dir)
+                except Exception:
+                    pass
+            from pyproj import Transformer
+            tr = Transformer.from_crs("EPSG:4326", "EPSG:%d" % SELFTEST_EPSG, always_xy=True)
+            x, y = tr.transform(102.5, 34.5)
+            # 已知值用高斯-克吕格投影自己推的（不经过 pyproj）：中央经线 102°E、东偏 500000
+            rx, ry = 545920.2014, 3819238.3878
+            dx = abs(x - rx) * 1000.0
+            dy = abs(y - ry) * 1000.0
+            add("pyproj 坐标换算（WGS84 → EPSG:4543，误差 ≤ 1 毫米）",
+                dx <= SELFTEST_TOL_MM and dy <= SELFTEST_TOL_MM,
+                "算出 (%.4f, %.4f)；已知 (%.4f, %.4f)；差 %.4f / %.4f 毫米（pyproj %s，PROJ %s）" % (
+                    x, y, rx, ry, dx, dy, pyproj.__version__, pyproj.proj_version_str))
+        except Exception as ex:
+            add("pyproj 坐标换算（WGS84 → EPSG:4543，误差 ≤ 1 毫米）", False,
+                "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 5) shapely：buffer / simplify ----
+        try:
+            from shapely.geometry import LineString, Point
+            buf = Point(100.0, 100.0).buffer(10.0)
+            ok_buf = abs(buf.area - math.pi * 100.0) < 1.0
+            line = LineString([(0, 0), (1, 0.001), (2, 0), (3, 0.002), (4, 0)])
+            simp = line.simplify(0.1)
+            ok_sim = len(simp.coords) < len(line.coords)
+            add("shapely 几何运算（buffer / simplify）", ok_buf and ok_sim,
+                "buffer 面积=%.2f（正圆 %.2f）；simplify 后 %d 个点（原 %d 个）" % (
+                    buf.area, math.pi * 100.0, len(simp.coords), len(line.coords)))
+        except Exception as ex:
+            add("shapely 几何运算（buffer / simplify）", False, "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 6) sqlite3：内存库 ----
+        try:
+            import sqlite3
+            con = sqlite3.connect(":memory:")
+            con.execute("create table t (a integer, b text)")
+            con.execute("insert into t values (?, ?)", (1, "x"))
+            row = con.execute("select a, b from t").fetchone()
+            con.close()
+            add("sqlite3（内存库）", row == (1, "x"), "建表插入后查到 %s" % (row,))
+        except Exception as ex:
+            add("sqlite3（内存库）", False, "%s: %s" % (type(ex).__name__, ex))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    ok_all = all(r[1] for r in results)
+    return ok_all, results
+
+
+# ---------------------------------------------------------------------------
 # 图形界面
 # ---------------------------------------------------------------------------
 
@@ -7229,8 +7484,37 @@ def run_gui():
     for mode in ("system", "light", "dark"):
         m_look.add_radiobutton(label=appearance_label[mode], value=mode, variable=var_appearance, command=set_appearance)
     menubar.add_cascade(label="外观", menu=m_look)
+    def start_selftest():
+        q2 = queue.Queue()
+
+        def worker():
+            try:
+                q2.put((run_selftest(), None))
+            except Exception as ex:
+                q2.put((None, ex))
+
+        def poll():
+            try:
+                res, err = q2.get_nowait()
+            except queue.Empty:
+                root.after(200, poll)
+                return
+            if err is not None:
+                ui_box.showerror(APP_NAME, "自检失败：\n%s" % err)
+                return
+            ok, rows = res
+            lines = ["自检%s（共 %d 项）：" % ("全部通过" if ok else "有失败项", len(rows)), ""]
+            for name, passed, detail in rows:
+                lines.append("%s %s%s" % ("[通过]" if passed else "[失败]", name,
+                                          ("：" + detail) if detail else ""))
+            (ui_box.showinfo if ok else ui_box.showwarning)(APP_NAME, "\n".join(lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        root.after(200, poll)
+
     m_help = tk.Menu(menubar, tearoff=0)
     m_help.add_command(label="检查更新", command=lambda: start_update_check(True))
+    m_help.add_command(label="自检", command=start_selftest)
     m_help.add_checkbutton(label="启动时自动检查更新", variable=var_auto_update, command=toggle_auto_update)
     m_help.add_separator()
     m_help.add_command(label="项目主页（GitHub）", command=lambda: webbrowser.open(HOMEPAGE_URL))
@@ -9129,6 +9413,7 @@ def _print(s):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    setup_geo_env()   # D-34：在 import rasterio / pyproj 之前把 GDAL/PROJ 数据指到包里
     if not argv:
         try:
             run_gui()
@@ -9245,6 +9530,9 @@ def main(argv=None):
     sd.add_argument("--site", default="", help="只整理这些工点（工点名，逗号分隔）；默认全部")
     sd.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
+    st = sub.add_parser("selftest", help="自检：检查随包带的 GDAL/PROJ/numpy/shapely/sqlite3 能不能用"
+                        "（退出码 0 全部通过 / 1 有失败项）")
+    st.add_argument("--log", help="把自检结果另存到这个文件（打包的 exe 没有控制台时用）")
     args = ap.parse_args(argv)
     if args.cmd == "survey-deliver":
         return _cli_survey_deliver(args)
@@ -9258,6 +9546,22 @@ def main(argv=None):
         return _cli_align(args)
     if args.cmd in ("gcp-transfer", "gcp-init"):
         return _cli_gcp(args)
+    if args.cmd == "selftest":
+        flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+        def slog(t):
+            _print(t)
+            if flog:
+                flog.write(t + "\n")
+                flog.flush()
+
+        try:
+            ok, res = run_selftest(log=slog)
+            slog("自检结果：%s（%d 项）" % ("全部通过" if ok else "有失败项", len(res)))
+        finally:
+            if flog:
+                flog.close()
+        return 0 if ok else 1
     if args.cmd == "check-update":
         try:
             info = check_update()

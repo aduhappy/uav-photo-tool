@@ -1,10 +1,10 @@
 # 无人机照片工具（uav-photo-tool）
 
-一个**单文件、免安装**的 Windows 小工具，用来预处理无人机航测照片。双击 exe 就能用，不需要装 Python。
+一个**免安装**的 Windows 小工具，用来预处理无人机航测照片。装上或者直接解压就能用，不需要装 Python 和任何库。
 
 最初是为**室内航测**写的：室内 GPS 信号差，同一架次里有的照片坐标是 0,0，有的在漂，有的又是 RTK 固定解。空三软件把这些坐标当作先验，结果互相打架，对齐不上。这个工具先把定位信息剥掉，再做只靠影像匹配的空三。
 
-> English: A single-file, zero-dependency Windows tool for preprocessing drone survey photos. It strips GPS/location metadata from DJI JPEGs **byte-for-byte without re-encoding the image**, and can drive Agisoft Metashape Pro to align the photos and export a Blocks Exchange XML that ContextCapture / iTwin Capture Modeler can import. For repeated surveys of the same site it can also transfer ground control points from a reference epoch with zero manual tie-pointing, adjust, self-check, and export the block in local metric coordinates.
+> English: A zero-dependency Windows tool for preprocessing drone survey photos. It strips GPS/location metadata from DJI JPEGs **byte-for-byte without re-encoding the image**, and can drive Agisoft Metashape Pro to align the photos and export a Blocks Exchange XML that ContextCapture / iTwin Capture Modeler can import. For repeated surveys of the same site it can also transfer ground control points from a reference epoch with zero manual tie-pointing, adjust, self-check, and export the block in local metric coordinates.
 
 ## 功能
 
@@ -237,7 +237,20 @@ uav_photo_tool.exe survey-deliver <输出目录> [--to 交付目录] [--site 工
 
 ## 下载
 
-到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的 `uav-photo-tool_v*.exe`，双击运行即可。
+到 [Releases](https://github.com/aduhappy/uav-photo-tool/releases) 下载最新的版本，有**两种**给法，任选一种：
+
+| 附件 | 怎么用 |
+|:--|:--|
+| `无人机照片工具_v<版本>_安装包.exe` | 双击安装。**默认装到 `%LOCALAPPDATA%\Programs\无人机照片工具\`**（当前用户目录，**不需要管理员权限**），向导里可以改目录。装完在开始菜单有快捷方式，桌面也有（默认勾，可以去掉）。 |
+| `无人机照片工具_v<版本>_免安装.zip` | 解压到任意目录，双击里面的 `无人机照片工具.exe` 就能用。适合放在 U 盘里、或者不想装东西的场合。 |
+
+两种给法里的程序**是同一份**，功能一样。
+
+- **怎么卸**：安装包在「设置 → 应用」里找「无人机照片工具」卸载，或者直接跑安装目录里的 `unins000.exe`。也可以在「开始菜单 → 无人机照片工具 → 卸载」。
+  卸载**只删程序文件**，不会删你的设置和配置（`%APPDATA%\无人机照片工具\config.json`）和任何用户数据——重装后设置还在。
+- 免安装 zip 不用卸载：把解压出来的文件夹删了就行。
+- 两个附件都**自带 GDAL / PROJ / numpy / shapely / pyproj**（约 180 MB），不用另外装 Python 或任何库。程序用的 GDAL 数据是它自己包里那份，**不会**读你电脑上装过的 GDAL / PROJ / QGIS / conda 的环境变量。
+- 想确认程序没问题：在命令行里跑 `无人机照片工具.exe selftest`，会检查 GDAL/PROJ/numpy/shapely/sqlite3 能不能用，退出码 0 就是全好（界面里也有：菜单「帮助 → 自检」）。
 
 软件启动时会在后台查一次有没有新版本，有的话会弹窗提示并给出下载链接，不会自动下载或替换。不想要这个提示，可以在菜单「帮助 → 启动时自动检查更新」里关掉。
 
@@ -247,6 +260,7 @@ uav_photo_tool.exe survey-deliver <输出目录> [--to 交付目录] [--site 工
 - 「剔除定位」不需要安装任何东西。
 - 「空三」「控制点」「批量迁移」「影像处理」需要 Metashape **Pro** 版（标准版不支持脚本，用不了）。目前只在 Metashape Pro 1.7.2 上实测过，2.x 和 PhotoScan 1.4 没有测过，欢迎反馈。
 - 已测试的相机：DJI M3E（Mavic 3 Enterprise）；「影像处理」用 DJI Mavic 3 系列（Hasselblad L2D-20c）实景照片测过。其他大疆机型的照片结构相近，应该也能用；遇到问题请提 Issue。
+- 从 v1.5 起是**文件夹版**（不是一个 exe）：启动直接读程序目录里的文件，比以前单文件 exe 每次启动要解压一遍要快。
 
 ## 命令行
 
@@ -276,6 +290,7 @@ uav_photo_tool.py survey-clip <工点输出目录>... [--line 范围线.kml|.shp
 uav_photo_tool.py survey-deliver <输出目录> [--to 交付目录] [--site 工点名,...] [--log 日志文件]
 
 uav_photo_tool.py check-update
+uav_photo_tool.py selftest [--log 自检结果.txt]
 ```
 
 不带参数就启动图形界面。
@@ -293,27 +308,37 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
 | `survey-batch` | 选中的工点全部完成、部分对齐或跳过（`--plan` 也返回 0） | 有工点失败（含对齐率低于 80%、DOM/DSM 没做成） | 参数错误（如 `--epsg` 不是 4534～4554、输出目录在照片目录里、`--pick` 越界） | 已取消 | | |
 | `survey-deliver` | 全部整理好 | 有工点没整理成（如复制后 SHA-256 对不上） | 参数错误（如交付目录在输出目录里、输出目录不存在） | 已取消 | | |
 | `check-update` | 已是最新 | 查询失败 | | | | 有新版本 |
+| `selftest` | 全部通过 | 有失败项 | | | | |
 
 自己写批量脚本时请把 4 当作「没通过」处理，不要当成功。
 
 ## 从源码运行和打包
 
-- 源码只有一个文件 `src/uav_photo_tool.py`。需要 Python 3.8 或更高版本（带 tkinter）。处理逻辑和命令行只用 Python 标准库，不装任何东西就能跑命令行；图形界面另外要装界面库 CustomTkinter（版本钉在 `requirements-gui.txt`）：
+- 源码只有一个文件 `src/uav_photo_tool.py`。需要 Python 3.8 或更高版本（带 tkinter）。图形界面要用界面库 CustomTkinter（版本钉在 `requirements-gui.txt`）；处理用的地理库 numpy / rasterio（含 GDAL）/ shapely / pyproj 版本钉在 `requirements.txt`：
 
   ```powershell
-  python -m pip install -r requirements-gui.txt   # 只有界面需要
+  python -m pip install -r requirements-gui.txt   # 界面
+  python -m pip install -r requirements.txt        # 地理库（GDAL 裁边等新功能要用）
   python src/uav_photo_tool.py            # 启动界面
-  python src/uav_photo_tool.py --help     # 命令行，不需要 CustomTkinter
+  python src/uav_photo_tool.py --help     # 命令行
+  python src/uav_photo_tool.py selftest   # 自检：GDAL/PROJ/numpy/shapely/sqlite3 能不能用
   ```
 
   界面支持浅色（默认）/ 深色 / 跟随系统，在菜单「外观」里切换，会记住。
 
-- 打包成单文件 exe 需要先装 PyInstaller 和 CustomTkinter（脚本开头会检查版本，并把 CustomTkinter 的主题资源打进 exe），输出在 `发布\` 目录；打好的 exe 拷到别的电脑直接用，不用装任何东西：
+- 打包成**文件夹版 + 安装包 + 免安装 zip**（v1.5 起；以前是单文件 exe，脚本 `scripts/build_exe.ps1` 已标「已取代」）：
+  用一个**干净的 Python 3.11 环境**（不要用 conda 的 env——conda 装的 numpy 依赖 MKL，DLL 在 `Library\bin` 里带不走），先装好版本钉死的依赖，再跑打包脚本。脚本开头会核对已装版本和 `requirements*.txt` 一致，不一致就停：
 
   ```powershell
-  python -m pip install pyinstaller -r requirements-gui.txt
-  pwsh -File scripts/build_exe.ps1 -Python python
+  python -m venv .venv
+  .venv\Scripts\python -m pip install -r requirements.txt -r requirements-gui.txt
+  .venv\Scripts\python -m pip install pyinstaller==6.22.3
+  pwsh -File scripts/build_installer.ps1 -Python .venv\Scripts\python.exe -Build <中间文件目录>
   ```
+
+  脚本做三件事：① PyInstaller `--onedir --windowed` 打文件夹版；② 调 Inno Setup 6 编译安装包 `发布\无人机照片工具_v<版本>_安装包.exe`（安装脚本在 `installer\uav_photo_tool.iss`，中文向导用 `installer\ChineseSimplified.isl`）；③ 打免安装 zip `发布\无人机照片工具_v<版本>_免安装.zip`。版本号只从源码的 `APP_VERSION` 读。
+
+  还需要装 Inno Setup 6（默认在 `C:\Program Files (x86)\Inno Setup 6\`）。
 
 - 测试脚本（需要 Pillow）：
 
@@ -329,3 +354,14 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
 [MIT](LICENSE)。Metashape 是 Agisoft 的商业软件，本工具不包含它，只调用你电脑上已安装的版本。
 
 界面使用 [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)（Copyright (c) 2023 Tom Schimansky，MIT 许可），打包进 exe 的还有它的依赖 [darkdetect](https://github.com/albertosottile/darkdetect)（BSD-3-Clause）和 [packaging](https://github.com/pypa/packaging)（Apache-2.0 或 BSD-2-Clause）。
+
+从 v1.5 起，打包的程序还带这几个处理用的库（都是自由/开源许可，许可全文在程序的 `_internal` 里各自的 `dist-info/licenses` 或包目录里）：
+
+| 库 | 用途 | 许可 |
+|---|---|---|
+| [numpy](https://numpy.org/) | 数值计算 | BSD-3-Clause |
+| [rasterio](https://rasterio.readthedocs.io/)（含 [GDAL](https://gdal.org/)、[PROJ](https://proj.org/)、[GEOS](https://libgeos.org/)） | 读写 GeoTIFF、坐标系 | BSD-3-Clause / MIT / MIT / LGPL-2.1 |
+| [shapely](https://shapely.readthedocs.io/) | 几何运算 | BSD-3-Clause |
+| [pyproj](https://pyproj4.github.io/pyproj/) | 坐标换算 | MIT |
+
+安装向导的简体中文翻译来自 [Inno-Setup-Chinese-Simplified-Translation](https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation)（MIT）。
