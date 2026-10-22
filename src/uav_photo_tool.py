@@ -13,6 +13,8 @@
      勾了 DOM/DSM 默认自动裁边（D-32）：只认「DOM 有影像 + 不插值的密集点云真有点 + 点云够密」的地方，补缝、取最大连片、
      填小洞、往里收 3 米成范围线，DOM 和 DSM 用同一条线同一个像元网格裁（线外透明 / NoData），范围线另存 KML（WGS84）
      + SHP（同 DOM 坐标系）。「按范围线重新裁剪…」/ survey-clip：用户改了线（可挖洞、加块）后只重新导出，不重建。
+     列表可按照片数排序（点列头「照片数」，处理顺序跟着列表走）。「整理交付目录」/ survey-deliver：每个工点一个文件夹，
+     只放 <工点名>DOM.tif/.tfw、<工点名>DSM.tif/.tfw，复制并逐个核对 SHA-256，写 交付清单.csv；可勾「处理完自动整理」。
 
 规则：
   - 字节级原位等长改写，输出大小 = 原文件，SOS 之后的数据逐字节不变，不解码图像。
@@ -36,7 +38,9 @@
   python uav_photo_tool.py survey-batch <上级目录> --out <输出> [--epsg auto|4543] [--dom-dsm] [--resolution 0.03]
                                         [--clip auto|none|范围线.kml|.shp] [--clip-inset 3] [--clip-density 50]
                                         [--include "*弃渣场*"] [--pick 1,3,5-9] [--skip 名字,...] [--plan]
+                                        [--sort scan|photos-desc|photos-asc] [--deliver [--deliver-to 交付目录]]
   python uav_photo_tool.py survey-clip <工点输出目录>... [--line <KML或SHP>] [--clip-inset 3] [--clip-density 50]
+  python uav_photo_tool.py survey-deliver <输出目录> [--to 交付目录] [--site 工点名,...]
   python uav_photo_tool.py check-update
 不带参数启动图形界面（菜单「帮助」里可以检查更新）。
 退出码：0 成功（控制点＝自动通过）/ 1 有失败 / 2 拒绝执行 / 3 已取消 / 4 控制点需人工核对 / 10 有新版本（check-update）。
@@ -69,7 +73,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -5939,6 +5943,245 @@ def run_survey_clip(site_dirs, metashape, source="dir", line_file=None, inset=SU
     return {"rows": rows, "exit": code, "cancelled": cancelled}
 
 
+# ---------------------------------------------------------------------------
+# 整理交付目录（T14 的做法做进软件）：<交付目录>\<工点名>\ 只放 <工点名>DOM.tif/.tfw、<工点名>DSM.tif/.tfw 四个文件，
+# 复制不移动（原结果目录只读，以后还要按范围线重新裁剪），每个文件先写临时名、读回核对 SHA-256 一致才换上，只带修改时间；
+# 根目录写 交付清单.csv（UTF-8 带 BOM）。再整理一次时大小、修改时间都没变的文件不重复复制。
+# ---------------------------------------------------------------------------
+SURVEY_DELIVER_SUFFIX = "_交付"     # 默认交付目录 = 输出目录同级的 <输出目录名>_交付
+SURVEY_DELIVER_FILES = ("DOM.tif", "DOM.tfw", "DSM.tif", "DSM.tfw")
+SURVEY_DELIVER_CSV = "交付清单.csv"
+SURVEY_DELIVER_FIELDS = ("工点", "文件名", "大小(字节)", "SHA-256", "坐标系", "分辨率(米)", "行×列", "DOM与DSM行列一致",
+                         "处理状态")
+SURVEY_DELIVER_CHUNK = 8 * 1024 * 1024
+SURVEY_SORTS = ("scan", "photos-desc", "photos-asc")   # 工点顺序：扫描顺序 / 照片数从多到少 / 从少到多（也是处理顺序）
+
+
+def survey_sort_items(items, how="scan"):
+    """按 how 排工点（照片数一样的按扫描序号），返回新列表；序号不变（--pick 仍按扫描序号）。"""
+    if how == "photos-desc":
+        return sorted(items, key=lambda it: (-it["n"], it["idx"]))
+    if how == "photos-asc":
+        return sorted(items, key=lambda it: (it["n"], it["idx"]))
+    return sorted(items, key=lambda it: it["idx"])
+
+
+def survey_deliver_default(out_dir):
+    p = Path(os.path.abspath(out_dir))
+    return p.parent / (p.name + SURVEY_DELIVER_SUFFIX)
+
+
+def survey_report_srs(path):
+    """处理报告「坐标系：」那一行去掉来源说明，如「EPSG:4543 CGCS2000 / 3-degree Gauss-Kruger CM 102E（东坐标不带带号）」。"""
+    try:
+        for ln in Path(path).read_text(encoding="utf-8-sig").splitlines():
+            if ln.startswith("坐标系："):
+                return " ".join(ln[len("坐标系："):].split("；来源：")[0].split())
+    except OSError:
+        pass
+    return ""
+
+
+def survey_deliver_sites(out_dir):
+    """输出目录里能交付的工点 [(工点名, 目录, 处理状态)]，和完成了却没有齐 DOM/DSM 的 [(工点名, 原因)]。
+    失败、已取消、没有报告的目录（含改名保留的 _上次失败/_上次已取消）不算，不列。"""
+    ok, skipped = [], []
+    try:
+        subs = sorted((d for d in Path(out_dir).iterdir() if d.is_dir()), key=lambda d: d.name)
+    except OSError:
+        return ok, skipped
+    for d in subs:
+        n = d.name
+        rep = d / SURVEY_REPORT
+        if not rep.is_file() or (d / "已取消.txt").exists():
+            continue
+        verdict = survey_read_report(rep).get("状态", "").split("（")[0].strip()
+        if verdict not in ("完成", "部分对齐"):
+            continue
+        miss = [n + f for f in SURVEY_DELIVER_FILES if not (d / (n + f)).is_file()]
+        if len(miss) == len(SURVEY_DELIVER_FILES):
+            skipped.append((n, "没有 DOM/DSM（处理时没勾）"))
+        elif miss:
+            skipped.append((n, "缺 %s" % "、".join(miss)))
+        else:
+            ok.append((n, str(d), verdict))
+    return ok, skipped
+
+
+def _file_sha256(path, stopped, on_bytes):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            if stopped():
+                raise AlignCancelled()
+            b = f.read(SURVEY_DELIVER_CHUNK)
+            if not b:
+                return h.hexdigest()
+            h.update(b)
+            on_bytes(len(b))
+
+
+def _deliver_copy(src, dst, stopped, on_bytes):
+    """src 复制成 dst：先写 <dst>.tmp_part，只带修改时间（不带只读属性），读回 SHA-256 与边复制边算的源文件一致才换上。
+    返回 SHA-256；对不上抛 ValueError（dst 原样不动）。"""
+    tmp = Path(str(dst) + ".tmp_part")
+    h = hashlib.sha256()
+    try:
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            while True:
+                if stopped():
+                    raise AlignCancelled()
+                b = fi.read(SURVEY_DELIVER_CHUNK)
+                if not b:
+                    break
+                h.update(b)
+                fo.write(b)
+                on_bytes(len(b))
+        st = os.stat(src)
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        got = _file_sha256(tmp, stopped, lambda k: None)
+        if got != h.hexdigest():
+            raise ValueError("复制后 SHA-256 对不上（%s），没换上" % Path(dst).name)
+        os.replace(tmp, dst)
+        return got
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _read_deliver_csv(path):
+    rows = {}
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                if r.get("工点") and r.get("文件名"):
+                    rows[(r["工点"], r["文件名"])] = r
+    except (OSError, csv.Error, UnicodeDecodeError):
+        pass
+    return rows
+
+
+def survey_deliver(out_dir, dest=None, sites=None, log=None, progress=None, stop_event=None):
+    """把输出目录里完成/部分对齐、DOM/DSM 齐的工点整理到交付目录（默认 <输出目录>_交付）。sites=None：全部能交付的；
+    给工点名列表就只整理这些（交付目录里别的工点照旧留在清单里）。交付目录里别的文件不动、不删。
+    返回 {"dest", "csv", "sites", "skipped", "failed", "copied", "same", "bytes", "cancelled", "exit"}；
+    exit：0 全部成功 / 1 有工点没做成 / 3 取消。"""
+    log = log or (lambda s: None)
+    progress = progress or (lambda f, s: None)
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    out = Path(os.path.abspath(out_dir))
+    dest = Path(os.path.abspath(dest)) if dest else survey_deliver_default(out)
+    if not out.is_dir():
+        raise ValueError("输出目录不存在：%s" % out)
+    if dest == out or out in dest.parents or dest in out.parents:
+        raise ValueError("交付目录不能是输出目录本身，也不能在它里面或包含它：%s" % dest)
+    ok, skipped = survey_deliver_sites(out)
+    if sites is not None:
+        want = set(sites)
+        ok = [x for x in ok if x[0] in want]
+        skipped = [x for x in skipped if x[0] in want]
+    csv_path = dest / SURVEY_DELIVER_CSV
+    old = _read_deliver_csv(csv_path)
+    dest.mkdir(parents=True, exist_ok=True)
+    log("—— 整理交付目录：%s → %s（%d 个工点，每个只放 DOM/DSM 四个文件，复制、不动原结果）" % (out, dest, len(ok)))
+    for n, why in skipped:
+        log("  跳过 %s：%s" % (n, why))
+    total = sum((Path(d) / (n + f)).stat().st_size for n, d, _ in ok for f in SURVEY_DELIVER_FILES) or 1
+    done_bytes = [0]
+
+    def on_bytes(k):
+        done_bytes[0] += k
+        progress(min(done_bytes[0] / float(total), 1.0), "整理交付 %.0f/%.0f MB" % (done_bytes[0] / 1048576.0,
+                                                                                total / 1048576.0))
+
+    new_rows, failed, copied, same, cancelled = {}, [], 0, 0, False
+    for n, d, verdict in ok:
+        if stopped():
+            cancelled = True
+            break
+        try:
+            sd = dest / n
+            sd.mkdir(exist_ok=True)
+            info = {}
+            for kind in ("DOM", "DSM"):
+                g = geotiff_info(Path(d) / (n + kind + ".tif"))
+                g["tfw"] = read_tfw(Path(d) / (n + kind + ".tfw"))
+                info[kind] = g
+            pair = check_survey_raster_pair(info)
+            srs = survey_report_srs(Path(d) / SURVEY_REPORT)
+            rows, k_copy, k_same = [], 0, 0
+            for f in SURVEY_DELIVER_FILES:
+                src, dst = Path(d) / (n + f), sd / (n + f)
+                s_st = src.stat()
+                sha = None
+                if dst.is_file():
+                    d_st = dst.stat()
+                    if d_st.st_size == s_st.st_size and d_st.st_mtime_ns == s_st.st_mtime_ns:
+                        prev = old.get((n, dst.name))
+                        if prev and prev.get("大小(字节)") == str(s_st.st_size) and prev.get("SHA-256"):
+                            sha = prev["SHA-256"]        # 上次复制时核对过，大小和修改时间都没变
+                            on_bytes(s_st.st_size)
+                        else:
+                            a = _file_sha256(src, stopped, on_bytes)
+                            if a == _file_sha256(dst, stopped, lambda k: None):
+                                sha = a
+                if sha:
+                    k_same += 1
+                else:
+                    sha = _deliver_copy(src, dst, stopped, on_bytes)
+                    k_copy += 1
+                g = info[f[:3]]
+                rows.append({"工点": n, "文件名": dst.name, "大小(字节)": s_st.st_size, "SHA-256": sha, "坐标系": srs,
+                             "分辨率(米)": "%g" % abs(g["tfw"][0]),
+                             "行×列": "%d×%d" % (g["height"], g["width"]) if f.endswith(".tif") else "",
+                             "DOM与DSM行列一致": "否" if pair else "是", "处理状态": verdict})
+            new_rows[n] = rows
+            copied += k_copy
+            same += k_same
+            extra = sorted(x.name for x in sd.iterdir() if x.name not in {n + f for f in SURVEY_DELIVER_FILES})
+            log("  %s：复制 %d 个、已是最新 %d 个；%s；%s 米；%s 像元%s" % (
+                n, k_copy, k_same, srs or "坐标系（报告里没写）", rows[0]["分辨率(米)"], rows[0]["行×列"],
+                "" if verdict == "完成" else "（%s）" % verdict))
+            for p in pair:
+                log("    注意：%s" % p)
+            if extra:
+                log("    注意：交付目录里这个工点下还有别的文件，没动：%s" % "、".join(extra))
+        except AlignCancelled:
+            cancelled = True
+            break
+        except (OSError, ValueError, struct.error) as ex:
+            failed.append((n, str(ex)))
+            log("  %s：失败：%s" % (n, ex))
+    # 清单：这次整理的 + 交付目录里还在、上次清单里有的别的工点（这次失败的不列）
+    gone = set(new_rows) | {n for n, _ in failed}
+    allrows = {}
+    for (n, fn), r in old.items():
+        if n not in gone and (dest / n / fn).is_file():
+            allrows.setdefault(n, []).append(r)
+    allrows.update(new_rows)
+    order = {f: i for i, f in enumerate(SURVEY_DELIVER_FILES)}
+    out_rows = []
+    for n in sorted(allrows):
+        out_rows += sorted(allrows[n], key=lambda r, n=n: order.get(r["文件名"][len(n):], 9))
+    tmp = Path(str(csv_path) + ".tmp_part")
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as fcsv:
+        w = csv.DictWriter(fcsv, fieldnames=SURVEY_DELIVER_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in out_rows:
+            w.writerow(r)
+    os.replace(tmp, csv_path)
+    nbytes = sum(int(r.get("大小(字节)") or 0) for r in out_rows)
+    log("交付目录：%s；清单里 %d 个工点、%d 个文件，共 %.1f MB；这次复制 %d 个、已是最新 %d 个%s%s" % (
+        dest, len(allrows), len(out_rows), nbytes / 1048576.0, copied, same,
+        "；失败 %d 个工点" % len(failed) if failed else "", "；已取消，剩下的没整理" if cancelled else ""))
+    code = 3 if cancelled else 1 if failed else 0
+    return {"dest": str(dest), "csv": str(csv_path), "sites": sorted(new_rows), "skipped": skipped, "failed": failed,
+            "copied": copied, "same": same, "bytes": nbytes, "cancelled": cancelled, "exit": code}
+
+
 def _survey_result(it, out_dir, metashape, dom_dsm, resolution, keypoints, tiepoints, clip=SURVEY_CLIP_AUTO,
                    clip_inset=SURVEY_CLIP_INSET, clip_file=None, clip_density=SURVEY_CLIP_DENSITY):
     return {"name": it["name"], "dir": it["dir"], "out_dir": str(out_dir), "status": "失败", "reason": "",
@@ -8019,6 +8262,9 @@ def run_gui():
     v5_clip = tk.BooleanVar(value=bool(cfg5.get("survey_clip", True)))   # D-31：自动裁边，默认勾，记 config
     v5_inset = tk.StringVar(value=str(cfg5.get("survey_inset") or "%g" % SURVEY_CLIP_INSET))
     v5_density = tk.StringVar(value=str(cfg5.get("survey_density") or "%g" % SURVEY_CLIP_DENSITY))   # D-32，记 config
+    v5_sort = tk.StringVar(value=cfg5.get("survey_sort") if cfg5.get("survey_sort") in SURVEY_SORTS else "scan")
+    v5_deliver = tk.BooleanVar(value=bool(cfg5.get("survey_deliver", True)))   # 处理完自动整理交付目录，记 config
+    v5_deliver_to = tk.StringVar(value=cfg5.get("survey_deliver_to", ""))       # 空 = <输出目录>_交付
     srs_choices = [survey_srs_label(e) for e in range(SURVEY_EPSG_MIN, SURVEY_EPSG_MAX + 1)]
     v5_unify = tk.StringVar(value=survey_srs_label(4543))
     st5 = {"stop": None, "items": [], "rows": [], "scanned": None, "running": False, "scanning": False, "closing": False,
@@ -8062,11 +8308,11 @@ def run_gui():
         for w in (lbl5_res, e5_res):
             set_enabled(w, v5_domdsm.get())
         set_enabled(cb5_clip, v5_domdsm.get())          # 勾选框本身只看 DOM/DSM：不然一取消勾就再也勾不回来
+        set_enabled(cb5_deliver, v5_domdsm.get())       # 只出 XML 时没有 DOM/DSM 可交付
         for w in (lbl5_inset, e5_inset, lbl5_density, e5_density):
             set_enabled(w, v5_domdsm.get() and v5_clip.get())
     v5_domdsm.trace_add("write", update_res_state)
     v5_clip.trace_add("write", update_res_state)
-    update_res_state()
 
     uf5 = ctk.CTkFrame(tab5, fg_color="transparent")
     uf5.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
@@ -8078,6 +8324,17 @@ def run_gui():
     btn5_unify.grid(row=0, column=2, sticky="w", padx=(6, 0))
     ctk.CTkLabel(uf5, text="跳过这些工点（逗号分隔）：").grid(row=0, column=3, sticky="w", padx=(16, 4))
     ctk.CTkEntry(uf5, textvariable=v5_skip).grid(row=0, column=4, sticky="ew")
+    df5 = ctk.CTkFrame(uf5, fg_color="transparent")
+    df5.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 0))
+    cb5_deliver = ctk.CTkCheckBox(df5, text="处理完自动整理交付目录", variable=v5_deliver)
+    cb5_deliver.pack(side="left")
+    ctk.CTkLabel(df5, text="交付目录（空＝<输出目录>_交付）：").pack(side="left", padx=(16, 4))
+    btn5_deliver = button(df5, "整理交付目录…", width=120)
+    btn5_deliver.pack(side="right")
+    button(df5, "浏览…", lambda: pick_dir(v5_deliver_to, "选择交付目录（每个工点一个文件夹，只放 DOM/DSM）")).pack(
+        side="right", padx=(6, 6))
+    ctk.CTkEntry(df5, textvariable=v5_deliver_to).pack(side="left", fill="x", expand=True)
+    update_res_state()
     hint(tab5, "每个直接含照片的文件夹算一个工点，下面的子文件夹（如 正摄）并进来，所有照片都用。本页签不去定位：照片 GPS "
                "换算到工点的 CGCS2000 3 度带（不带带号）作相机参考，按照片平均经度自动选最近的带，可在列表里逐个改，"
                "改过的记住；精度取决于机载 GPS（米级），没用控制点。带定位不到一半的、在子目录里的（如 无正射影像 下面的）"
@@ -8090,7 +8347,9 @@ def run_gui():
                "拉花处点又稀又乱会被裁掉）。DOM 和 DSM 用同一条线、同一个像元网格裁，线外 DOM 透明、DSM 是 NoData。"
                "范围线另存 <工点名>_范围线.kml（WGS84 经纬度）和 <工点名>_范围线.shp（同 DOM 坐标系）；想手动改，"
                "用任何 GIS 软件改了线（可以挖洞、加块），点「按范围线重新裁剪…」只重新导出，几分钟。跟正摄还是斜飞无关。"
-               "筛选只影响显示；四个勾选按钮只作用于当前显示的行，「只勾待处理」不勾子目录里的。").grid(
+               "筛选只影响显示；四个勾选按钮只作用于当前显示的行，「只勾待处理」不勾子目录里的。"
+               "点列头「照片数」排序，勾选的工点按列表顺序处理。交付目录每个工点只放 DOM/DSM 四个文件"
+               "（复制、核对 SHA-256），写 交付清单.csv。").grid(
         row=5, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
     tb5 = ctk.CTkFrame(tab5, fg_color="transparent")
@@ -8114,12 +8373,42 @@ def run_gui():
     lst5.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
     lst5.columnconfigure(2, weight=1)
     tab5.rowconfigure(7, weight=1)
-    cols5 = (("", 28, "w"), ("序号", 36, "e"), ("工点", 260, "w"), ("照片数", 52, "e"), ("带定位", 52, "e"),
+    cols5 = (("", 28, "w"), ("序号", 36, "e"), ("工点", 260, "w"), ("照片数", 64, "e"), ("带定位", 52, "e"),
              ("坐标系", 200, "w"), ("状态", 120, "w"), ("备注", 90, "w"))
+    head5 = {}
     for c, (t, w, a) in enumerate(cols5):
         if t:
-            ctk.CTkLabel(lst5, text=t, width=w, anchor=a, text_color=hint_color, height=20).grid(
-                row=0, column=c, sticky="ew", padx=(0, 6))
+            head5[t] = ctk.CTkLabel(lst5, text=t, width=w, anchor=a, text_color=hint_color, height=20)
+            head5[t].grid(row=0, column=c, sticky="ew", padx=(0, 6))
+    sort_next5 = {"scan": "photos-desc", "photos-desc": "photos-asc", "photos-asc": "scan"}
+
+    def sort_heads5():
+        how = v5_sort.get()
+        head5["照片数"].configure(text={"photos-desc": "照片数 ▼", "photos-asc": "照片数 ▲"}.get(how, "照片数 ⇅"),
+                                 text_color=label_color if how != "scan" else hint_color)
+        head5["序号"].configure(text_color=label_color if how == "scan" else hint_color)
+
+    def sort5(how=None):
+        """按 v5_sort 重排列表（只挪位置，不重建控件）；勾选的工点按列表顺序处理。"""
+        if how is not None:
+            if st5["running"] or st5["scanning"]:
+                return
+            v5_sort.set(how)
+            cfg = load_config()
+            cfg["survey_sort"] = how
+            save_config(cfg)
+        order = {id(it): k for k, it in enumerate(survey_sort_items([r["item"] for r in st5["rows"]], v5_sort.get()))}
+        st5["rows"].sort(key=lambda r: order[id(r["item"])])
+        for i, r in enumerate(st5["rows"], 1):
+            for c, w in enumerate(r["widgets"]):
+                w.grid(row=i, column=c, sticky="ew", padx=(0, 6), pady=(0, 1))
+        sort_heads5()
+        apply_filter5()
+
+    for t, nxt in (("照片数", lambda: sort_next5[v5_sort.get()]), ("序号", lambda: "scan")):
+        head5[t].configure(cursor="hand2")
+        head5[t].bind("<Button-1>", lambda ev, nxt=nxt: sort5(nxt()))
+    tooltip(head5["照片数"], lambda: "点一下按照片数排序：多→少 → 少→多 → 扫描顺序（勾选的工点按列表顺序处理）")
     status_color5 = {"待处理（": ("#6A1B9A", "#CE93D8"), "完成": ("#2E7D32", "#81C784"), "部分对齐": ("#E65100", "#FFB74D"),
                      "定位不足": ("#E65100", "#FFB74D"), "失败": danger, "已取消": hint_color,
                      "运行中": ("#1565C0", "#64B5F6"), "等待其他 Metashape": ("#1565C0", "#64B5F6")}
@@ -8254,7 +8543,7 @@ def run_gui():
             if old or todo:
                 root.after(1, step)
                 return
-            apply_filter5()
+            sort5()
             done()
         step()
 
@@ -8266,7 +8555,8 @@ def run_gui():
         cfg = load_config()
         cfg.update(survey_root=v5_root.get().strip(), survey_out=v5_out.get().strip(),
                    survey_skip=",".join(_split_names(v5_skip.get())), survey_clip=bool(v5_clip.get()),
-                   survey_inset=v5_inset.get().strip(), survey_density=v5_density.get().strip())
+                   survey_inset=v5_inset.get().strip(), survey_density=v5_density.get().strip(),
+                   survey_deliver=bool(v5_deliver.get()), survey_deliver_to=v5_deliver_to.get().strip())
         if v5_ms.get().strip():
             cfg["metashape"] = v5_ms.get().strip()
         save_config(cfg)
@@ -8277,6 +8567,7 @@ def run_gui():
         set_btn(btn5_start, not busy)
         set_btn(btn5_unify, not busy)
         set_btn(btn5_reclip, not busy)
+        set_btn(btn5_deliver, not busy)
         set_btn(btn5_stop, busy)
         for r in st5["rows"]:
             r["srs"].configure(state="disabled" if busy else "normal")
@@ -8386,6 +8677,23 @@ def run_gui():
                         if r["item"] is it:
                             set_row_status5(r, text)
                     update_count5()
+                elif kind == "deliver_done":
+                    set_busy5(False)
+                    st5["running"] = False
+                    if st5["closing"]:
+                        if not st4["running"]:
+                            remember_window()
+                            root.destroy()
+                        return
+                    if isinstance(val, Exception):
+                        lbl5.configure(text="失败")
+                        log_add(lg5, "出错：%s" % val)
+                        ui_box.showerror(APP_NAME, str(val))
+                        continue
+                    res, logf = val
+                    lbl5.configure(text="已取消" if res["cancelled"] else "完成")
+                    (ui_box.showwarning if res["exit"] else ui_box.showinfo)(
+                        APP_NAME + " - 整理交付目录", deliver_note5(res) + "\n\n清单：%s\n日志：%s" % (res["csv"], logf))
                 elif kind == "reclip_done":
                     set_busy5(False)
                     st5["running"] = False
@@ -8403,6 +8711,8 @@ def run_gui():
                     lbl5.configure(text="已取消" if res["cancelled"] else "完成")
                     body = ["%s：%s（%.1f 分钟）%s" % (r["name"], r["status"], (r["secs"] or 0) / 60.0,
                                                     "\n  " + r["reason"] if r["reason"] else "") for r in res["rows"]]
+                    if res.get("deliver"):
+                        body += ["", deliver_note5(res["deliver"])]
                     body += ["", "完整日志：%s" % logf]
                     (ui_box.showwarning if res["exit"] else ui_box.showinfo)(
                         APP_NAME + " - 按范围线重新裁剪", ("有没做成的工点（原来的 DOM/DSM 没动）。\n\n" if res["exit"] else
@@ -8421,8 +8731,10 @@ def run_gui():
                         log_add(lg5, "出错：%s" % val)
                         ui_box.showerror(APP_NAME, str(val))
                         continue
-                    res, logf = val
+                    res, logf, dres = val
                     body = ["%s：%d 个" % kv for kv in res["counts"].items()]
+                    if dres:
+                        body.append(deliver_note5(dres))
                     for st_name in ("失败", "部分对齐"):
                         names = [r["工点"] for r in res["rows"] if r["状态"] == st_name]
                         if names:
@@ -8438,7 +8750,7 @@ def run_gui():
                                            "已取消：已完成的工点结果都保留，剩下的没有开始。\n\n" + "\n".join(body))
                     else:
                         lbl5.configure(text="完成")
-                        bad = res["exit"] != 0
+                        bad = res["exit"] != 0 or bool(dres and (dres.get("error") or dres.get("exit")))
                         (ui_box.showwarning if bad else ui_box.showinfo)(
                             APP_NAME + " - 影像处理完成", ("有失败的工点，详见汇总表和各工点的处理报告.txt。\n\n"
                                                     if bad else "") + "\n".join(body))
@@ -8496,6 +8808,14 @@ def run_gui():
                                          "或者不勾：\n" + "\n".join(nosrs))
             return
         out = os.path.abspath(v5_out.get().strip())
+        deliver = dom_dsm and v5_deliver.get()
+        dest = None
+        if deliver:
+            try:
+                dest = deliver_dest5(out)
+            except ValueError as ex:
+                ui_box.showwarning(APP_NAME, str(ex))
+                return
         save5()
         log_clear(lg5)
         pb5.set(0)
@@ -8517,6 +8837,9 @@ def run_gui():
                         flog.flush()
                         q5.put(("log", s))
 
+                    if v5_sort.get() != "scan":
+                        log("处理顺序：按列表（%s）" % {"photos-desc": "照片数从多到少",
+                                                    "photos-asc": "照片数从少到多"}[v5_sort.get()])
                     for it in chosen:
                         if survey_runnable(it):
                             log("%s：%s（%s）" % (it["name"], survey_srs_label(it["epsg"]), it["epsg_src"]))
@@ -8526,7 +8849,16 @@ def run_gui():
                                            clip=clip, clip_inset=clip_inset, clip_file=clip_file,
                                            clip_density=clip_density,
                                            summary=Path(out) / ("影像处理汇总_%s.csv" % stamp))
-                q5.put(("done", (res, str(logf))))
+                    dres = None
+                    if deliver and not res["cancelled"]:
+                        log("")
+                        try:
+                            dres = survey_deliver(out, dest, sites=[it["name"] for it in chosen], log=log,
+                                                  progress=lambda f, s: q5.put(("prog", (f, s))), stop_event=stop)
+                        except (ValueError, OSError) as ex:
+                            log("整理交付目录没做成：%s" % ex)
+                            dres = {"error": str(ex)}
+                q5.put(("done", (res, str(logf), dres)))
             except Exception as ex:
                 q5.put(("done", ex))
 
@@ -8651,6 +8983,10 @@ def run_gui():
         if err:
             ui_box.showwarning(APP_NAME, err)
             return
+        try:
+            dest = deliver_dest5(out) if v5_deliver.get() else None
+        except ValueError:
+            dest = None
         save5()
         log_clear(lg5)
         pb5.set(0)
@@ -8670,17 +9006,106 @@ def run_gui():
                         q5.put(("log", s))
                     r = run_survey_clip(res["sites"], ms, res["src"], res.get("file"), res["inset"], res["density"],
                                         log=log, progress=lambda f, s: q5.put(("prog", (f, s))), stop_event=stop)
+                    names = [x["name"] for x in r["rows"] if x["status"] == "完成"]
+                    if dest and names and (Path(dest) / SURVEY_DELIVER_CSV).is_file() and not r["cancelled"]:
+                        log("")
+                        log("交付目录里已经有清单，把重新裁剪过的工点也更新过去：")
+                        try:
+                            r["deliver"] = survey_deliver(out, dest, sites=names, log=log, stop_event=stop,
+                                                          progress=lambda f, s: q5.put(("prog", (f, s))))
+                        except (ValueError, OSError) as ex:
+                            log("整理交付目录没做成：%s" % ex)
+                            r["deliver"] = {"error": str(ex)}
                 q5.put(("reclip_done", (r, str(logf))))
             except Exception as ex:
                 q5.put(("reclip_done", ex))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def deliver_dest5(out):
+        """交付目录：框里填了用它，空就是 <输出目录>_交付；不能放在照片上级目录里（原片只读）。"""
+        dest = Path(os.path.abspath(v5_deliver_to.get().strip())) if v5_deliver_to.get().strip() \
+            else survey_deliver_default(out)
+        src = v5_root.get().strip()
+        if src:
+            r = Path(os.path.abspath(src))
+            if dest == r or r in dest.parents:
+                raise ValueError("交付目录不能放在照片上级目录里面（原片目录只读）：%s" % dest)
+        o = Path(os.path.abspath(out))
+        if dest == o or o in dest.parents or dest in o.parents:
+            raise ValueError("交付目录不能是输出目录本身，也不能在它里面或包含它：%s" % dest)
+        return dest
+
+    def deliver_note5(d):
+        if d.get("error"):
+            return "整理交付目录没做成：%s" % d["error"]
+        lines = ["交付目录：%s（%d 个工点，这次复制 %d 个文件、已是最新 %d 个，清单共 %.1f MB）" % (
+            d["dest"], len(d["sites"]), d["copied"], d["same"], d["bytes"] / 1048576.0)]
+        if d["failed"]:
+            lines.append("没整理成的：%s" % "、".join("%s（%s）" % x for x in d["failed"]))
+        if d["skipped"]:
+            lines.append("没有 DOM/DSM、没放进去的：%s" % "、".join(n for n, _ in d["skipped"]))
+        if d["cancelled"]:
+            lines.append("整理到一半取消了，剩下的没放进去")
+        return "\n".join(lines)
+
+    def deliver5():
+        """「整理交付目录…」：把输出目录里完成且有 DOM/DSM 的工点复制到交付目录（只放 4 个文件 + 交付清单.csv）。"""
+        out = v5_out.get().strip()
+        if not out or not os.path.isdir(out):
+            ui_box.showwarning(APP_NAME, "请先在「输出目录」里选处理结果所在的目录（每个工点一个子目录）")
+            return
+        try:
+            dest = deliver_dest5(out)
+        except ValueError as ex:
+            ui_box.showwarning(APP_NAME, str(ex))
+            return
+        ok, skipped = survey_deliver_sites(out)
+        if not ok:
+            ui_box.showwarning(APP_NAME, "输出目录里没有能交付的工点（要完成/部分对齐、有 <工点名>DOM.tif/.tfw 和 "
+                                         "<工点名>DSM.tif/.tfw）：\n%s" % out)
+            return
+        size = sum((Path(d) / (n + f)).stat().st_size for n, d, _ in ok for f in SURVEY_DELIVER_FILES)
+        msg = ("把 %d 个工点（共 %.1f MB）整理到：\n%s\n\n每个工点一个文件夹，只放 <工点名>DOM.tif/.tfw、<工点名>DSM.tif/.tfw；"
+               "是复制，处理结果原样不动；每个文件核对 SHA-256，根目录写 交付清单.csv。已经在里面、没变过的文件不重复复制；"
+               "交付目录里别的文件不动。" % (len(ok), size / 1048576.0, dest))
+        if skipped:
+            msg += "\n\n没有 DOM/DSM、不放进去的 %d 个：%s" % (len(skipped), "、".join(n for n, _ in skipped))
+        if not ui_box.askyesno(APP_NAME + " - 整理交付目录", msg + "\n\n继续吗？"):
+            return
+        save5()
+        log_clear(lg5)
+        pb5.set(0)
+        lbl5.configure(text="")
+        set_busy5(True)
+        stop = threading.Event()
+        st5["stop"], st5["running"] = stop, True
+        logf = Path(out) / ("整理交付日志_%s.txt" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        log_set_file(lg5, logf)
+
+        def work():
+            try:
+                with open(logf, "a", encoding="utf-8") as flog:
+                    def log(s):
+                        flog.write(s + "\n")
+                        flog.flush()
+                        q5.put(("log", s))
+                    r = survey_deliver(out, dest, log=log, progress=lambda f, s: q5.put(("prog", (f, s))),
+                                       stop_event=stop)
+                q5.put(("deliver_done", (r, str(logf))))
+            except Exception as ex:
+                q5.put(("deliver_done", ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
     btn5_reclip.configure(command=reclip5)
+    btn5_deliver.configure(command=deliver5)
     btn5_start.configure(command=start5)
     btn5_stop.configure(command=stop5)
     root.protocol("WM_DELETE_WINDOW", on_close5)
-    root.ui_t9 = {"st5": st5, "q5": q5, "rows": lambda: st5["rows"], "set_srs": set_srs5, "reclip": reclip5}  # 给测试脚本看
+    root.ui_t9 = {"st5": st5, "q5": q5, "rows": lambda: st5["rows"], "set_srs": set_srs5, "reclip": reclip5,
+                  "sort": sort5, "sort_var": v5_sort, "head": head5, "deliver": deliver5, "deliver_var": v5_deliver,
+                  "deliver_to": v5_deliver_to}  # 给测试脚本看
 
     root.after(200, poll5)
 
@@ -8791,6 +9216,11 @@ def main(argv=None):
     sv.add_argument("--pick", default="", help="按扫描序号选（如 1,3,5-9；先用 --plan 看序号）")
     sv.add_argument("--skip", default="", help="跳过名单：不处理的工点名，逗号分隔")
     sv.add_argument("--plan", action="store_true", help="只列计划、写汇总表，不运行")
+    sv.add_argument("--sort", default="scan", choices=SURVEY_SORTS, help="处理顺序：scan＝扫描顺序（默认）/ "
+                    "photos-desc＝照片数从多到少 / photos-asc＝从少到多；序号仍按扫描顺序")
+    sv.add_argument("--deliver", action="store_true", help="（配 --dom-dsm）跑完把完成的工点整理到交付目录："
+                    "每个工点一个文件夹，只放 DOM/DSM 四个文件 + 交付清单.csv")
+    sv.add_argument("--deliver-to", help="交付目录，默认是输出目录同级的 <输出目录名>_交付")
     sv.add_argument("--keypoints", type=int, default=SURVEY_KEYPOINTS, help="关键点上限，默认 %d" % SURVEY_KEYPOINTS)
     sv.add_argument("--tiepoints", type=int, default=SURVEY_TIEPOINTS, help="连接点上限，默认 %d" % SURVEY_TIEPOINTS)
     sv.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
@@ -8807,8 +9237,17 @@ def main(argv=None):
         SURVEY_CLIP_DENSITY_MIN, SURVEY_CLIP_DENSITY_MAX, SURVEY_CLIP_DENSITY))
     sc.add_argument("--metashape", help="metashape.exe 路径（默认用上次界面里记的或常见安装位置）")
     sc.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
+    sd = sub.add_parser("survey-deliver", help="整理交付目录：输出目录里完成且有 DOM/DSM 的工点，每个一个文件夹，只放 "
+                        "<工点名>DOM.tif/.tfw、<工点名>DSM.tif/.tfw（复制，逐个核对 SHA-256），根目录写 交付清单.csv"
+                        "（退出码 0 成功 / 1 有失败 / 2 参数错误 / 3 取消）")
+    sd.add_argument("out", help="影像处理的输出目录（每个工点一个子目录，只读）")
+    sd.add_argument("--to", help="交付目录，默认是输出目录同级的 <输出目录名>_交付")
+    sd.add_argument("--site", default="", help="只整理这些工点（工点名，逗号分隔）；默认全部")
+    sd.add_argument("--log", help="把日志另存到这个文件（打包的 exe 没有控制台时用）")
     sub.add_parser("check-update", help="查 GitHub 上有没有新版本（退出码 0 已是最新 / 10 有新版本 / 1 查询失败）")
     args = ap.parse_args(argv)
+    if args.cmd == "survey-deliver":
+        return _cli_survey_deliver(args)
     if args.cmd == "survey-batch":
         return _cli_survey(args)
     if args.cmd == "survey-clip":
@@ -9025,6 +9464,21 @@ def _cli_survey(args):
                     log("按 --pick 选中 %d 个。" % len(chosen))
             else:
                 chosen = [it for it in items if it["default"] or not survey_runnable(it)]
+            if args.sort != "scan":
+                chosen = survey_sort_items(chosen, args.sort)
+                log("处理顺序：%s" % {"photos-desc": "照片数从多到少", "photos-asc": "照片数从少到多"}[args.sort])
+            if args.deliver and not args.dom_dsm:
+                log("注意：没勾 DOM/DSM，--deliver 不起作用")
+            if args.deliver_to and not args.deliver:
+                log("注意：没给 --deliver，--deliver-to 不起作用")
+            dest = None
+            if args.deliver and args.dom_dsm and not args.plan:
+                dest = Path(os.path.abspath(args.deliver_to)) if args.deliver_to else survey_deliver_default(args.out)
+                o, r = Path(os.path.abspath(args.out)), Path(os.path.abspath(args.root))
+                if dest == o or o in dest.parents or dest in o.parents:
+                    raise ValueError("交付目录不能是输出目录本身，也不能在它里面或包含它：%s" % dest)
+                if dest == r or r in dest.parents:
+                    raise ValueError("交付目录不能放在照片上级目录里面（原片目录只读）：%s" % dest)
         except (ValueError, OSError) as ex:
             log("拒绝执行：%s" % ex)
             return 2
@@ -9035,7 +9489,16 @@ def _cli_survey(args):
             res = run_survey_batch(chosen, args.out, ms, plan=args.plan, dom_dsm=args.dom_dsm, resolution=resolution,
                                    keypoints=args.keypoints, tiepoints=args.tiepoints, log=log, clip=clip,
                                    clip_inset=clip_inset, clip_file=clip_file, clip_density=clip_density)
-
+            if dest is not None and not res["cancelled"]:
+                log("")
+                try:
+                    d = survey_deliver(args.out, dest, sites=[it["name"] for it in chosen], log=log)
+                except (ValueError, OSError) as ex:
+                    log("整理交付目录没做成：%s" % ex)
+                    return max(res["exit"], 1)
+                if d["exit"] == 3:
+                    return 3
+                return max(res["exit"], d["exit"])
         except ValueError as ex:
             log("拒绝执行：%s" % ex)
             return 2
@@ -9088,6 +9551,39 @@ def _cli_survey_clip(args):
             return 2
         try:
             res = run_survey_clip(sites, ms, source, line, inset, density, log=log)
+        except KeyboardInterrupt:
+            log("已取消")
+            return 3
+        return res["exit"]
+    finally:
+        if flog:
+            flog.close()
+
+
+def _cli_survey_deliver(args):
+    """survey-deliver：退出码 0 成功 / 1 有失败 / 2 参数错误 / 3 取消。"""
+    flog = open(args.log, "a", encoding="utf-8") if args.log else None
+
+    def log(s):
+        _print(s)
+        if flog:
+            flog.write(s + "\n")
+            flog.flush()
+
+    try:
+        names = _split_names(args.site) or None
+        try:
+            if not os.path.isdir(args.out):
+                raise ValueError("输出目录不存在：%s" % args.out)
+            if names:
+                have = {n for n, _, _ in survey_deliver_sites(args.out)[0]}
+                miss = [n for n in names if n not in have]
+                if miss:
+                    raise ValueError("这些工点不是完成且有 DOM/DSM 的：%s" % "、".join(miss))
+            res = survey_deliver(args.out, args.to, sites=names, log=log)
+        except (ValueError, OSError) as ex:
+            log("拒绝执行：%s" % ex)
+            return 2
         except KeyboardInterrupt:
             log("已取消")
             return 3
