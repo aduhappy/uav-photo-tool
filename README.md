@@ -211,6 +211,23 @@ uav_photo_tool.exe gcp-batch <照片上级目录> --out <输出目录> `
 - `交付清单.csv`（UTF-8 带 BOM）每个文件一行：工点、文件名、大小（字节）、SHA-256、坐标系（从处理报告读，如 `EPSG:4543 CGCS2000 / 3-degree Gauss-Kruger CM 102E（东坐标不带带号）`）、分辨率（米，从 .tfw 读）、行×列（tif）、DOM 与 DSM 行列是否一致、处理状态（完成 / 部分对齐）。日志在输出目录的 `整理交付日志_<时间>.txt`（或这次影像处理的日志里）。
 - 命令行：`survey-deliver <输出目录> [--to 交付目录] [--site 工点名,...]`；或 `survey-batch ... --dom-dsm --deliver [--deliver-to 交付目录]` 跑完自动整理。
 
+#### 4.3 整理 CC 成果（v1.6）
+
+在 ContextCapture / iTwin Capture Modeler 里导入 XML、出了 DOM/DSM 或 3SM 之后，CC 的输出目录只叫 `Production_1`、`Production_2`，不带工点名。点「**整理 CC 成果…**」，软件自己认出每个成果是哪个工点，再整理进 4.2 的交付目录：
+
+1. 先在「输出目录」里选影像处理的输出目录（候选工点就从这里找：完成 / 部分对齐、有 `<工点名>_BlocksExchange.xml` 的）。
+2. 在弹框里加 CC 目录（CC 工程目录、它下面的 `Productions`，或某个 `Production_*` 目录都行，可以加好几个工程），点「扫描」，列出每个成果：类型、外框、认到的工点、得分、状态。
+3. **怎么认**：成果外框（DOM/DSM 用 `.tfw` + 行列数，3SM 读文件里根节点的外框）和每个工点「已对齐相机的平面范围」比，**坐标系（EPSG）一样的才比**；得分 = 重叠面积 ÷ 成果外框面积。最高分 ≥ 0.5、且第二名不到最高分的一半，才自动认定；否则（比如同一地点不同日期的两个工点）不猜，在「工点」一栏的下拉里自己选（不想整理就选「（不整理）」）。同一个工点认到两个同类成果（如两个正射）也要自己选。只有分块、没有 `*_merge.tif` 的 Production 列为「未合并，跳过」；读不出坐标系的列为「坐标系不明」。
+4. 点「开始整理」。每个工点文件夹里放 `<工点名>DOM.tif/.tfw/.tif.ovr`、`<工点名>DSM.tif/.tfw/.tif.ovr`（`.ovr` 是金字塔），有 3SM 的再加 `<工点名>.3sm`（逐字节复制、只改名）。
+
+- **裁边**（默认勾，可以不勾）：同 4.1 的做法——0.5 米网格上 ①CC 的 DOM 有影像（RGB 不是全黑的像元 ≥ 90%），②③ 工点的 `.psx` 里有密集点云时用它算「真实点云够密」（要 Metashape）；工点工程里没有密集点云（只出过 XML）或没有 `.psx` 时，用 ④CC 的 DSM 有值代替，报告里写明「未用点云判据」。然后补缝、取最大连片、填小洞、往里收（默认 3 米）。**不重采样**：留在 CC 原来的像元网格和分辨率上，DOM 输出带透明通道（线外透明），DSM 线外是 NoData −9999，DOM、DSM 外框和像元网格完全一致；金字塔重新生成（CC 原来的 `.ovr` 跟裁过的图对不上，不会复制）。范围线另存为 `<工点名>_CC范围线.kml/.shp`，放在**输出目录**的工点目录里，不进交付目录。
+- **不裁**时：CC 的 tif、tfw、`.tif.ovr` 改名原样复制（CC 没给金字塔的话软件给它建一个 `.ovr`，tif 本身不动）。
+- 交付目录里这个工点已经有同名文件、但来源不一样（比如 4.2 放进去的 Metashape 的 DOM），会先弹框问要不要换成 CC 的；选「否」就不覆盖、这个成果不整理。反过来，「整理交付目录…」也不会把交付目录里 CC 的成果换回 Metashape 的。
+- `交付清单.csv` 加了一列「来源」：`Metashape` 或 `CC:<Production 目录名>`。工点的 `处理报告.txt` 末尾追加一段「CC 成果整理」：来源目录、认定方式（自动 + 得分 / 用户指定）、裁边的各项数字、交付了哪些文件。日志在输出目录的 `整理CC成果日志_<时间>.txt`。
+- CC 的目录只读，一个字节都不改。
+- 已知情况：CC 在没纹理的地方会填纯灰色（128,128,128），工点没有密集点云时这些灰块 RGB 不是黑的、会被当成「有影像」留下；工点有密集点云时由点云判据决定。
+- 命令行：`survey-cc-deliver <CC工程或Productions目录>... --out <输出目录> [--to 交付目录] [--map Production_2=工点名,...] [--no-clip] [--clip-inset 3] [--clip-density 50] [--replace] [--plan]`。认不准的成果要用 `--map` 指定，不然跳过并报出来；`--plan` 只列认定结果、不写文件；交付目录里有来源不同的同名文件时要加 `--replace` 才换。
+
 **在 ContextCapture 里导入**：新建工程 → 导入区块（Import blocks）→ 选 `<工点名>_BlocksExchange.xml`。应看到：照片全部找到（路径里有 `#`、`、`、`+` 的也要找到）、区块坐标系是 CGCS2000 / 3-degree Gauss-Kruger CM 102E（或该工点的带）、照片都已有位置姿态（已空三），直接可以建重建任务，不用再空三。
 
 **大概要跑多久**（本机 i7-12700H + RTX 3050 Laptop 4 GB，照片在网络盘上）：见 `处理报告.txt` 的「各步耗时」；百张左右的工点只出 XML 约 3～4 分钟，加 DOM/DSM（超高）要长得多，三百张的工点可能要几个小时。
@@ -226,6 +243,9 @@ uav_photo_tool.exe survey-batch <照片上级目录> --out <输出目录> `
 uav_photo_tool.exe survey-clip <工点输出目录> [<工点输出目录> ...] [--line 范围线.kml|.shp] [--clip-inset 3] `
     [--clip-density 50] [--metashape 路径] [--log 日志文件]
 uav_photo_tool.exe survey-deliver <输出目录> [--to 交付目录] [--site 工点名1,工点名2] [--log 日志文件]
+uav_photo_tool.exe survey-cc-deliver <CC工程或Productions目录> [...] --out <输出目录> [--to 交付目录] `
+    [--map Production_2=工点名,...] [--no-clip] [--clip-inset 3] [--clip-density 50] [--replace] [--plan] `
+    [--metashape 路径] [--log 日志文件]
 ```
 
 - `--epsg auto`（默认）每个工点自动选带；`--epsg 4543` 整批统一用这个带。命令行不读界面里记住的逐个修改。
@@ -233,6 +253,7 @@ uav_photo_tool.exe survey-deliver <输出目录> [--to 交付目录] [--site 工
 - `survey-clip`（按范围线重新裁剪）：退出码 0 成功 / 1 有失败 / 2 参数错误；`--line` 给的线原样裁，不能再和 `--clip-inset` / `--clip-density` 一起用。
 - `--sort`：处理顺序，`scan` 扫描顺序（默认）/ `photos-desc` 照片数从多到少 / `photos-asc` 从少到多（照片数一样的按序号）。
 - `survey-deliver`（整理交付目录，见 4.2）：退出码 0 成功 / 1 有工点没整理成 / 2 参数错误（如交付目录在输出目录里、`--site` 的工点不是完成且有 DOM/DSM 的）/ 3 已取消。`survey-batch --deliver` 要配 `--dom-dsm`；交付有失败时退出码算 1。
+- `survey-cc-deliver`（整理 CC 成果，见 4.3）：退出码 0 成功 / 1 有成果没整理成（含没认出、未合并、坐标系不明、交付目录里有来源不同的文件没加 `--replace`）/ 2 参数错误（如 `--map` 写错、指定的工点不是候选或坐标系不同）/ 3 已取消；`--plan` 时全部能认出返回 0，否则 1。
 - 不给 `--include` / `--pick` 时只处理界面里默认会勾的工点（待处理、且不在子目录里）；给了就从全部工点里按名字通配符 / 序号选（两个一起用取交集）。先加 `--plan` 看一遍序号和每个工点的坐标系。
 
 ## 下载
@@ -289,6 +310,9 @@ uav_photo_tool.py survey-batch <照片上级目录> --out <输出目录> [--epsg
 uav_photo_tool.py survey-clip <工点输出目录>... [--line 范围线.kml|.shp] [--clip-inset 3] [--clip-density 50]
                               [--metashape 路径] [--log 日志文件]
 uav_photo_tool.py survey-deliver <输出目录> [--to 交付目录] [--site 工点名,...] [--log 日志文件]
+uav_photo_tool.py survey-cc-deliver <CC工程或Productions目录>... --out <输出目录> [--to 交付目录]
+                                    [--map P=工点名,...] [--no-clip] [--clip-inset 3] [--clip-density 50]
+                                    [--replace] [--plan] [--metashape 路径] [--log 日志文件]
 
 uav_photo_tool.py check-update
 uav_photo_tool.py selftest [--log 自检结果.txt]
@@ -308,6 +332,7 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
 | `gcp-batch` | 选中的期全部自动通过或跳过（`--plan` 也返回 0） | 有期次失败或被拒绝（含原地抹除有照片没抹成） | 参数错误（如 `--rule` 写错或参考期不存在、`--pick` 越界、原地模式 `--confirm` 不对、照片目录不可写） | 已取消 | 有期次需人工核对（没有失败） | |
 | `survey-batch` | 选中的工点全部完成、部分对齐或跳过（`--plan` 也返回 0） | 有工点失败（含对齐率低于 80%、DOM/DSM 没做成） | 参数错误（如 `--epsg` 不是 4534～4554、输出目录在照片目录里、`--pick` 越界） | 已取消 | | |
 | `survey-deliver` | 全部整理好 | 有工点没整理成（如复制后 SHA-256 对不上） | 参数错误（如交付目录在输出目录里、输出目录不存在） | 已取消 | | |
+| `survey-cc-deliver` | 全部整理好（`--plan`：全部认出） | 有成果没整理成或没认出 | 参数错误（如 `--map` 写错、输出目录里没有候选工点） | 已取消 | | |
 | `check-update` | 已是最新 | 查询失败 | | | | 有新版本 |
 | `selftest` | 全部通过 | 有失败项 | | | | |
 

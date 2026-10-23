@@ -25,7 +25,7 @@ if __name__ == "__main__" and not getattr(sys, "frozen", False):  # 打包版里
     import argparse
     import shutil
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("invoke", "shots", "batch", "batch8", "t10", "t10long", "t9"), default="invoke")
+    ap.add_argument("--mode", choices=("invoke", "shots", "batch", "batch8", "t10", "t10long", "t9", "t17"), default="invoke")
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default="")
     ap.add_argument("--metashape", required=True)
@@ -1682,6 +1682,94 @@ def steps_t9(root, nb):
     yield 600  # 软件停好当前工点后自己关窗；关了之后这里不会再执行
 
 
+def steps_t17(root, nb):
+    """T17「整理 CC 成果…」：环境变量 UAV_T17_OUT（影像处理输出目录夹具，里面有同一地点两个工点、要用户选）、
+    UAV_T17_CC（CC 工程目录，只读）、UAV_T17_DEST（新的交付目录）、UAV_T17_SITE（要选的工点名）。
+    查：没选输出目录的提示；对话框扫描出两个成果都「要选工点」、下拉里有两个候选；不选就开始 → 提示、不关；
+    选了 → 跑完（真裁边），交付目录里 DOM/DSM tif+tfw+ovr 和 .3sm、清单来源列是 CC:…；对话框截图。"""
+    cfg_path = os.path.join(os.environ["APPDATA"], "无人机照片工具", "config.json")
+    out, cc, dest, site = (os.environ[k] for k in ("UAV_T17_OUT", "UAV_T17_CC", "UAV_T17_DEST", "UAV_T17_SITE"))
+    shots = os.path.join(OUT, "截图")
+    os.makedirs(shots, exist_ok=True)
+    root.geometry("+40+40")
+    check("窗口标题", root.title().endswith("v" + VERSION), root.title())
+    nb.set("影像处理")
+    t5 = nb.tab("影像处理")
+    ui = root.ui_t9
+    yield 0.5
+    e_root, e_out, e_ms = (entry_row(t5, r) for r in range(3))
+    b_cc = btn(t5, "整理 CC 成果…")
+    nbox = len(R["boxes"])
+    set_entry(e_out, os.path.join(OUT, "没有这个目录"))
+    b_cc.invoke()
+    check("输出目录不存在 → 提示先选输出目录", len(R["boxes"]) > nbox and "输出目录" in R["boxes"][-1][2], R["boxes"][-1:])
+    set_entry(e_out, out)
+    ui["deliver_to"].set(dest)
+    seen = {}
+
+    def inspect(step=0):
+        dlg = getattr(root, "ui_cc_dlg", None)
+        if dlg is None or not dlg.winfo_exists():
+            root.after(200, lambda: inspect(step))
+            return
+        u = dlg.ui_cc
+        if step == 0:
+            u["dirs"].delete("1.0", "end")
+            u["dirs"].insert("1.0", cc)
+            u["scan"]()
+            root.after(300, lambda: inspect(1))
+            return
+        if not u["rows"]:
+            root.after(300, lambda: inspect(1))
+            return
+        seen["rows"] = [(r["row"]["key"], r["row"]["kind"], r["var"].get(), r["row"]["why"]) for r in u["rows"]]
+        oms = find(dlg, ctk.CTkOptionMenu)
+        seen["choices"] = [list(o.cget("values")) for o in oms]
+        dlg.update()
+        shot = os.path.join(shots, "整理CC成果对话框_要选工点.bmp")
+        grab_bmp(shot, dlg)
+        R.setdefault("shots", []).append(shot)
+        n0 = len(R["boxes"])
+        u["go"]()                                              # 还没选工点
+        seen["unpicked"] = R["boxes"][n0:]
+        seen["still_open"] = dlg.winfo_exists()
+        for r in u["rows"]:
+            r["var"].set(site)
+        dlg.update()
+        grab_bmp(os.path.join(shots, "整理CC成果对话框_选好了.bmp"), dlg)
+        u["go"]()
+        seen["closed"] = not dlg.winfo_exists()
+    root.after(800, inspect)
+    b_cc.invoke()
+    yield 0.5
+    check("扫描：两个成果（3SM、正射/DSM）都要选工点（同一地点两个工点）", len(seen.get("rows", [])) == 2 and all(
+        r[2] == "（请选工点）" and "第二名" in r[3] for r in seen["rows"]), seen.get("rows"))
+    check("下拉：请选 + 同坐标系的工点（得分高的两个在最前）+ 不整理",
+          all(c[0] == "（请选工点）" and site in c[1:3] and c[-1] == "（不整理）" for c in seen.get("choices", []))
+          and len(seen.get("choices", [])) == 2, seen.get("choices"))
+    check("没选工点就开始 → 提示、对话框不关", "还没选工点" in str(seen.get("unpicked")) and seen.get("still_open"),
+          seen.get("unpicked"))
+    check("选好后开始：对话框关、开始运行", seen.get("closed") and ui["st5"]["running"], seen.get("closed"))
+    check("运行中：整理 CC 成果按钮不可点、取消可点", b_cc.cget("state") == "disabled"
+          and btn(t5, "取消").cget("state") == "normal")
+    yield (lambda: not ui["st5"]["running"]), 900
+    check("跑完", not ui["st5"]["running"], R["boxes"][-1:])
+    check("完成弹框是 info", R["boxes"] and R["boxes"][-1][0] == "showinfo" and "整理 CC 成果" in R["boxes"][-1][1],
+          R["boxes"][-1:])
+    sd = os.path.join(dest, site)
+    want = sorted([site + "DOM.tif", site + "DOM.tfw", site + "DOM.tif.ovr", site + "DSM.tif", site + "DSM.tfw",
+                   site + "DSM.tif.ovr", site + ".3sm"])
+    got = sorted(os.listdir(sd)) if os.path.isdir(sd) else []
+    check("交付文件夹里正好 DOM/DSM tif+tfw+ovr 和 .3sm", got == want, got)
+    import csv as _csv
+    rows = list(_csv.DictReader(open(os.path.join(dest, "交付清单.csv"), encoding="utf-8-sig")))
+    check("清单 7 行、来源都是 CC:Production_*、认定写进处理报告",
+          len(rows) == 7 and all(r["来源"].startswith("CC:Production_") for r in rows)
+          and "用户指定" in open(os.path.join(out, site, "处理报告.txt"), encoding="utf-8").read(), [r["来源"] for r in rows])
+    c = json.load(open(cfg_path, encoding="utf-8"))
+    check("CC 目录记进 config", c.get("survey_cc_dirs") == [cc], c.get("survey_cc_dirs"))
+
+
 def fill_dialog(root, answer):
     tops = [w for w in root.winfo_children() if isinstance(w, ctk.CTkToplevel) and w.winfo_exists()]
     if not tops:
@@ -1707,7 +1795,7 @@ def drive(root):
             setattr(box, k, rec_box(k))
         box.askyesno = rec_box("askyesno", True)
     gen = {"shots": steps_shots, "batch": steps_batch, "batch8": steps_batch8, "t10": steps_t10, "t10long": steps_t10long,
-           "t9": steps_t9}.get(MODE, steps_invoke)(root, nb)
+           "t9": steps_t9, "t17": steps_t17}.get(MODE, steps_invoke)(root, nb)
 
     def tick(cond=None, deadline=0):
         if cond is not None and not cond() and time.time() < deadline:
