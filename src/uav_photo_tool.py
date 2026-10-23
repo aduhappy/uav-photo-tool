@@ -6042,8 +6042,11 @@ SURVEY_DELIVER_SUFFIX = "_交付"     # 默认交付目录 = 输出目录同级�
 SURVEY_DELIVER_FILES = ("DOM.tif", "DOM.tfw", "DSM.tif", "DSM.tfw")
 SURVEY_DELIVER_CSV = "交付清单.csv"
 SURVEY_DELIVER_FIELDS = ("工点", "文件名", "大小(字节)", "SHA-256", "坐标系", "分辨率(米)", "行×列", "DOM与DSM行列一致",
-                         "处理状态", "来源")   # 来源（T17）：Metashape / CC:<Production 目录名>
+                         "处理状态", "来源", "来源标识", "判据")
+# 来源（T17）：Metashape / CC:<Production 目录名>；来源标识（R1）：判断「是不是同一个来源」的稳定 ID
+# （CC = Production 目录的完整规范路径），判据（R1）：这次用了哪几组裁边判据
 SURVEY_DELIVER_SOURCE_MS = "Metashape"
+SURVEY_DELIVER_ID_MS = "Metashape"      # Metashape 出的成果，来源标识就是这个（不是文件路径，但唯一）
 # 清单里同一工点各文件的顺序（Metashape 的四个 + CC 的金字塔 .ovr、3SM）
 SURVEY_DELIVER_ORDER = ("DOM.tif", "DOM.tfw", "DOM.tif.ovr", "DSM.tif", "DSM.tfw", "DSM.tif.ovr", ".3sm")
 SURVEY_DELIVER_CHUNK = 8 * 1024 * 1024
@@ -6153,6 +6156,8 @@ def _read_deliver_csv(path):
                 if r.get("工点") and r.get("文件名"):
                     if not (r.get("来源") or "").strip():   # v1.4 的清单没有「来源」列，那时只有 Metashape 的
                         r["来源"] = SURVEY_DELIVER_SOURCE_MS
+                    if not (r.get("来源标识") or "").strip() and r["来源"] == SURVEY_DELIVER_SOURCE_MS:
+                        r["来源标识"] = SURVEY_DELIVER_ID_MS
                     rows[(r["工点"], r["文件名"])] = r
     except (OSError, csv.Error, UnicodeDecodeError):
         pass
@@ -6182,6 +6187,23 @@ def _write_deliver_csv(dest, old, new_rows, keep=()):
             w.writerow(r)
     os.replace(tmp, csv_path)
     return out_rows, len(allrows)
+
+
+def _survey_deliver_criteria(site_dir):
+    """Metashape 成果用了哪组裁边判据（R1⑤：清单要写明）。从工点的 处理报告.txt 的裁边段读。"""
+    try:
+        text = (Path(site_dir) / SURVEY_REPORT).read_text(encoding="utf-8-sig")
+    except OSError:
+        return ""
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("裁边："):
+            if "用户范围线" in s:
+                return "按用户范围线裁（不按点云判据）"
+            if s.startswith("裁边：自动"):
+                return "自动裁边（①②③真实点云）"
+            return "按范围线裁剪"
+    return ""
 
 
 def survey_deliver(out_dir, dest=None, sites=None, log=None, progress=None, stop_event=None):
@@ -6267,7 +6289,8 @@ def survey_deliver(out_dir, dest=None, sites=None, log=None, progress=None, stop
                              "分辨率(米)": "%g" % abs(g["tfw"][0]),
                              "行×列": "%d×%d" % (g["height"], g["width"]) if f.endswith(".tif") else "",
                              "DOM与DSM行列一致": "否" if pair else "是", "处理状态": verdict,
-                             "来源": SURVEY_DELIVER_SOURCE_MS})
+                             "来源": SURVEY_DELIVER_SOURCE_MS, "来源标识": SURVEY_DELIVER_ID_MS,
+                             "判据": _survey_deliver_criteria(d)})
             new_rows[n] = rows
             copied += k_copy
             same += k_same
@@ -6320,12 +6343,38 @@ CC_DSM_FRAC = 0.9                    # 判据④（工点没有点云时）：�
 CC_STRIP_ROWS = 512                  # 按这么多行一条读写（= CC 和输出的分块高度）
 CC_OVR_MIN = 256                     # 金字塔一直做到长边 < 这么多像元
 CC_SKIP_LABEL = "（不整理）"
+
+
+class CCRejected(Exception):
+    """扫 Production 时发现的问题（坐标系冲突等）：这个成果不整理，理由写在清单和报告里。"""
+
+
 CC_CLIP_STAGE = {"cover_dom": "判据① DOM 有影像", "cover_dsm": "判据④ DSM 有值", "cloud": "判据②③ 真实点云",
                  "range": "算范围线", "dom": "裁 DOM", "dsm": "裁 DSM", "ovr": "金字塔"}
 
 
 def cc_source(prod):
+    """清单里显示的来源列（会重名）：CC:<Production 目录名>。"""
     return "CC:" + prod
+
+
+def cc_source_id(pdir):
+    """来源标识（R1）：判断「是不是同一个来源」的稳定 ID = Production 目录的完整规范路径。
+    跨工程同名（两个工程里都有 Production_2）靠这个区分；不是路径的（Metashape）用常量。"""
+    return os.path.normcase(os.path.abspath(str(pdir)))
+
+
+def _deliver_row_id(row):
+    """清单里一行的来源标识：老清单没有这一列时，Metashape 的按 Metashape 算，CC 的算「不明」（宁可拒绝覆盖）。"""
+    if not row:
+        return ""
+    sid = (row.get("来源标识") or "").strip()
+    if sid:
+        return sid
+    src = (row.get("来源") or "").strip()
+    if src == SURVEY_DELIVER_SOURCE_MS:
+        return SURVEY_DELIVER_ID_MS
+    return ""
 
 
 def _cc_epsg_of(text):
@@ -6419,7 +6468,8 @@ def cc_scan_production(pdir):
     pdir = Path(pdir)
     proj = pdir.parent.parent.name if pdir.parent.name.lower() == "productions" else pdir.parent.name
     base = {"key": "%s/%s" % (proj, pdir.name), "prod": pdir.name, "project": proj, "dir": str(pdir),
-            "source": cc_source(pdir.name), "kind": "", "dom": "", "dsm": "", "sm": "", "epsg": None, "box": None,
+            "source": cc_source(pdir.name), "source_id": cc_source_id(pdir),
+            "kind": "", "dom": "", "dsm": "", "sm": "", "epsg": None, "box": None,
             "grid": None, "status": "", "scores": [], "score": 0.0, "second": None, "site": "", "how": "", "why": "",
             "map": ""}
     try:
@@ -6465,14 +6515,21 @@ def cc_scan_production(pdir):
                         ej = es.pop()
                 except (ValueError, AttributeError, OSError):
                     ej = None
-            et = {g2["epsg"] for g2 in grids.values()}
+            # R1③：多个 TIFF 的 EPSG 分「缺失 / 一致 / 冲突」三种状态，不能压成 None 混同「读不出」；
+            # 已知冲突直接拒绝（不整理），ContextScene.json 只补缺失，不覆盖 GeoTIFF 里的值。
+            et = {g2["epsg"] for g2 in grids.values() if g2["epsg"]}
+            if len(et) > 1:
+                raise CCRejected("坐标系冲突（DOM / DSM 的 GeoTIFF 里 EPSG 不一样：%s）" % "、".join(
+                    "EPSG:%s" % e for e in sorted(et)))
             et = et.pop() if len(et) == 1 else None
             if ej and et and ej != et:
-                r["status"] = "坐标系不明（ContextScene.json 写 EPSG:%s、GeoTIFF 写 EPSG:%s）" % (ej, et)
-            elif not (ej or et):
+                raise CCRejected("坐标系冲突（ContextScene.json 写 EPSG:%s、GeoTIFF 写 EPSG:%s）" % (ej, et))
+            if not (ej or et):
                 r["status"] = "坐标系不明（ContextScene.json 和 GeoTIFF 都读不出 EPSG）"
             else:
-                r["epsg"] = ej or et
+                r["epsg"] = et if et else ej
+        except CCRejected as ex:
+            r["status"] = str(ex)
         except (ValueError, OSError, struct.error) as ex:
             r["status"] = "读不了：%s" % ex
     for f in sms:
@@ -6708,19 +6765,29 @@ def cc_targets(r, site):
 
 
 def cc_conflicts(rows, dest):
-    """🔒 交付目录里该工点已有同名文件、但来源不同（如 v1.4 放进去的 Metashape DOM）→ [(行, 文件名, 原来源)]。"""
+    """🔒 交付目录里该工点已有同名文件、但来源不同（如 v1.4 放进去的 Metashape DOM）→ [(行, 文件名, 原来源)]。
+
+    R1：判「来源不同」不再比会重名的显示文本（CC:Production_2），改比稳定的「来源标识」
+    （CC = Production 目录的完整规范路径，Metashape = 常量）。清单里没有来源标识的老行、
+    或者来源标识读不出来 → 一律当作「来源不明」，不覆盖（🔒：不同来源不覆盖，宁可停下问）。"""
     dest = Path(dest)
     old = _read_deliver_csv(dest / SURVEY_DELIVER_CSV)
     out = []
     for r in rows:
         if not r["site"] or r["status"]:
             continue
+        rid = r.get("source_id") or ""
         for fn, _ in cc_targets(r, r["site"]):
             p = dest / r["site"] / fn
-            if p.is_file():
-                src = (old.get((r["site"], fn)) or {}).get("来源") or "（清单里没有，来源不明）"
-                if src != r["source"]:
-                    out.append((r, fn, src))
+            if not p.is_file():
+                continue
+            row = old.get((r["site"], fn))
+            src = (row or {}).get("来源") or "（清单里没有，来源不明）"
+            old_id = _deliver_row_id(row)
+            if not rid or not old_id:
+                out.append((r, fn, "%s（来源不明）" % src))
+            elif os.path.normcase(old_id) != os.path.normcase(rid):
+                out.append((r, fn, src))
     return out
 
 
@@ -6793,11 +6860,13 @@ def cc_cell_ok(path, nx, ny, frac, test, stopped=None, progress=None):
 
 
 def _cc_dom_has_image(a, ds):
-    """判据①：RGB 不是全 0（有 alpha 的看 alpha > 0）。"""
+    """判据①（🔒 锁定）：RGB 不是全 0 的像元才算「有影像」。有 alpha 时 alpha 只能再加限制（alpha = 0 也不算），
+    不能反过来用 alpha 取代 RGB 判据（R1④）。"""
     import numpy as np
+    ok = np.any(a[:3] != 0, axis=0)
     if a.shape[0] >= 4 and ds.colorinterp[3].name == "alpha":
-        return a[3] > 0
-    return np.any(a[:3] != 0, axis=0)
+        ok &= a[3] > 0
+    return ok
 
 
 def _cc_dsm_valid(a, ds):
@@ -6996,10 +7065,14 @@ def cc_clip_range(r, site, inset, density, metashape=None, log=None, progress=No
         info["steps"].append(("cloud", round(time.time() - t1, 1)))
         info["cloud"] = True
         info["cloud_note"] = "用工点工程 %s 的密集点云算判据②③" % Path(psx).name
+        info["criteria"] = "①DOM有影像+②③真实点云"
+        info["criteria_note"] = "用了点云判据（%s）" % Path(psx).name
         fail_text = None
     else:
-        info["cloud_note"] = "未用点云判据（%s），用 ④CC DSM 有值代替②③" % (
-            "工点目录里没有 .psx" if not psx else "工点工程 %s 里没有密集点云" % Path(psx).name)
+        why = "工点目录里没有 .psx" if not psx else "工点工程 %s 里没有密集点云" % Path(psx).name
+        info["cloud_note"] = "未用点云判据（%s），用 ④CC DSM 有值代替②③" % why
+        info["criteria"] = "①DOM有影像+④DSM有值"
+        info["criteria_note"] = "未用点云判据（%s）" % why
         log("    %s" % info["cloud_note"])
         if r["dsm"]:
             d_ok = cc_cell_ok(r["dsm"], nx, ny, CC_DSM_FRAC, _cc_dsm_valid, stopped,
@@ -7045,20 +7118,147 @@ def cc_build_ovr(path, kind):
     return fs
 
 
-def cc_check_ovr(path):
-    """金字塔可用、和 tif 尺寸匹配：每级大小 = ceil(原尺寸 / 倍数)，能读出数据。返回 (问题列表, 各级倍数)。"""
+def cc_ovr_levels(path):
+    """读金字塔的真实层级（R1②：按实际 IFD 的尺寸，不按公式算）。返回 [(倍数, 宽, 高)]；没有金字塔返回 []。"""
     import rasterio
-    probs = []
+    out = []
     with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
-        fs = ds.overviews(1)
-        if not fs:
-            return ["%s 没有金字塔" % Path(path).name], []
-        for k, f in enumerate(fs):
-            ow, oh = int(math.ceil(ds.width / float(f))), int(math.ceil(ds.height / float(f)))
-            a = ds.read(1, out_shape=(oh, ow))
-            if a.shape != (oh, ow):
-                probs.append("%s 第 %d 级金字塔大小不对" % (Path(path).name, k + 1))
-    return probs, fs
+        fs = list(ds.overviews(1))
+    for k, f in enumerate(fs):
+        try:
+            with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path), OVERVIEW_LEVEL=k) as lv:
+                out.append((f, lv.width, lv.height))
+        except Exception:
+            out.append((f, 0, 0))
+    return out
+
+
+def _cc_open_level(path, level=None):
+    """打开 path 的某一级金字塔（level=None 是主图；level=0 是第一级缩览）。"""
+    import rasterio
+    if level is None:
+        return rasterio.open(str(path))
+    return rasterio.open(str(path), OVERVIEW_LEVEL=level)
+
+def _cc_ovr_range_check(path, level, lw, lh, mw, mh, max_block=4000000):
+    """抽查金字塔读值（R1②）：第 k 级的某个像元应该落在**主图**里对应那一块的取值范围内
+    （平均 / 最近邻重采样都成立；重采样核偶尔略微过冲，给 2% 的余量）。
+    金字塔和主图不是一套（换了图、旧 .ovr 留着）就对不上。
+
+    注意：比的是**主图**，不是上一级 —— GDAL 建每一级都是按自己的方式从原图算的
+    （CC 的 .ovr 级数倍数是 2/4/…/64/127/252/…，127 不是 128，各级之间不是逐级相减的），
+    拿上一级当基准会误判（金字塔没问题也被说成有问题）。
+
+    只按窗口读，不整层读进内存；对应块太大的最深几级跳过读值抽查。
+    返回 (问题列表, 抽查条数, 是否跳过)。"""
+    import numpy as np
+    import rasterio
+    from rasterio.windows import Window
+    probs, n = [], 0
+    if lw <= 0 or lh <= 0 or mw <= 0 or mh <= 0:
+        return ["金字塔某一级的尺寸读不出来"], 0, False
+    if (mw / float(lw)) * (mh / float(lh)) > max_block:
+        return [], 0, True
+    try:
+        with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
+            nodata = ds.nodata
+            with rasterio.Env(GDAL_PAM_ENABLED="NO"), _cc_open_level(path, level) as lv:
+                spots = [(int(lw * fx), int(lh * fy)) for fx, fy in
+                         ((0.23, 0.31), (0.71, 0.17), (0.47, 0.66), (0.86, 0.83))]
+                for px, py in spots:
+                    px = min(max(px, 0), lw - 1)
+                    py = min(max(py, 0), lh - 1)
+                    sx, sy = mw / float(lw), mh / float(lh)
+                    c0, r0 = int(px * sx), int(py * sy)
+                    c1, r1 = max(c0 + 1, int((px + 1) * sx)), max(r0 + 1, int((py + 1) * sy))
+                    c1, r1 = min(c1, mw), min(r1, mh)
+                    if c1 <= c0 or r1 <= r0:
+                        continue
+                    blk = ds.read(window=Window(c0, r0, c1 - c0, r1 - r0))
+                    val = lv.read(window=Window(px, py, 1, 1))
+                    for b in range(min(blk.shape[0], val.shape[0])):
+                        v = float(val[b][0][0])
+                        if nodata is not None and v == float(nodata):
+                            continue                       # 这一格是 NoData，不比
+                        seg = blk[b].astype("float64")
+                        if nodata is not None:
+                            seg = seg[seg != float(nodata)]
+                        seg = seg[np.isfinite(seg)]
+                        if seg.size == 0:
+                            continue
+                        lo, hi = float(seg.min()), float(seg.max())
+                        tol = max(1.0, (hi - lo) * 0.02)
+                        n += 1
+                        if v < lo - tol or v > hi + tol:
+                            probs.append("第 %d 级的读值 %g 不在主图对应那块（%g～%g）里" % (level + 1, v, lo, hi))
+                            break
+    except Exception as ex:
+        return ["金字塔抽查读值失败：%s" % ex], n, False
+    return probs, n, False
+
+
+def cc_check_ovr(path):
+    """金字塔可用、层级真实尺寸、和 tif 是同一套（R1②）。返回 (问题列表, [(倍数, 宽, 高)])。
+
+    查三件事：①有金字塔；②每一级的真实尺寸（按实际 IFD 读）和「倍数 × 主图尺寸」对得上；
+    ③抽查读值——金字塔某像元落在**主图**里对应那一块的取值范围内（换了图、旧 .ovr 留着就会对不上）。
+    全程按窗口读，不整层读进内存。"""
+    probs = []
+    name = Path(path).name
+    import rasterio
+    levels = cc_ovr_levels(path)
+    if not levels:
+        return ["%s 没有金字塔" % name], []
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
+        w, h = ds.width, ds.height
+    for k, (f, lw, lh) in enumerate(levels):
+        if lw <= 0 or lh <= 0:
+            probs.append("%s 第 %d 级金字塔尺寸读不出来" % (name, k + 1))
+            continue
+        # 尺寸按倍数核：GDAL 的倍数不一定正好是 2 的幂（CC 的 .ovr 有 127、252、504…），
+        # 每级真实尺寸就是「主图尺寸 ÷ 倍数」四舍五入到的整数，所以差 1 个像元以内都算对。
+        if abs(lw - w / float(f)) > 1.5 or abs(lh - h / float(f)) > 1.5:
+            probs.append("%s 第 %d 级金字塔（%d × %d）和主图（%d × %d，%d 倍）对不上" % (
+                name, k + 1, lw, lh, w, h, f))
+    # 读值抽查：每一级都对主图
+    for k, (f, lw, lh) in enumerate(levels):
+        if lw <= 0 or lh <= 0:
+            break
+        p, n, skipped = _cc_ovr_range_check(path, k, lw, lh, w, h)
+        probs += ["%s %s" % (name, x) for x in p]
+        if n == 0 and not skipped:
+            probs.append("%s 第 %d 级金字塔抽查不到读值" % (name, k + 1))
+    return probs, levels
+
+
+def cc_ovr_build_if_needed(tif, kind, log=None):
+    """交付目录里的 tif 换成了新的一份以后，保证它带着和它自己匹配的金字塔（R1②：tif/tfw/ovr 当一套）。
+
+    已有 .ovr 但和这张 tif 对不上（旧成果留下的）→ 删掉重建；没有金字塔 → 建一个（tif 一个字节不动）。
+    返回 (建了没有, 问题列表)。"""
+    log = log or (lambda s: None)
+    tif, ovr = Path(tif), Path(str(tif) + ".ovr")
+    if not tif.is_file():
+        return False, []
+    probs, _ = cc_check_ovr(tif)
+    if not probs:
+        return False, []
+    if ovr.is_file():
+        try:
+            ovr.unlink()
+            log("    %s 的旧金字塔和这张图对不上，删掉重建" % tif.name)
+        except OSError as ex:
+            raise RuntimeError("删不掉旧的金字塔 %s：%s" % (ovr.name, ex))
+    before = _file_sha256(tif, lambda: False, lambda n: None)
+    cc_build_ovr(tif, kind)
+    if _file_sha256(tif, lambda: False, lambda n: None) != before:
+        raise RuntimeError("建金字塔时 %s 被改了" % tif.name)
+    probs, levels = cc_check_ovr(tif)
+    if probs:
+        raise RuntimeError("%s 的金字塔不对：%s" % (tif.name, "；".join(probs)))
+    log("    %s 没有匹配的金字塔，重建了（%d 级）" % (tif.name, len(levels)))
+    return True, []
+
 
 
 def cc_write_clipped(src, dst, kind, polys, win, stopped=None, progress=None):
@@ -7213,7 +7413,11 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
 
 def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
     """不裁：CC 的 tif / tfw / tif.ovr（或 3SM）改名逐字节复制（先写临时文件、读回 SHA-256 一致才换上、保留修改时间）；
-    大小、修改时间没变、清单里有哈希的不重复复制。CC 没有金字塔的给复制过来的 tif 建外部 .ovr。返回 [(名, 路径, sha 或 None)]。"""
+    大小、修改时间没变、清单里有哈希的不重复复制。
+
+    R1②：tif、.tfw、.tif.ovr 当同一套换 —— 换主图时金字塔必须跟着换：
+    源有 .ovr 就把它一起复制过去（它和源 tif 是一套）；源没有 .ovr，交付目录里的旧 .ovr 就是上一版的、跟新图对不上，
+    要删掉重建（🔒 交付的 tif 必须带和它本身匹配的金字塔）。最后都核一遍真实层级尺寸和抽查读值。"""
     name = site["name"]
     out = []
     for fn, src in cc_targets(r, name):
@@ -7226,7 +7430,9 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
             d_st = dst.stat()
             prev = old.get((name, fn))
             if d_st.st_size == s_st.st_size and d_st.st_mtime_ns == s_st.st_mtime_ns and prev and \
-                    prev.get("大小(字节)") == str(s_st.st_size) and prev.get("SHA-256") and prev.get("来源") == r["source"]:
+                    prev.get("大小(字节)") == str(s_st.st_size) and prev.get("SHA-256") and \
+                    prev.get("来源") == r["source"] and \
+                    os.path.normcase(prev.get("来源标识") or "") == os.path.normcase(r.get("source_id") or ""):
                 sha = prev["SHA-256"]           # 上次复制时核对过，大小和修改时间都没变
                 on_bytes(s_st.st_size)
         if not sha:
@@ -7234,19 +7440,17 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
             log("    复制 %s → %s" % (Path(src).name, fn))
         out.append((fn, dst, sha))
     if r["kind"] == CC_KIND_ORTHO:
-        import rasterio
         for k in ("DOM", "DSM"):
+            if not r[k.lower()]:
+                continue
             tif = sd / (name + k + ".tif")
-            if r[k.lower()] and tif.is_file() and not Path(str(tif) + ".ovr").is_file():
-                with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(tif)) as ds:
-                    internal = bool(ds.overviews(1))
-                if not internal:   # 🔒 交付的 tif 必须带金字塔：CC 没给就自己建（外部 .ovr，tif 不动）
-                    before = _file_sha256(tif, stopped, lambda n: None)
-                    cc_build_ovr(tif, k)
-                    if _file_sha256(tif, stopped, lambda n: None) != before:
-                        raise RuntimeError("建金字塔时 %s 被改了" % tif.name)
-                    out.append((tif.name + ".ovr", Path(str(tif) + ".ovr"), None))
-                    log("    CC 没给 %s 的金字塔，建了外部 %s.ovr" % (k, tif.name))
+            if not tif.is_file():
+                continue
+            # 🔒 交付的 tif 必须带和它本身匹配的金字塔；旧的跟新图对不上就重建（CC 没给就自己建，tif 一个字节不动）
+            cc_ovr_build_if_needed(tif, k, log=log)
+            ovr = Path(str(tif) + ".ovr")
+            if ovr.is_file() and not any(fn == ovr.name for fn, _, _ in out):
+                out.append((ovr.name, ovr, None))
     return out
 
 
@@ -7296,7 +7500,12 @@ def _cc_report_append(site, r, dest):
     else:
         lines.append("    3SM：逐字节复制 + 改名，不裁、不改内容")
     lines.append("    交付：%s\\：%s" % (Path(dest) / site["name"], "、".join(fn for fn, _, _ in r["files"])))
-    lines.append("    清单里的来源：%s" % r["source"])
+    lines.append("    清单里的来源：%s（来源标识 %s）" % (r["source"], r.get("source_id") or "不明"))
+    if r["kind"] == CC_KIND_ORTHO:
+        crit = r["clip"].get("criteria") if r.get("clip") else None
+        note = r["clip"].get("criteria_note") if r.get("clip") else None
+        lines.append("    裁边判据：%s%s" % (crit or "不裁边（CC 原图原样复制）",
+                                         "（%s）" % note if note else ""))
     rep = Path(site["dir"]) / SURVEY_REPORT
     try:
         with open(rep, "a", encoding="utf-8") as f:
@@ -7397,13 +7606,20 @@ def run_cc_deliver(plan, out_dir, dest=None, clip=True, inset=SURVEY_CLIP_INSET,
                     info[k] = _cc_grid_of(p)
         pair = check_survey_raster_pair(info)
         lst = new_rows.setdefault(name, {})
+        if r["kind"] == CC_KIND_ORTHO and r.get("clip"):
+            crit = "%s（%s）" % (r["clip"].get("criteria") or "", r["clip"].get("criteria_note") or "")
+        elif r["kind"] == CC_KIND_ORTHO:
+            crit = "不裁边（CC 原图原样复制）"
+        else:
+            crit = "3SM（逐字节复制，不裁）"
         for fn, p, _ in r["files"]:
             g = info.get(fn[len(name):len(name) + 3])
             lst[fn] = {"工点": name, "文件名": fn, "大小(字节)": os.path.getsize(p), "SHA-256": r["shas"][fn], "坐标系": srs,
                        "分辨率(米)": "%g" % abs(g["tfw"][0]) if g else "",
                        "行×列": "%d×%d" % (g["height"], g["width"]) if g and fn.endswith(".tif") else "",
                        "DOM与DSM行列一致": ("否" if pair else "是") if g else "",
-                       "处理状态": site["verdict"], "来源": r["source"]}
+                       "处理状态": site["verdict"], "来源": r["source"], "来源标识": r.get("source_id") or "",
+                       "判据": crit}
         log("    交付：%s" % "、".join(fn for fn, _, _ in r["files"]))
         _cc_report_append(site, r, dest)
     # 清单：这次整理的工点原来的别的行（别的来源 / 别的文件）照旧留着，只换这次写的文件
@@ -10700,13 +10916,7 @@ def run_gui():
         pick_text = "（请选工点）"
         body = ctk.CTkFrame(dlg, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=18, pady=(14, 6))
-        lbl = ctk.CTkLabel(body, text="", text_color=hint_color, justify="left", anchor="w")
-        set_wrapped(lbl, "CC 输出的 Production_* 不带工点名：按成果外框和坐标系，和输出目录里各工点已对齐相机的范围比，"
-                         "重叠占成果外框一半以上、且明显比第二名多才自动认；认不准的在「工点」一栏自己选。"
-                         "DOM/DSM 默认裁边（不重采样，线外透明 / NoData，金字塔重新生成），3SM 改名原样复制；"
-                         "都放进交付目录 %s 里各工点的文件夹，范围线另存在输出目录的工点目录里。CC 的目录只读。" % dest,
-                    int(720 * win_scale))
-        lbl.pack(anchor="w")
+        ctk.CTkLabel(body, text="CC 成果整理（交付目录：%s）：" % dest, anchor="w").pack(anchor="w")
         ctk.CTkLabel(body, text="CC 目录（每行一个：CC 工程目录、Productions 或某个 Production 目录）：").pack(anchor="w",
                                                                                              pady=(8, 2))
         fd = ctk.CTkFrame(body, fg_color="transparent")
@@ -10789,7 +10999,7 @@ def run_gui():
                 return
             set_btn(b_scan, False)
             set_btn(b_go, False)
-            lbl_st.configure(text="扫描中…（读成果外框和各工点 XML 开头的相机位置）")
+            lbl_st.configure(text="扫描中…")
 
             def work():
                 try:
