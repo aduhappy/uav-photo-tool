@@ -84,7 +84,76 @@ for _k in ("showinfo", "showwarning", "showerror"):
     setattr(messagebox, _k, rec_box(_k))
 messagebox.askyesno = rec_box("askyesno", True)
 filedialog.askopenfilename = lambda **kw: (R["boxes"].append(["askopenfilename", kw.get("title"), FILE_ANSWER["open"], 0]) or FILE_ANSWER["open"] or "")
+ORIG_DIRDLG = filedialog.askdirectory          # T18-F5：真原生目录对话框（T17 遗留 F5：标题里还带目录结构说明）
 filedialog.askdirectory = lambda **kw: ""
+
+
+def grab_hwnd_bmp(path, hwnd):
+    """按窗口句柄截一张 BMP（Win32 PrintWindow，抓窗口自己的内容，不用屏幕坐标）。"""
+    rc = W.RECT()
+    ctypes.windll.user32.GetWindowRect(W.HWND(hwnd), ctypes.byref(rc))
+    l, t, r, b = rc.left, rc.top, rc.right, rc.bottom
+    w, h = max(1, r - l), max(1, b - t)
+    u, g = ctypes.windll.user32, ctypes.windll.gdi32
+    u.GetDC.restype = W.HDC; u.GetDC.argtypes = [W.HWND]
+    u.ReleaseDC.argtypes = [W.HWND, W.HDC]
+    g.CreateCompatibleDC.restype = W.HDC; g.CreateCompatibleDC.argtypes = [W.HDC]
+    g.CreateCompatibleBitmap.restype = W.HBITMAP; g.CreateCompatibleBitmap.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int]
+    g.SelectObject.restype = W.HGDIOBJ; g.SelectObject.argtypes = [W.HDC, W.HGDIOBJ]
+    g.BitBlt.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, W.HDC, ctypes.c_int, ctypes.c_int, W.DWORD]
+    g.GetDIBits.argtypes = [W.HDC, W.HBITMAP, W.UINT, W.UINT, ctypes.c_void_p, ctypes.c_void_p, W.UINT]
+    g.DeleteObject.argtypes = [W.HGDIOBJ]; g.DeleteDC.argtypes = [W.HDC]
+    sdc = u.GetDC(None)
+    mdc = g.CreateCompatibleDC(sdc)
+    bmp = g.CreateCompatibleBitmap(sdc, w, h)
+    g.SelectObject(mdc, bmp)
+    u.PrintWindow.argtypes = [W.HWND, W.HDC, W.UINT]
+    u.PrintWindow(W.HWND(hwnd), mdc, 2)
+    hdr = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
+    buf = ctypes.create_string_buffer(w * h * 4)
+    bi = ctypes.create_string_buffer(hdr + b"\0" * 16)
+    g.GetDIBits(mdc, bmp, 0, h, buf, bi, 0)
+    with open(path, "wb") as f:
+        f.write(b"BM" + struct.pack("<IHHI", 14 + 40 + len(buf.raw), 0, 0, 54) + hdr + buf.raw)
+    g.DeleteObject(bmp)
+    g.DeleteDC(mdc)
+    u.ReleaseDC(None, sdc)
+
+
+def watch_native_dialog(want, shot_path, timeout=30.0):
+    """盯原生对话框窗口：找到标题里含 want 的窗口 → 记标题、截屏 → 关掉它。返回标题或 None。"""
+    u = ctypes.windll.user32
+    found = {}
+
+    def cb(hwnd, lp):
+        if not u.IsWindowVisible(hwnd):
+            return True
+        n = u.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u.GetWindowTextW(hwnd, buf, n + 1)
+        if want and want in buf.value:
+            found["hwnd"] = hwnd
+            found["title"] = buf.value
+            return False
+        return True
+
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, W.HWND, W.LPARAM)
+    end = time.time() + timeout
+    while time.time() < end and "hwnd" not in found:
+        u.EnumWindows(CB(cb), 0)
+        if "hwnd" not in found:
+            time.sleep(0.2)
+    if "hwnd" not in found:
+        return None
+    try:
+        grab_hwnd_bmp(shot_path, found["hwnd"])
+        found["shot"] = shot_path
+    except Exception:
+        pass
+    u.PostMessageW(W.HWND(found["hwnd"]), 0x0010, 0, 0)      # WM_CLOSE：取消这个对话框
+    return found["title"]
 webbrowser.open = lambda url, *a, **k: R["browser"].append(url)
 os.startfile = lambda p, *a, **k: R.setdefault("startfile", []).append(str(p))  # 「打开完整日志」不真打开
 ORIG_BOX = {}  # 软件自己的统一弹窗（T10）；drive() 里换成记录器前先存一份，t10 模式要用真的
@@ -1605,6 +1674,7 @@ def steps_t9(root, nb):
                 r["var"].set(True)
 
     only(site)
+    by = {r["item"]["name"]: r for r in ui["rows"]()}     # 上面的「扫描」重建过行，旧的行控件已经销毁，要重新取
     gaps["max"] = 0.0
     btn(t5, "开始").invoke()
     yield (lambda: by[site]["status"].cget("text") == "运行中"), 120
@@ -1686,7 +1756,8 @@ def steps_t17(root, nb):
     """T17「整理 CC 成果…」：环境变量 UAV_T17_OUT（影像处理输出目录夹具，里面有同一地点两个工点、要用户选）、
     UAV_T17_CC（CC 工程目录，只读）、UAV_T17_DEST（新的交付目录）、UAV_T17_SITE（要选的工点名）。
     查：没选输出目录的提示；对话框扫描出两个成果都「要选工点」、下拉里有两个候选；不选就开始 → 提示、不关；
-    选了 → 跑完（真裁边），交付目录里 DOM/DSM tif+tfw+ovr 和 .3sm、清单来源列是 CC:…；对话框截图。"""
+    选了 → 跑完（真裁边），交付目录里 DOM/DSM tif+tfw 和 .3sm（**默认不生成金字塔，D-37**）、清单来源列是 CC:…；
+    再勾「生成金字塔（.ovr）」跑第二遍 → 交付目录里多两个 .tif.ovr；对话框截图。"""
     cfg_path = os.path.join(os.environ["APPDATA"], "无人机照片工具", "config.json")
     out, cc, dest, site = (os.environ[k] for k in ("UAV_T17_OUT", "UAV_T17_CC", "UAV_T17_DEST", "UAV_T17_SITE"))
     shots = os.path.join(OUT, "截图")
@@ -1735,7 +1806,43 @@ def steps_t17(root, nb):
         seen["still_open"] = dlg.winfo_exists()
         for r in u["rows"]:
             r["var"].set(site)
+        seen["ovr_checkbox"] = [c.cget("text") for c in find(dlg, ctk.CTkCheckBox)]
         dlg.update()
+        # T18-F5：点「添加目录…」打开原生目录对话框，抓它的**真实标题**并截图（标题里不该有目录结构说明）
+        orig_dir = filedialog.askdirectory
+        shot_native = os.path.join(shots, "整理CC成果_添加目录_原生对话框.bmp")
+
+        def askdir_watch(**kw):
+            """真开原生目录对话框；另开一个线程盯窗口标题、截图、然后关掉它。"""
+            import threading
+            res = {}
+
+            def worker():
+                res["title"] = watch_native_dialog("选择", shot_native, timeout=30)
+            th = threading.Thread(target=worker, daemon=True)
+            th.start()
+            try:
+                out = ORIG_DIRDLG(parent=kw.get("parent"), title=kw.get("title"),
+                                  mustexist=kw.get("mustexist", True))
+            finally:
+                th.join(5)
+            seen["native_title"] = res.get("title")
+            seen["native_shot"] = shot_native if os.path.exists(shot_native) else None
+            return out
+
+        # 同步做：原生对话框是模态的，点了就阻塞在这儿；看门狗线程负责抓标题、截图、把它关掉
+        filedialog.askdirectory = askdir_watch
+        try:
+            b_add = [b for b in find(dlg, ctk.CTkButton) if str(b.cget("text")).startswith("添加目录")]
+            seen["add_btn_texts"] = [str(b.cget("text")) for b in find(dlg, ctk.CTkButton)]
+            if not b_add:
+                seen["f5_error"] = "找不到「添加目录…」按钮"
+            else:
+                b_add[0].invoke()
+        except Exception as ex:
+            seen["f5_error"] = "%s: %s" % (type(ex).__name__, ex)
+        finally:
+            filedialog.askdirectory = orig_dir
         grab_bmp(os.path.join(shots, "整理CC成果对话框_选好了.bmp"), dlg)
         u["go"]()
         seen["closed"] = not dlg.winfo_exists()
@@ -1757,17 +1864,23 @@ def steps_t17(root, nb):
     check("完成弹框是 info", R["boxes"] and R["boxes"][-1][0] == "showinfo" and "整理 CC 成果" in R["boxes"][-1][1],
           R["boxes"][-1:])
     sd = os.path.join(dest, site)
-    want = sorted([site + "DOM.tif", site + "DOM.tfw", site + "DOM.tif.ovr", site + "DSM.tif", site + "DSM.tfw",
-                   site + "DSM.tif.ovr", site + ".3sm"])
+    want5 = sorted([site + "DOM.tif", site + "DOM.tfw", site + "DSM.tif", site + "DSM.tfw", site + ".3sm"])
     got = sorted(os.listdir(sd)) if os.path.isdir(sd) else []
-    check("交付文件夹里正好 DOM/DSM tif+tfw+ovr 和 .3sm", got == want, got)
+    check("对话框里有「生成金字塔（.ovr）」勾选框", "生成金字塔（.ovr）" in (seen.get("ovr_checkbox") or []),
+          seen.get("ovr_checkbox"))
+    check("默认不生成金字塔：交付文件夹里正好 DOM/DSM tif+tfw 和 .3sm（5 个、没有 .ovr）", got == want5, got)
     import csv as _csv
     rows = list(_csv.DictReader(open(os.path.join(dest, "交付清单.csv"), encoding="utf-8-sig")))
-    check("清单 7 行、来源都是 CC:Production_*、认定写进处理报告",
-          len(rows) == 7 and all(r["来源"].startswith("CC:Production_") for r in rows)
+    check("清单 5 行、来源都是 CC:Production_*、认定写进处理报告",
+          len(rows) == 5 and all(r["来源"].startswith("CC:Production_") for r in rows)
           and "用户指定" in open(os.path.join(out, site, "处理报告.txt"), encoding="utf-8").read(), [r["来源"] for r in rows])
+    check("清单「判据」列写明用了哪组判据", all(r.get("判据") for r in rows), [r.get("判据") for r in rows])
     c = json.load(open(cfg_path, encoding="utf-8"))
     check("CC 目录记进 config", c.get("survey_cc_dirs") == [cc], c.get("survey_cc_dirs"))
+    nt = seen.get("native_title")
+    check("F5：「添加目录…」的原生对话框标题就是「选择 CC 目录」（没有目录结构说明）",
+          nt == "选择 CC 目录", nt)
+    check("F5：原生对话框截图有", bool(seen.get("native_shot")), seen.get("native_shot"))
 
 
 def fill_dialog(root, answer):
