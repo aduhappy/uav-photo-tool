@@ -6737,13 +6737,13 @@ def cc_assign(rows, sites, mapping=None):
 
 
 def cc_row_state(r):
-    """表格/日志里的状态文字。"""
+    """表格/日志里的状态文字（R2-F5：只写结果，阈值公式和判定解释进 README / 报告 / 日志）。"""
     if r["status"]:
         return r["status"]
     if r["how"] == "用户指定不整理":
         return "不整理（用户指定）"
     if not r["site"]:
-        return "要选工点：" + r["why"]
+        return "需选择工点"
     return "待整理（%s%s）" % (r["how"], "，得分 %.2f" % r["score"] if r["how"] == "自动" else "")
 
 
@@ -6811,7 +6811,9 @@ def cc_plan_lines(plan):
     for r in plan["rows"]:
         lines.append("  %s %s：%s%s；%s" % (
             r["key"], r["kind"] or "-", "EPSG:%s，" % r["epsg"] if r["epsg"] else "", cc_box_text(r["box"]) or "-",
-            cc_row_state(r)))
+            ("要选工点" if (not r["site"] and not r["status"]) else cc_row_state(r))))
+        if not r["site"] and r["why"]:
+            lines.append("    说明：%s" % r["why"])
         if r["site"]:
             lines.append("    → %s" % r["site"])
         if r["scores"]:
@@ -7140,16 +7142,54 @@ def _cc_open_level(path, level=None):
         return rasterio.open(str(path))
     return rasterio.open(str(path), OVERVIEW_LEVEL=level)
 
+def _cc_valid_level_pixels(lv, nodata, lw, lh, want=6, tile=64, max_tiles=4000):
+    """在某一级的图里找几个「确实有值」的像元（列, 行）。按块扫，够 want 个就停。
+
+    R2-F4：有效区是窄斜带之类时，固定那几个抽查点可能全落在 NoData 里；
+    这时到这一级里去找真的有值的地方，别因为「没抽到样点」就说文件坏了。
+    只按窗口读（tile × tile），不整层读进内存。"""
+    import numpy as np
+    from rasterio.windows import Window
+    out, tiles = [], 0
+    for r0 in range(0, lh, tile):
+        for c0 in range(0, lw, tile):
+            tiles += 1
+            if tiles > max_tiles:
+                return out
+            w, h = min(tile, lw - c0), min(tile, lh - r0)
+            if w <= 0 or h <= 0:
+                continue
+            try:
+                blk = lv.read(window=Window(c0, r0, w, h))
+            except Exception:
+                continue
+            for b in range(blk.shape[0]):
+                mask = blk[b]
+                if nodata is not None:
+                    mask = mask != float(nodata)
+                mask = np.isfinite(mask)
+                idx = np.argwhere(mask)
+                if idx.size:
+                    rr, cc = idx[0]
+                    out.append((c0 + int(cc), r0 + int(rr)))
+                    break
+            if len(out) >= want:
+                return out
+    return out
+
+
 def _cc_ovr_range_check(path, level, lw, lh, mw, mh, max_block=4000000):
     """抽查金字塔读值（R1②）：第 k 级的某个像元应该落在**主图**里对应那一块的取值范围内
     （平均 / 最近邻重采样都成立；重采样核偶尔略微过冲，给 2% 的余量）。
     金字塔和主图不是一套（换了图、旧 .ovr 留着）就对不上。
 
-    注意：比的是**主图**，不是上一级 —— GDAL 建每一级都是按自己的方式从原图算的
+    注意：比的是**主图**，不是上一级 —— GDAL 建每一级都是自己从原图算的
     （CC 的 .ovr 级数倍数是 2/4/…/64/127/252/…，127 不是 128，各级之间不是逐级相减的），
     拿上一级当基准会误判（金字塔没问题也被说成有问题）。
 
     只按窗口读，不整层读进内存；对应块太大的最深几级跳过读值抽查。
+    R2-F4：固定抽查点全落在 NoData（窄斜带）时，到这一级的有效像元里再找样点；
+    实在没抽到**不等于**文件损坏（主图本身没有有效数据时本来就没什么可比的）。
     返回 (问题列表, 抽查条数, 是否跳过)。"""
     import numpy as np
     import rasterio
@@ -7163,19 +7203,17 @@ def _cc_ovr_range_check(path, level, lw, lh, mw, mh, max_block=4000000):
         with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
             nodata = ds.nodata
             with rasterio.Env(GDAL_PAM_ENABLED="NO"), _cc_open_level(path, level) as lv:
-                spots = [(int(lw * fx), int(lh * fy)) for fx, fy in
-                         ((0.23, 0.31), (0.71, 0.17), (0.47, 0.66), (0.86, 0.83))]
-                for px, py in spots:
-                    px = min(max(px, 0), lw - 1)
-                    py = min(max(py, 0), lh - 1)
-                    sx, sy = mw / float(lw), mh / float(lh)
+                sx, sy = mw / float(lw), mh / float(lh)
+
+                def compare(px, py):
+                    """比一个金字塔像元（px, py）和主图里对应那一块。返回 1（比了）、0（没法比）。"""
                     c0, r0 = int(px * sx), int(py * sy)
                     c1, r1 = max(c0 + 1, int((px + 1) * sx)), max(r0 + 1, int((py + 1) * sy))
                     c1, r1 = min(c1, mw), min(r1, mh)
                     if c1 <= c0 or r1 <= r0:
-                        continue
-                    blk = ds.read(window=Window(c0, r0, c1 - c0, r1 - r0))
+                        return 0
                     val = lv.read(window=Window(px, py, 1, 1))
+                    blk = ds.read(window=Window(c0, r0, c1 - c0, r1 - r0))
                     for b in range(min(blk.shape[0], val.shape[0])):
                         v = float(val[b][0][0])
                         if nodata is not None and v == float(nodata):
@@ -7185,19 +7223,34 @@ def _cc_ovr_range_check(path, level, lw, lh, mw, mh, max_block=4000000):
                             seg = seg[seg != float(nodata)]
                         seg = seg[np.isfinite(seg)]
                         if seg.size == 0:
-                            continue
+                            continue                       # 主图那一块没有有效值，没法比
                         lo, hi = float(seg.min()), float(seg.max())
                         tol = max(1.0, (hi - lo) * 0.02)
-                        n += 1
                         if v < lo - tol or v > hi + tol:
                             probs.append("第 %d 级的读值 %g 不在主图对应那块（%g～%g）里" % (level + 1, v, lo, hi))
+                        return 1
+                    return 0
+
+                # 先按固定的几点抽（抽查够快）
+                spots = [(int(lw * fx), int(lh * fy)) for fx, fy in
+                         ((0.23, 0.31), (0.71, 0.17), (0.47, 0.66), (0.86, 0.83))]
+                for px, py in spots:
+                    px = min(max(px, 0), lw - 1)
+                    py = min(max(py, 0), lh - 1)
+                    n += compare(px, py)
+                # R2-F4：一个都没比成（固定点全在 NoData 里，有效区是窄斜带之类）→
+                # 到这一级的有效像元里再找样点；**没抽到不等于损坏**。
+                if n == 0:
+                    for px, py in _cc_valid_level_pixels(lv, nodata, lw, lh):
+                        n += compare(px, py)
+                        if n >= 4:
                             break
     except Exception as ex:
         return ["金字塔抽查读值失败：%s" % ex], n, False
     return probs, n, False
 
 
-def cc_check_ovr(path):
+def cc_check_ovr(path, log=None):
     """金字塔可用、层级真实尺寸、和 tif 是同一套（R1②）。返回 (问题列表, [(倍数, 宽, 高)])。
 
     查三件事：①有金字塔；②每一级的真实尺寸（按实际 IFD 读）和「倍数 × 主图尺寸」对得上；
@@ -7226,8 +7279,10 @@ def cc_check_ovr(path):
             break
         p, n, skipped = _cc_ovr_range_check(path, k, lw, lh, w, h)
         probs += ["%s %s" % (name, x) for x in p]
-        if n == 0 and not skipped:
-            probs.append("%s 第 %d 级金字塔抽查不到读值" % (name, k + 1))
+        # R2-F4：没抽到读值**不等于**文件坏了 —— 主图本来就没有有效数据（比如有效区是窄斜带、
+        # 抽查点全落在 NoData 里）时本来就没什么可比的。只有「读出值来但对不上」才是真问题。
+        if n == 0 and not skipped and log:
+            log("    %s 第 %d 级没抽到可比的读值（主图这级上没有有效数据），不据此判损坏" % (name, k + 1))
     return probs, levels
 
 
@@ -7240,7 +7295,7 @@ def cc_ovr_build_if_needed(tif, kind, log=None):
     tif, ovr = Path(tif), Path(str(tif) + ".ovr")
     if not tif.is_file():
         return False, []
-    probs, _ = cc_check_ovr(tif)
+    probs, _ = cc_check_ovr(tif, log=log)
     if not probs:
         return False, []
     if ovr.is_file():
@@ -7253,7 +7308,7 @@ def cc_ovr_build_if_needed(tif, kind, log=None):
     cc_build_ovr(tif, kind)
     if _file_sha256(tif, lambda: False, lambda n: None) != before:
         raise RuntimeError("建金字塔时 %s 被改了" % tif.name)
-    probs, levels = cc_check_ovr(tif)
+    probs, levels = cc_check_ovr(tif, log=log)
     if probs:
         raise RuntimeError("%s 的金字塔不对：%s" % (tif.name, "；".join(probs)))
     log("    %s 没有匹配的金字塔，重建了（%d 级）" % (tif.name, len(levels)))
@@ -7261,10 +7316,14 @@ def cc_ovr_build_if_needed(tif, kind, log=None):
 
 
 
-def cc_write_clipped(src, dst, kind, polys, win, stopped=None, progress=None):
+def cc_write_clipped(src, dst, kind, polys, win, stopped=None, progress=None, epsg=None):
     """把 src（CC 的 DOM / DSM）win = (列, 行, 宽, 高) 这块原样写到 dst（🔒 不重采样）：DOM → RGBA 8 位，线外 alpha = 0
     （RGB 也写 0）；DSM → float32，线外和原来的 NoData 都写 −9999。Deflate、512 分块、估算 > 3.8 GB 写 BigTIFF；
-    坐标系写进 GeoTIFF，另写 .tfw。线内外按像元中心判断。"""
+    坐标系写进 GeoTIFF，另写 .tfw。线内外按像元中心判断。
+
+    R2-F3：epsg 是**已经核定过的成果坐标系**（GeoTIFF 里读不出、ContextScene.json 补出来的那种）。
+    写出的 tif 用它当投影（只是补坐标系的标签，像元网格和像素值一个不动、不重投影），
+    不用源文件那个可能读不出来的 s.crs。"""
     import numpy as np
     import rasterio
     from rasterio.features import geometry_mask
@@ -7275,13 +7334,20 @@ def cc_write_clipped(src, dst, kind, polys, win, stopped=None, progress=None):
     progress = progress or (lambda f: None)
     geom = mapping(MultiPolygon([Polygon(o, hs) for o, hs in _as_polygons(polys)]))
     c0, r0, w, h = win
+    crs = None
+    if epsg:
+        try:
+            from rasterio.crs import CRS
+            crs = CRS.from_epsg(int(epsg))
+        except Exception:
+            crs = None
     with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(src)) as s:
         T = s.transform
         tr = Affine(T.a, 0.0, T.c + c0 * T.a, 0.0, T.e, T.f + r0 * T.e)
         dom = kind == "DOM"
         bands, dtype, nbytes = (4, "uint8", 1) if dom else (1, "float32", 4)
         big = float(w) * h * bands * nbytes > SURVEY_BIGTIFF
-        prof = dict(driver="GTiff", width=w, height=h, count=bands, dtype=dtype, crs=s.crs, transform=tr, tiled=True,
+        prof = dict(driver="GTiff", width=w, height=h, count=bands, dtype=dtype, crs=crs or s.crs, transform=tr, tiled=True,
                     blockxsize=512, blockysize=512, compress="deflate", BIGTIFF="YES" if big else "NO")
         has_alpha = False
         if dom:
@@ -7373,7 +7439,8 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
             t1 = time.time()
             boxes[k] = cc_write_clipped(r[k.lower()], tmp, k, polys, win, stopped,
                                         lambda f, i=i, k=k: progress(0.5 + 0.4 * (i + f) / len(kinds),
-                                                                     "%s %d%%" % (CC_CLIP_STAGE[k.lower()], f * 100)))
+                                                                     "%s %d%%" % (CC_CLIP_STAGE[k.lower()], f * 100)),
+                                        epsg=r["epsg"])
             info["steps"].append((k.lower(), round(time.time() - t1, 1)))
             t1 = time.time()
             progress(0.5 + 0.4 * (i + 1) / len(kinds), "%s（%s）" % (CC_CLIP_STAGE["ovr"], k))
@@ -7388,7 +7455,7 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
             problems, rinfo = check_survey_rasters(tmps["DOM"], tmps["DSM"], r["epsg"], g["px"])
             problems += check_survey_raster_pair(rinfo)
         for k in kinds:
-            p, _ = cc_check_ovr(tmps[k])
+            p, _ = cc_check_ovr(tmps[k], log=log)
             problems += p
             gi = geotiff_info(tmps[k])
             dc = (gi["origin"][0] - g["left"]) / g["px"]
@@ -7415,11 +7482,14 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
     """不裁：CC 的 tif / tfw / tif.ovr（或 3SM）改名逐字节复制（先写临时文件、读回 SHA-256 一致才换上、保留修改时间）；
     大小、修改时间没变、清单里有哈希的不重复复制。
 
-    R1②：tif、.tfw、.tif.ovr 当同一套换 —— 换主图时金字塔必须跟着换：
-    源有 .ovr 就把它一起复制过去（它和源 tif 是一套）；源没有 .ovr，交付目录里的旧 .ovr 就是上一版的、跟新图对不上，
-    要删掉重建（🔒 交付的 tif 必须带和它本身匹配的金字塔）。最后都核一遍真实层级尺寸和抽查读值。"""
+    R1② / R2-F1：tif、.tfw、.tif.ovr 当同一套换 —— **主图一换，交付目录里的旧 .ovr 一律作废**：
+    源有 .ovr 就把它一起复制过去（它和源 tif 是一套）；源没有 .ovr（或源那份没跟着换）就重建
+    （🔒 交付的 tif 必须带和它本身匹配的金字塔）。抽查读值只用来验**新的一套**对不对，
+    不能当作旧 .ovr 还能继续用的凭据（局部改动避开抽查点就能绕过去）。
+    R2-F2：金字塔重建过的那一行，清单里的 SHA-256 作废 → 后面按实际文件统一重算。"""
     name = site["name"]
     out = []
+    written = set()                              # 这次真的重新复制过的交付文件名
     for fn, src in cc_targets(r, name):
         if not Path(src).is_file():
             continue
@@ -7438,6 +7508,7 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
         if not sha:
             sha = _deliver_copy(src, dst, stopped, on_bytes)
             log("    复制 %s → %s" % (Path(src).name, fn))
+            written.add(fn)
         out.append((fn, dst, sha))
     if r["kind"] == CC_KIND_ORTHO:
         for k in ("DOM", "DSM"):
@@ -7446,9 +7517,17 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log):
             tif = sd / (name + k + ".tif")
             if not tif.is_file():
                 continue
+            ovr = Path(str(tif) + ".ovr")
+            # R2-F1：主图换了（这次真的重新复制过）而源没给 .ovr → 交付目录里上一版的 .ovr
+            # 一定是跟新主图对不上的，一律作废重建；不能靠「抽查几个点还对得上」就沿用。
+            if (name + k + ".tif") in written and not Path(r[k.lower()] + ".ovr").is_file() and ovr.is_file():
+                try:
+                    ovr.unlink()
+                    log("    %s 的主图换了、源没有对应的金字塔，删掉上一版的重建" % tif.name)
+                except OSError as ex:
+                    raise RuntimeError("删不掉旧的金字塔 %s：%s" % (ovr.name, ex))
             # 🔒 交付的 tif 必须带和它本身匹配的金字塔；旧的跟新图对不上就重建（CC 没给就自己建，tif 一个字节不动）
             cc_ovr_build_if_needed(tif, k, log=log)
-            ovr = Path(str(tif) + ".ovr")
             if ovr.is_file() and not any(fn == ovr.name for fn, _, _ in out):
                 out.append((ovr.name, ovr, None))
     return out
@@ -7585,8 +7664,11 @@ def run_cc_deliver(plan, out_dir, dest=None, clip=True, inset=SURVEY_CLIP_INSET,
                 r["files"] = [(fn, p, None) for fn, p in files]
             else:
                 r["files"] = cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log)
+            # R2-F2：清单里的 SHA-256 一律按**最终落定的文件**重算。
+            # 复制时记下的哈希是中间状态：金字塔可能被删掉重建（哈希就变了），
+            # 不能拿旧值写进清单。
             for fn, p, sha in r["files"]:
-                r["shas"][fn] = sha or _file_sha256(p, stopped, lambda n: None)
+                r["shas"][fn] = _file_sha256(p, stopped, lambda n: None)
             r["result"] = "完成"
         except (AlignCancelled, KeyboardInterrupt):
             r.update(result="已取消", reason="用户取消；这个成果的临时文件已清掉，交付目录里原来的没动")
@@ -10917,8 +10999,7 @@ def run_gui():
         body = ctk.CTkFrame(dlg, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=18, pady=(14, 6))
         ctk.CTkLabel(body, text="CC 成果整理（交付目录：%s）：" % dest, anchor="w").pack(anchor="w")
-        ctk.CTkLabel(body, text="CC 目录（每行一个：CC 工程目录、Productions 或某个 Production 目录）：").pack(anchor="w",
-                                                                                             pady=(8, 2))
+        ctk.CTkLabel(body, text="CC 目录：").pack(anchor="w", pady=(8, 2))
         fd = ctk.CTkFrame(body, fg_color="transparent")
         fd.pack(fill="x")
         tb_dirs = ctk.CTkTextbox(fd, height=64)
@@ -10948,10 +11029,10 @@ def run_gui():
         rows_ui = []
         fo = ctk.CTkFrame(body, fg_color="transparent")
         fo.pack(fill="x", pady=(8, 0))
-        ctk.CTkCheckBox(fo, text="DOM/DSM 自动裁边（线外透明 / NoData）", variable=v_clip).pack(side="left")
-        ctk.CTkLabel(fo, text="往里收（0～30 米）").pack(side="left", padx=(16, 4))
+        ctk.CTkCheckBox(fo, text="自动裁边", variable=v_clip).pack(side="left")
+        ctk.CTkLabel(fo, text="往里收（米）").pack(side="left", padx=(16, 4))
         ctk.CTkEntry(fo, textvariable=v_ins, width=56).pack(side="left")
-        ctk.CTkLabel(fo, text="点云密度门槛（%，工点有点云时用）").pack(side="left", padx=(12, 4))
+        ctk.CTkLabel(fo, text="点云密度门槛（%）").pack(side="left", padx=(12, 4))
         ctk.CTkEntry(fo, textvariable=v_den, width=56).pack(side="left")
         bar = ctk.CTkFrame(dlg, fg_color="transparent")
         bar.pack(fill="x", padx=18, pady=(4, 14))
