@@ -6869,18 +6869,25 @@ def run_selftest(log=None):
 
     tmp = tempfile.mkdtemp(prefix="uav_selftest_")
     try:
-        # ---- 数据目录在不在程序里 ----
+        # ---- 数据目录和两份 proj.db 在不在程序里 ----
         gdal, rast_proj, pyproj_dir = geo_data_dirs()
-        add("GDAL/PROJ 数据目录随包带",
-            bool(gdal) and os.path.isdir(gdal) and bool(rast_proj) and os.path.isdir(rast_proj),
-            "GDAL_DATA=%s；PROJ_DATA=%s" % (gdal or "（没找到）", rast_proj or "（没找到）"))
+        rasterio_db = os.path.join(rast_proj, "proj.db") if rast_proj else ""
+        pyproj_db = os.path.join(pyproj_dir, "proj.db") if pyproj_dir else ""
+        add("GDAL/PROJ 数据目录及两份 proj.db 随包带",
+            bool(gdal) and os.path.isdir(gdal)
+            and bool(rast_proj) and os.path.isdir(rast_proj) and os.path.isfile(rasterio_db)
+            and bool(pyproj_dir) and os.path.isdir(pyproj_dir) and os.path.isfile(pyproj_db),
+            "GDAL_DATA=%s；rasterio proj.db=%s；pyproj proj.db=%s" % (
+                gdal or "（没找到）", rasterio_db or "（没找到）", pyproj_db or "（没找到）"))
 
         # ---- numpy / rasterio ----
         try:
             import numpy
             import rasterio
+            from rasterio import _env as rasterio_env
             from rasterio.enums import Resampling
             from rasterio.transform import from_origin
+            from rasterio.warp import transform as rasterio_transform
         except Exception as ex:
             add("导入 numpy / rasterio", False, "%s: %s" % (type(ex).__name__, ex))
             return False, results
@@ -6889,6 +6896,56 @@ def run_selftest(log=None):
                                                 rasterio.__gdal_version__))
 
         transform = from_origin(500000.0, 3900000.0, 1.0, 1.0)
+
+        def coordinate_error_mm(lon, lat):
+            dx = abs(lon - 102.5) * 111319.49079327358 * math.cos(math.radians(34.5)) * 1000.0
+            dy = abs(lat - 34.5) * 110574.3885578 * 1000.0
+            return dx, dy
+
+        def planar_error_mm(x, y):
+            # 已知值：按 CGCS2000（GRS80）高斯-克吕格自己算的，不经过 pyproj
+            #   经度 102.5°、纬度 34.5° -> 东 545920.2014、北 3819238.3878
+            return abs(x - 545920.2014) * 1000.0, abs(y - 3819238.3878) * 1000.0
+
+        def verify_proj_db(db_path):
+            """只读验证指定的 proj.db 包含本自检要用到的 EPSG:4543 定义。"""
+            import sqlite3
+            from urllib.parse import quote
+
+            if not db_path or not os.path.isfile(db_path):
+                raise FileNotFoundError("找不到 proj.db：%s" % (db_path or "（路径未找到）"))
+            uri = "file:%s?mode=ro" % quote(os.path.abspath(db_path).replace("\\", "/"), safe="/:")
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                layout = con.execute(
+                    "SELECT value FROM metadata WHERE key='DATABASE.LAYOUT.VERSION.MAJOR'"
+                ).fetchone()
+                row = con.execute(
+                    "SELECT p.name, p.geodetic_crs_code, c.method_name, "
+                    "c.param2_value, c.param4_value "
+                    "FROM projected_crs p JOIN conversion c "
+                    "ON p.conversion_auth_name=c.auth_name "
+                    "AND p.conversion_code=c.code "
+                    "WHERE p.auth_name='EPSG' AND p.code='4543'"
+                ).fetchone()
+                if not layout or layout[0] != "1" or not row or row[1] != 4490 \
+                        or row[2] != "Transverse Mercator" or row[3] != 102.0 \
+                        or row[4] != 500000.0:
+                    raise ValueError("proj.db 缺少或损坏 EPSG:4543 定义：%r" % (row,))
+                return row[0]
+            finally:
+                con.close()
+
+        def only_data_dir(actual, expected):
+            """数据目录必须就是指定的那一份，不许悄悄回退到别的（哪怕也在包内）。"""
+            if not actual:
+                return False
+            want = os.path.normcase(os.path.realpath(expected))
+            for p in actual:
+                got = os.path.normcase(os.path.realpath(p))
+                if got != want:
+                    return False
+            return True
 
         # ---- 1) RGBA + Deflate + 512 分块 + 金字塔 ----
         try:
@@ -6959,30 +7016,56 @@ def run_selftest(log=None):
         except Exception as ex:
             add("写读 BigTIFF", False, "%s: %s" % (type(ex).__name__, ex))
 
-        # ---- 4) pyproj：WGS84 -> EPSG:4543，和独立算出来的已知值比（<= 1 毫米）----
+        # ---- 4) rasterio/GDAL 真正使用自己的 proj.db 做坐标换算 ----
         try:
-            import pyproj
-            if pyproj_dir:
-                try:
-                    pyproj.datadir.set_data_dir(pyproj_dir)
-                except Exception:
-                    pass
-            from pyproj import Transformer
-            tr = Transformer.from_crs("EPSG:4326", "EPSG:%d" % SELFTEST_EPSG, always_xy=True)
-            x, y = tr.transform(102.5, 34.5)
-            # 已知值用高斯-克吕格投影自己推的（不经过 pyproj）：中央经线 102°E、东偏 500000
-            rx, ry = 545920.2014, 3819238.3878
-            dx = abs(x - rx) * 1000.0
-            dy = abs(y - ry) * 1000.0
-            add("pyproj 坐标换算（WGS84 → EPSG:4543，误差 ≤ 1 毫米）",
-                dx <= SELFTEST_TOL_MM and dy <= SELFTEST_TOL_MM,
-                "算出 (%.4f, %.4f)；已知 (%.4f, %.4f)；差 %.4f / %.4f 毫米（pyproj %s，PROJ %s）" % (
-                    x, y, rx, ry, dx, dy, pyproj.__version__, pyproj.proj_version_str))
+            db_crs = verify_proj_db(rasterio_db)
+            rasterio_env.set_proj_data_search_path(rast_proj)
+            paths = rasterio_env.get_proj_data_search_paths()
+            if not only_data_dir(paths, rast_proj):
+                raise RuntimeError("rasterio PROJ 搜索路径不是包内目录：%r" % (paths,))
+            # 4326 -> 4543：和独立算的已知平面值比
+            x, y = rasterio_transform(4326, 4543, [102.5], [34.5])
+            dx, dy = planar_error_mm(x[0], y[0])
+            # 4543 -> 4490：和已知经纬度比
+            lon, lat = rasterio_transform(4543, 4490, [545920.2014], [3819238.3878])
+            dlon, dlat = coordinate_error_mm(lon[0], lat[0])
+            ok = (dx <= SELFTEST_TOL_MM and dy <= SELFTEST_TOL_MM
+                  and dlon <= SELFTEST_TOL_MM and dlat <= SELFTEST_TOL_MM)
+            add("rasterio/GDAL 使用 rasterio proj.db（坐标换算，误差 ≤ 1 毫米）", ok,
+                "db 中 CRS=%s；搜索路径=%s；4326→4543 差 %.4f / %.4f 毫米；"
+                "4543→4490 差 %.4f / %.4f 毫米" % (
+                    db_crs, paths[0], dx, dy, dlon, dlat))
         except Exception as ex:
-            add("pyproj 坐标换算（WGS84 → EPSG:4543，误差 ≤ 1 毫米）", False,
-                "%s: %s" % (type(ex).__name__, ex))
+            add("rasterio/GDAL 使用 rasterio proj.db（坐标换算，误差 ≤ 1 毫米）",
+                False, "%s: %s" % (type(ex).__name__, ex))
 
-        # ---- 5) shapely：buffer / simplify ----
+        # ---- 5) pyproj 真正使用自己的 proj.db 做坐标换算 ----
+        try:
+            db_crs = verify_proj_db(pyproj_db)
+            import pyproj
+            pyproj.datadir.set_data_dir(pyproj_dir)
+            actual_dir = pyproj.datadir.get_data_dir()
+            if not only_data_dir([actual_dir], pyproj_dir):
+                raise RuntimeError("pyproj PROJ 数据目录不是包内目录：%s" % actual_dir)
+            # 4326 -> 4543：和独立算的已知平面值比
+            x, y = pyproj.Transformer.from_crs(4326, 4543, always_xy=True).transform(102.5, 34.5)
+            dx, dy = planar_error_mm(x, y)
+            # 4543 -> 4490：和已知经纬度比
+            lon, lat = pyproj.Transformer.from_crs(4543, 4490, always_xy=True).transform(
+                545920.2014, 3819238.3878)
+            dlon, dlat = coordinate_error_mm(lon, lat)
+            ok = (dx <= SELFTEST_TOL_MM and dy <= SELFTEST_TOL_MM
+                  and dlon <= SELFTEST_TOL_MM and dlat <= SELFTEST_TOL_MM)
+            add("pyproj 使用 pyproj proj.db（坐标换算，误差 ≤ 1 毫米）", ok,
+                "db 中 CRS=%s；数据目录=%s；4326→4543 差 %.4f / %.4f 毫米；"
+                "4543→4490 差 %.4f / %.4f 毫米（pyproj %s，PROJ %s）" % (
+                    db_crs, actual_dir, dx, dy, dlon, dlat,
+                    pyproj.__version__, pyproj.proj_version_str))
+        except Exception as ex:
+            add("pyproj 使用 pyproj proj.db（坐标换算，误差 ≤ 1 毫米）",
+                False, "%s: %s" % (type(ex).__name__, ex))
+
+        # ---- 6) shapely：buffer / simplify ----
         try:
             from shapely.geometry import LineString, Point
             buf = Point(100.0, 100.0).buffer(10.0)

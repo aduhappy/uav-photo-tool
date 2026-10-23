@@ -127,12 +127,38 @@ if (-not (Test-Path $Installer)) { throw "没生成安装包 $Installer（找找
 $mb = [math]::Round((Get-Item $Installer).Length / 1MB, 2)
 Write-Host "安装包：$Installer （$mb MB）"
 
-# ---- 免安装 zip：同一个文件夹版 ----
+# ---- 免安装 zip：UTF-8 文件名（ZIP flag bit 11） ----
 if (-not $SkipZip) {
-    Remove-Item -Force -ErrorAction SilentlyContinue $Zip
-    Compress-Archive -Path (Join-Path $Dist '*') -DestinationPath $Zip -CompressionLevel Optimal
+    Add-Type -AssemblyName System.IO.Compression
+    $zipStream = $null
+    $archive = $null
+    try {
+        Remove-Item -Force -ErrorAction SilentlyContinue $Zip
+        $zipStream = [System.IO.File]::Open($Zip, [System.IO.FileMode]::CreateNew)
+        $archive = [System.IO.Compression.ZipArchive]::new(
+            $zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false,
+            [System.Text.Encoding]::UTF8)
+        $distPrefix = (Resolve-Path $Dist).Path.TrimEnd('\') + '\'
+        foreach ($item in (Get-ChildItem -LiteralPath $Dist -Force -Recurse | Sort-Object FullName)) {
+            $entryName = $item.FullName.Substring($distPrefix.Length).Replace('\', '/')
+            if ($item.PSIsContainer) {
+                $entryName += '/'
+                [void]$archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+                continue
+            }
+            $entry = $archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $inputStream = [System.IO.File]::OpenRead($item.FullName)
+            $outputStream = $entry.Open()
+            try { $inputStream.CopyTo($outputStream) }
+            finally { $outputStream.Dispose(); $inputStream.Dispose() }
+        }
+    }
+    finally {
+        if ($archive) { $archive.Dispose() }
+        if ($zipStream) { $zipStream.Dispose() }
+    }
     $zmb = [math]::Round((Get-Item $Zip).Length / 1MB, 2)
-    Write-Host "免安装 zip：$Zip （$zmb MB）"
+    Write-Host "免安装 zip：$Zip （$zmb MB，UTF-8 文件名）"
 }
 
 Write-Host "完成。"

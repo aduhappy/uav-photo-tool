@@ -248,9 +248,10 @@ uav_photo_tool.exe survey-deliver <输出目录> [--to 交付目录] [--site 工
 
 - **怎么卸**：安装包在「设置 → 应用」里找「无人机照片工具」卸载，或者直接跑安装目录里的 `unins000.exe`。也可以在「开始菜单 → 无人机照片工具 → 卸载」。
   卸载**只删程序文件**，不会删你的设置和配置（`%APPDATA%\无人机照片工具\config.json`）和任何用户数据——重装后设置还在。
+- **升级**：装新版本时，安装程序会先清理安装目录里本工具旧版留下的程序文件，再安装新版本；只处理安装目录，不会碰配置和用户数据。请不要把个人文件放进安装目录。
 - 免安装 zip 不用卸载：把解压出来的文件夹删了就行。
 - 两个附件都**自带 GDAL / PROJ / numpy / shapely / pyproj**（约 180 MB），不用另外装 Python 或任何库。程序用的 GDAL 数据是它自己包里那份，**不会**读你电脑上装过的 GDAL / PROJ / QGIS / conda 的环境变量。
-- 想确认程序没问题：在命令行里跑 `无人机照片工具.exe selftest`，会检查 GDAL/PROJ/numpy/shapely/sqlite3 能不能用，退出码 0 就是全好（界面里也有：菜单「帮助 → 自检」）。
+- 想确认程序没问题：在命令行里跑 `无人机照片工具.exe selftest`，会检查 GDAL/PROJ/numpy/shapely/sqlite3 能不能用（包括 GDAL 和 pyproj 各自的 `proj.db` 文件及坐标换算），退出码 0 就是全好（界面里也有：菜单「帮助 → 自检」）。
 
 软件启动时会在后台查一次有没有新版本，有的话会弹窗提示并给出下载链接，不会自动下载或替换。不想要这个提示，可以在菜单「帮助 → 启动时自动检查更新」里关掉。
 
@@ -336,7 +337,7 @@ exe 打包时没有带控制台窗口，所以用 exe 跑命令行时看不到�
   pwsh -File scripts/build_installer.ps1 -Python .venv\Scripts\python.exe -Build <中间文件目录>
   ```
 
-  脚本做三件事：① PyInstaller `--onedir --windowed` 打文件夹版；② 调 Inno Setup 6 编译安装包 `发布\无人机照片工具_v<版本>_安装包.exe`（安装脚本在 `installer\uav_photo_tool.iss`，中文向导用 `installer\ChineseSimplified.isl`）；③ 打免安装 zip `发布\无人机照片工具_v<版本>_免安装.zip`。版本号只从源码的 `APP_VERSION` 读。
+  脚本做三件事：① PyInstaller `--onedir --windowed` 打文件夹版；② 调 Inno Setup 6 编译安装包 `发布\无人机照片工具_v<版本>_安装包.exe`（安装脚本在 `installer\uav_photo_tool.iss`，中文向导用 `installer\ChineseSimplified.isl`）；③ 打免安装 zip `发布\无人机照片工具_v<版本>_免安装.zip`（zip 里中文文件名带 UTF-8 标志，非中文系统的解压工具不会乱码）。版本号只从源码的 `APP_VERSION` 读。
 
   还需要装 Inno Setup 6（默认在 `C:\Program Files (x86)\Inno Setup 6\`）。
 

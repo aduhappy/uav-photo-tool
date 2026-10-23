@@ -1,15 +1,15 @@
 ; 无人机照片工具 安装包脚本（Inno Setup 6）
 ;
 ; 用法（一般由 scripts/build_installer.ps1 调用，不用手敲）：
-;   ISCC.exe /DMyAppVersion=1.5 /DMySourceDir="<文件夹版目录>" /O<输出.exe> installer\uav_photo_tool.iss
+;   ISCC.exe /DMyAppVersion=1.5 /DMySourceDir="<文件夹版目录>" /DMyOutputDir="<输出目录>" installer\uav_photo_tool.iss
 ;
 ; 约定（D-34）：
 ;   - 默认装到 %LOCALAPPDATA%\Programs\无人机照片工具\，不需要管理员权限（PrivilegesRequired=lowest），
 ;     用户在向导里可以改目录。
 ;   - 中文向导（ChineseSimplified.isl，和本脚本放在一起）。
 ;   - 开始菜单快捷方式；桌面快捷方式可选、默认勾。
-;   - 同一个 AppId：装新版本时 Inno Setup 会先把旧版本卸掉再装。
-;   - 卸载只删安装目录里的程序文件；%APPDATA%\无人机照片工具\ 下的 config.json 和用户数据一律不碰。
+;   - 同一个 AppId；每次安装前显式清掉已知的程序文件目录，再复制新版本。
+;   - 安装/卸载只处理安装目录里的程序文件；%APPDATA%\无人机照片工具\ 下的 config.json 和用户数据一律不碰。
 
 #ifndef MyAppVersion
   #error 请用 /DMyAppVersion=<版本> 指定版本号
@@ -57,6 +57,13 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
+[InstallDelete]
+; 兜底：即使 [Code] 里清目录失败，这些路径也要清掉。
+; 只删本安装包自己管理的程序文件；%APPDATA%\无人机照片工具\ 下的 config.json 和用户数据一律不碰。
+Type: filesandordirs; Name: "{app}\_internal"
+Type: files; Name: "{app}\{#MyAppExeName}"
+Type: files; Name: "{app}\ChineseSimplified.isl"
+
 [Files]
 ; 文件夹版整个目录：主程序 + _internal（含 numpy/rasterio/GDAL/shapely/pyproj 和它们的数据）
 Source: "{#MySourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -73,6 +80,32 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; 卸载时清掉安装目录里可能残留的东西（程序文件本身 Inno Setup 会删）
+; 卸载只删除安装包部署的程序文件，不删除 config.json 或其它用户数据。
 Type: filesandordirs; Name: "{app}\_internal"
+Type: files; Name: "{app}\{#MyAppExeName}"
+Type: files; Name: "{app}\ChineseSimplified.isl"
+Type: files; Name: "{app}\unins*.exe"
+Type: files; Name: "{app}\unins*.dat"
+Type: files; Name: "{app}\unins*.msg"
 Type: dirifempty; Name: "{app}"
+
+[Code]
+// 安装新版本前，只清理本安装包管理的程序路径：_internal、主程序和语言文件。
+// 不触碰安装目录中的其它文件，也绝不碰 %APPDATA%\无人机照片工具\config.json。
+
+procedure RemoveOldProgramFiles;
+var
+  AppDir: String;
+begin
+  AppDir := ExpandConstant('{app}');
+  if not DirExists(AppDir) then Exit;
+  DelTree(AppDir + '\_internal', True, True, True);
+  DeleteFile(AppDir + '\' + ExpandConstant('{#MyAppExeName}'));
+  DeleteFile(AppDir + '\ChineseSimplified.isl');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+    RemoveOldProgramFiles;
+end;
