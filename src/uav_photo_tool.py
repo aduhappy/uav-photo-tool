@@ -6343,6 +6343,7 @@ CC_DSM_FRAC = 0.9                    # 判据④（工点没有点云时）：�
 CC_GRAY = 128                        # D-36：CC 在没纹理的地方填的纯灰色（正好 128,128,128），当「没影像」
 CC_STRIP_ROWS = 512                  # 按这么多行一条读写（= CC 和输出的分块高度）
 CC_OVR_MIN = 256                     # 金字塔一直做到长边 < 这么多像元
+CC_OVR_BLOCK = 32                    # 金字塔核对：把缩览分成 32×32 的块，一块一块比
 CC_SKIP_LABEL = "（不整理）"
 
 
@@ -7175,117 +7176,90 @@ def _cc_open_level(path, level=None):
     return rasterio.open(str(path), OVERVIEW_LEVEL=level)
 
 
-def _cc_pixels_valid(a, ds, is_dom, nodata):
-    """一批像元的「有效」掩膜（True = 有效）。
+def _cc_pyramid_valid(a, is_dom, nodata, has_alpha):
+    """金字塔核对用的「有效」掩膜（True = 有效）。
 
-    DOM：RGB 不全为 0、**也不正好 (128,128,128)**（D-36 的纯灰），有 alpha 时还要 alpha > 0；
-    DSM：有限且 != NoData。
-    注意：掩膜只能「取交集」地加限制，不能拿 np.isfinite 覆盖掉 NoData 的判断
-    （T17 R2 的 F4 就是这么坏的：非 NoData 的布尔掩膜被 isfinite 覆盖成全 True，
-      全 NoData 的缩览也被放行）。"""
+    R1（主控澄清）：缩览上**只**看 DOM 的 alpha > 0、DSM 有限且 ≠ NoData，
+    **不套判据①的 RGB / 128 规则**（那条只用于 CC 原图判「有没有影像」）。
+    缩览是重采样后的结果：DOM 用平均，127/129 这种合法像元平均后会正好变成 128，
+    按 128 判「没值」会把**正确的**金字塔整级误拒（复核 R2）。
+    没有 alpha 波段时退回「RGB 不全为 0」。
+    （D-37：有限值与非 NoData 取交集；比的是主图的**实际**有效区。）"""
     import numpy as np
     if is_dom:
-        rgb = a[:3]
-        ok = np.any(rgb != 0, axis=0)
-        ok &= ~np.all(rgb == CC_GRAY, axis=0)
-        if a.shape[0] >= 4 and ds.colorinterp[3].name == "alpha":
-            ok &= a[3] > 0
-    else:
-        ok = np.isfinite(a[0])
-        if nodata is not None:
-            ok &= a[0] != float(nodata)
+        if has_alpha:
+            return a[3] > 0
+        return np.any(a[:3] != 0, axis=0)
+    ok = np.isfinite(a[0])
+    if nodata is not None:
+        ok &= a[0] != float(nodata)
     return ok
 
 
-def cc_main_level_masks(path, factors, mode="any", stopped=None, progress=None):
-    """一次扫描主图，算出每一级金字塔（倍数 f）对应的「主图有效区」掩膜。返回 {f: (mask, lw, lh)}。
+def cc_pyramid_main_blocks(path, levels, is_dom, nodata, has_alpha, stopped=None, progress=None):
+    """一次扫描主图，算出每一级金字塔对应的「粗块」统计。
 
-    第 f 级的尺寸按 GDAL 的实际算法取整：lw = ceil(主图宽 / f)、lh = ceil(主图高 / f)（和真实 .ovr 一致）。
+    levels：[(倍数, 缩览宽, 缩览高), ...]（按实际 IFD 读出来的真实尺寸，不按公式算）。
+    返回 {k: (每块有效像元数, 每块总像元数, 列边界, 行边界)}，两个数组都是 (块行数, 块列数)。
 
-    mode="any"（DOM 用，金字塔用「平均」）：
-        一个 f × f 的块里**至少有一个**有效像元 → 这个块算有效。
-        平均重采样里，只要块里有有效像元，缩览像元就不会是空/black（正好 128 的极少）。
-    mode="sample"（DSM 用，金字塔用「最近邻」）：
-        一个缩览像元取的是主图里 (f·y, f·x) 那一个像元（GDAL 最近邻就是取这个），
-        所以拿「被取到的那个像元有效不有效」来比，而不是整块——整块里别的像元有效不代表缩览会有效。
-    （D-37：有限值与非 NoData 取交集；比的是主图的**实际有效区**，不是「非 NoData 就算」。）
-
-    按条带读，不整张读进内存；条带高度取 fmax 的整数倍，每一级都不跨条带断块。"""
+    R1：粗块怎么分 —— 按这一级的**实际**尺寸（缩览宽 lw、高 lh）把缩览切成
+    CC_OVR_BLOCK（32）× 32 的块，一块对应主图里 (mw/lw)×32 × (mh/lh)×32 的一片区域，
+    换算用**实际尺寸比**，不按倍数去猜 GDAL 的取样点（复核 R1：固定 (f·y, f·x) 在奇数尺寸上错位）。
+    主图那边按条带读，不整张读进内存。"""
     import numpy as np
     import rasterio
     from rasterio.windows import Window
-    factors = sorted(set(int(f) for f in factors if int(f) >= 1))
-    if not factors:
-        return {}
-    fmax = max(factors)
+    grids, cnt_valid, cnt_total, cols = {}, {}, {}, {}
     with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
         mw, mh = ds.width, ds.height
-        is_dom = ds.count >= 3 and ds.dtypes[0] == "uint8"
-        nodata = ds.nodata
-        lw = {f: (mw + f - 1) // f for f in factors}
-        lh = {f: (mh + f - 1) // f for f in factors}
-        masks = {f: np.zeros((lh[f], lw[f]), dtype=bool) for f in factors}
-        strip = max(fmax, (CC_STRIP_ROWS // fmax) * fmax)   # 条带按最大倍数对齐，每级都不跨条带断块
+        for k, item in enumerate(levels):
+            f, lw, lh = item[0], item[1], item[2]
+            nbx = (lw + CC_OVR_BLOCK - 1) // CC_OVR_BLOCK
+            nby = (lh + CC_OVR_BLOCK - 1) // CC_OVR_BLOCK
+            xb = [int(math.floor(b * CC_OVR_BLOCK * float(mw) / float(lw))) for b in range(nbx)]
+            yb = [int(math.floor(b * CC_OVR_BLOCK * float(mh) / float(lh))) for b in range(nby)]
+            xb.append(mw)
+            yb.append(mh)
+            grids[k] = (nbx, nby, xb, yb)
+            cnt_valid[k] = np.zeros((nby, nbx), dtype=np.int64)
+            cnt_total[k] = np.zeros((nby, nbx), dtype=np.int64)
+            cols[k] = (np.searchsorted(np.asarray(xb), np.arange(mw), side="right") - 1).astype(np.int32)
+        strip = max(CC_STRIP_ROWS, 1)
         r0 = 0
         while r0 < mh:
             if stopped and stopped():
                 raise AlignCancelled()
             n = min(strip, mh - r0)
             a = ds.read(window=Window(0, r0, mw, n))
-            v = _cc_pixels_valid(a, ds, is_dom, nodata)          # (n, mw)
-            for f in factors:
-                lwf = lw[f]
-                wp = lwf * f                                  # 补齐到整块
-                y0 = r0 // f
-                if mode == "any":
-                    nf, rem = n // f, n % f
-                    if nf:
-                        b = v[:nf * f]
-                        if wp > mw:
-                            b = np.concatenate([b, np.zeros((b.shape[0], wp - mw), dtype=bool)], axis=1)
-                        masks[f][y0:y0 + nf, :] = b.reshape(nf, f, lwf, f).any(axis=(1, 3))
-                    if rem:
-                        b = v[nf * f:]
-                        nb = (rem + f - 1) // f
-                        pad = np.zeros((nb * f, wp), dtype=bool)
-                        pad[:rem, :mw] = b
-                        masks[f][y0 + nf:y0 + nf + nb, :] = pad.reshape(nb, f, lwf, f).any(axis=(1, 3))
-                else:
-                    cols = np.arange(lwf) * f
-                    okc = cols < mw
-                    for y in range(y0, min(lh[f], (r0 + n + f - 1) // f)):
-                        idx = f * y - r0
-                        if idx < 0 or idx >= n:
-                            continue
-                        m = np.zeros(lwf, dtype=bool)
-                        m[okc] = v[idx][cols[okc]]
-                        masks[f][y, :] = m
+            v = _cc_pyramid_valid(a, is_dom, nodata, has_alpha)
+            del a
+            for k, (nbx, nby, xb, yb) in grids.items():
+                ri = (np.searchsorted(np.asarray(yb), np.arange(r0, r0 + n), side="right") - 1).astype(np.int32)
+                blk = (ri[:, None] * np.int32(nbx) + cols[k][None, :]).ravel()
+                cnt_total[k] += np.bincount(blk, minlength=nbx * nby).reshape(nby, nbx)
+                if v.any():
+                    cnt_valid[k] += np.bincount(blk[v.ravel()], minlength=nbx * nby).reshape(nby, nbx)
+                del blk
             r0 += n
             if progress:
                 progress(r0 / float(mh))
-    return {f: (masks[f], lw[f], lh[f]) for f in factors}
+    return {k: (cnt_valid[k], cnt_total[k], grids[k][2], grids[k][3]) for k in grids}
 
 
-def cc_ovr_level_mask(path, level, is_dom, nodata):
-    """某一级金字塔的有效掩膜（逐像元）。读不出来返回 None。"""
+def cc_ovr_level_mask(path, level, is_dom, nodata, has_alpha=None):
+    """某一级金字塔的有效掩膜（逐像元）。读不出来返回 None。
+
+    R1：缩览上**不套** 128 规则（主控澄清）—— 缩览是重采样结果，DOM 用平均，
+    127/129 平均后正好 128，按 128 判「没值」会把正确的金字塔整级误拒（复核 R2）。"""
     import numpy as np
     import rasterio
     try:
-        with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
-            ci = ds.colorinterp
+        if has_alpha is None:
+            with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
+                has_alpha = ds.count >= 4 and ds.colorinterp[3].name == "alpha"
         with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path), OVERVIEW_LEVEL=level) as lv:
             a = lv.read()
-            if is_dom:
-                rgb = a[:3]
-                ok = np.any(rgb != 0, axis=0)
-                ok &= ~np.all(rgb == CC_GRAY, axis=0)
-                if a.shape[0] >= 4 and ci[3].name == "alpha":
-                    ok &= a[3] > 0
-            else:
-                ok = np.isfinite(a[0])
-                if nodata is not None:
-                    ok &= a[0] != float(nodata)
-            return ok
+            return _cc_pyramid_valid(a, is_dom, nodata, has_alpha)
     except Exception:
         return None
 
@@ -7296,10 +7270,17 @@ def cc_check_ovr(path, log=None):
     查两件事：
     (1)每一级的真实尺寸（按实际 IFD 读）和「主图尺寸 / 倍数」对得上（差 1 个像元以内都算对）；
     (2)**有效区一致**：主图有有效数据的地方，对应缩览也必须有有效数据（不许丢）。
-       比的是主图的**实际有效区**（DOM：RGB 不全为 0、也不正好 (128,128,128)、alpha>0；
-       DSM：有限且 != NoData），不是「非 NoData 就算」，也不是拿上一级当基准。
-       DOM 的金字塔是「平均」→ 比「整块里有没有有效像元」；
-       DSM 的金字塔是「最近邻」→ 比「被取到的那一个像元」（整块里别的像元有效不算数）。
+
+    R1（主控澄清，2026-10-23 复核 R1/R2 两项返修）：
+      · 缩览「有效」只看 **DOM 的 alpha > 0** / **DSM 有限且 ≠ NoData**，
+        **不套判据①的 RGB / 128 规则**（那条只用于 CC 原图；DOM 平均后 127/129 会变成 128，
+        按 128 判没值会把**正确的**金字塔整级误拒 —— 复核 R2）。
+      · **不模拟 GDAL 的取样点**。按这一级的**实际尺寸**（缩览宽 lw、高 lh）把缩览切成
+        CC_OVR_BLOCK（32）×32 的块，一块对应主图里 (mw/lw)×32 × (mh/lh)×32 的一片；
+        主图块里有有效像元 → 缩览块（**向外多看 1 像元**）里必须有；主图块全无效 → 不要求。
+        不用固定 (f·y, f·x) 取样（奇数尺寸下 GDAL 的真实取样会错位 —— 复核 R1）。
+      · 丢块的判据用「缩览有值的像元数」和「主图块里有值的像元数」两条**比值**，
+        不再用「期望块数 vs 实际块数」的掩膜相减（那样零样本会整级放行 —— 复核 R1 的 F4 同类）。
     全程按窗口读，不整张读进内存。"""
     import numpy as np
     import rasterio
@@ -7312,6 +7293,7 @@ def cc_check_ovr(path, log=None):
         w, h = ds.width, ds.height
         is_dom = ds.count >= 3 and ds.dtypes[0] == "uint8"
         nodata = ds.nodata
+        has_alpha = ds.count >= 4 and ds.colorinterp[3].name == "alpha"
     for k, (f, lw, lh) in enumerate(levels):
         if lw <= 0 or lh <= 0:
             probs.append("%s 第 %d 级金字塔尺寸读不出来" % (name, k + 1))
@@ -7320,33 +7302,60 @@ def cc_check_ovr(path, log=None):
             probs.append("%s 第 %d 级金字塔（%d × %d）和主图（%d × %d，%d 倍）对不上" % (
                 name, k + 1, lw, lh, w, h, f))
     try:
-        masks = cc_main_level_masks(path, [f for f, _, _ in levels], "any" if is_dom else "sample")
+        blocks = cc_pyramid_main_blocks(path, levels, is_dom, nodata, has_alpha)
     except Exception as ex:
         return probs + ["%s 的有效区读不出来：%s" % (name, ex)], levels
     for k, (f, lw, lh) in enumerate(levels):
         if lw <= 0 or lh <= 0:
             continue
-        om = cc_ovr_level_mask(path, k, is_dom, nodata)
+        om = cc_ovr_level_mask(path, k, is_dom, nodata, has_alpha)
         if om is None:
             probs.append("%s 第 %d 级读不出来" % (name, k + 1))
             continue
-        exp, elw, elh = masks[f]
-        if om.shape != (elh, elw):
+        if om.shape != (lh, lw):
             probs.append("%s 第 %d 级是 %d × %d，和算出来的 %d × %d 对不上" % (
-                name, k + 1, om.shape[1], om.shape[0], elw, elh))
+                name, k + 1, om.shape[1], om.shape[0], lw, lh))
             continue
-        n_exp = int(np.count_nonzero(exp))
-        n_ovr = int(np.count_nonzero(om))
-        lost = int(np.count_nonzero(exp & ~om))
-        tol = max(50, n_exp // 50)                # 允许少量因重采样取整造成的对不上
-        if n_exp > 0 and n_ovr == 0:
-            probs.append("%s 第 %d 级整级都没值，但主图有 %d 个块是有数据的" % (name, k + 1, n_exp))
-        elif lost > tol:
-            probs.append("%s 第 %d 级：主图有 %d 个块有数据，缩览丢了 %d 个（超过允许的 %d 个）" % (
-                name, k + 1, n_exp, lost, tol))
+        n_valid, n_total, xb, yb = blocks[k]
+        nbx, nby = n_valid.shape[1], n_valid.shape[0]
+        # 缩览侧：按同样的 32×32 分块，每块**向外多看 1 像元**，看块里有没有值
+        ov_has = np.zeros((nby, nbx), dtype=bool)
+        for by in range(nby):
+            oy0, oy1 = by * CC_OVR_BLOCK, min((by + 1) * CC_OVR_BLOCK, lh)
+            for bx in range(nbx):
+                ox0, ox1 = bx * CC_OVR_BLOCK, min((bx + 1) * CC_OVR_BLOCK, lw)
+                ex0, ex1 = max(0, ox0 - 1), min(lw, ox1 + 1)
+                ey0, ey1 = max(0, oy0 - 1), min(lh, oy1 + 1)
+                if om[ey0:ey1, ex0:ex1].any():
+                    ov_has[by, bx] = True
+        n_main_px = int(n_valid.sum())
+        n_ovr_px = int(np.count_nonzero(om))
+        # 判据一（块规则）：主图**整块全是**有效像元 → 缩览对应块（外扩 1 像元）必须有值。
+        #   这一条是可靠的：不管最近邻还是平均，缩览像元取的都是主图这一块里的像元，
+        #   块里全是有效像元时缩览不可能整块没值。
+        #   「块里只有一部分像元有效」时**不**要求：最近邻在奇数宽度上会「相位翻转」——
+        #   主图偶数列有效时，正确的一级缩览合法地只有左半边有值（实测 GDAL 3.10：
+        #   513 见方、偶数列有效的 DSM，正确缩览 257×257 只有 0～128 列有值）。
+        full = (n_total > 0) & (n_valid >= n_total)
+        n_full = int(full.sum())
+        n_lost = int((full & ~ov_has).sum())
+        # 判据二（总量比）：缩览的有效像元数，应该约等于「主图有效像元数 × 这一级的面积比」。
+        #   用绝对量的容差（不是相对量），这样「细长条」在高倍级合法地缩没了也不会被误拒。
+        if n_main_px > 0:
+            expect_ratio = (float(lw) * float(lh)) / (float(w) * float(h))
+            expect_px = n_main_px * expect_ratio
+            allowed = max(20.0, expect_px * 0.25)
+            if expect_px - n_ovr_px > allowed:
+                probs.append("%s 第 %d 级：缩览只有 %d 个有效像元，按主图 %d 个和面积比 %.4f 应有约 %.0f 个，"
+                             "少了 %.0f 个（允许少 %.0f 个）" % (
+                                 name, k + 1, n_ovr_px, n_main_px, expect_ratio, expect_px,
+                                 expect_px - n_ovr_px, allowed))
+        if n_full > 0 and n_lost > 0:
+            probs.append("%s 第 %d 级：主图有 %d 个整块全是有效数据，缩览丢了 %d 个" % (
+                name, k + 1, n_full, n_lost))
         if log:
-            log("    %s 第 %d 级：主图有数据的块 %d 个、缩览有值的像元 %d 个、丢了 %d 个" % (
-                name, k + 1, n_exp, n_ovr, lost))
+            log("    %s 第 %d 级：主图有效像元 %d 个、缩览有值 %d 个、整块全有值的主图块 %d 个、其中缩览没值 %d 个" % (
+                name, k + 1, n_main_px, n_ovr_px, n_full, n_lost))
     return probs, levels
 
 
