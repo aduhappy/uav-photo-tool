@@ -80,7 +80,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "无人机照片工具"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 GITHUB_REPO = "aduhappy/uav-photo-tool"
 HOMEPAGE_URL = "https://github.com/%s" % GITHUB_REPO
 OUTPUT_SUFFIX = "_去定位"
@@ -6343,7 +6343,6 @@ CC_DSM_FRAC = 0.9                    # 判据④（工点没有点云时）：�
 CC_GRAY = 128                        # D-36：CC 在没纹理的地方填的纯灰色（正好 128,128,128），当「没影像」
 CC_STRIP_ROWS = 512                  # 按这么多行一条读写（= CC 和输出的分块高度）
 CC_OVR_MIN = 256                     # 金字塔一直做到长边 < 这么多像元
-CC_OVR_BLOCK = 32                    # 金字塔核对：把缩览分成 32×32 的块，一块一块比
 CC_SKIP_LABEL = "（不整理）"
 
 
@@ -7141,16 +7140,71 @@ def _cc_ovr_factors(w, h):
     return out
 
 
-def cc_build_ovr(path, kind):
-    """给 path 建外部 .ovr 金字塔（GDAL TIFF_USE_OVR，主 tif 一个字节不动）。返回各级倍数。"""
+def cc_ovr_expected(w, h):
+    """D-38：这张 tif 这次该有的金字塔结构：[(倍数, 宽, 高), ...]。
+
+    级数 = _cc_ovr_factors(主图尺寸)（长边一直做到 < CC_OVR_MIN 为止）；
+    每级宽高 = 逐级 ceil(上一级 / 2) —— 这就是 GDAL 对这张 tif 的预期尺寸
+    （GDAL 3.10 实测：513→257、1025→513→257、1193×857→597×429→299×215，奇数尺寸也对）。"""
+    out = []
+    pw, ph = int(w), int(h)
+    for f in _cc_ovr_factors(pw, ph):
+        pw, ph = int(math.ceil(pw / 2.0)), int(math.ceil(ph / 2.0))
+        out.append((f, pw, ph))
+    return out
+
+
+def _cc_gdal_error_capture():
+    """装一个 GDAL 错误记录器（只收 GDAL 报的错误），返回 (记录列表, 还原函数)。
+
+    D-38：建金字塔的过程中 GDAL 报**任何**错误都算失败。rasterio 自己会把致命错误抛成异常，
+    但 GDAL 也可能只打一句错误不抛异常；rasterio 把 GDAL 的错误记在 logger 'rasterio' 上
+    （消息里含 "GDAL signalled an error"），这里把它收下来。"""
+    import logging
+    recs = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return
+            if "signalled an error" in msg:
+                recs.append(msg)
+
+    lg = logging.getLogger("rasterio")
+    handler = _H()
+    lg.addHandler(handler)
+    old_level = lg.level
+    lg.setLevel(logging.INFO)          # GDAL 的错误是以 INFO 级记的（rasterio.env / rasterio._err）
+
+    def restore():
+        try:
+            lg.removeHandler(handler)
+            lg.setLevel(old_level)
+        except Exception:
+            pass
+    return recs, restore
+
+
+def cc_ovr_build_to(path, kind):
+    """用 GDAL 给 path 建外部 .ovr 金字塔（DOM 平均、DSM 最近邻），主 tif 一个字节不动。
+
+    D-38：建的过程中 GDAL 报任何错误都算失败（错误消息收在返回值的第二项里）。
+    返回 (建的各级倍数, GDAL 错误消息列表)。"""
     import rasterio
     from rasterio.enums import Resampling
-    with rasterio.Env(TIFF_USE_OVR=True, COMPRESS_OVERVIEW="DEFLATE", BIGTIFF_OVERVIEW="IF_SAFER",
-                      GDAL_TIFF_OVR_BLOCKSIZE=512, GDAL_PAM_ENABLED="NO"):
-        with rasterio.open(str(path), "r+") as ds:
-            fs = _cc_ovr_factors(ds.width, ds.height)
-            ds.build_overviews(fs, Resampling.average if kind == "DOM" else Resampling.nearest)
-    return fs
+    recs, restore = _cc_gdal_error_capture()
+    fs = []
+    try:
+        with rasterio.Env(TIFF_USE_OVR=True, COMPRESS_OVERVIEW="DEFLATE", BIGTIFF_OVERVIEW="IF_SAFER",
+                          GDAL_TIFF_OVR_BLOCKSIZE=512, GDAL_PAM_ENABLED="NO"):
+            with rasterio.open(str(path), "r+") as ds:
+                fs = _cc_ovr_factors(ds.width, ds.height)
+                ds.build_overviews(fs, Resampling.average if kind == "DOM" else Resampling.nearest)
+    finally:
+        restore()
+    return fs, recs
 
 
 def cc_ovr_levels(path):
@@ -7168,216 +7222,131 @@ def cc_ovr_levels(path):
     return out
 
 
-def _cc_open_level(path, level=None):
-    """打开 path 的某一级金字塔（level=None 是主图；level=0 是第一级缩览）。"""
-    import rasterio
-    if level is None:
-        return rasterio.open(str(path))
-    return rasterio.open(str(path), OVERVIEW_LEVEL=level)
-
-
-def _cc_pyramid_valid(a, is_dom, nodata, has_alpha):
-    """金字塔核对用的「有效」掩膜（True = 有效）。
-
-    R1（主控澄清）：缩览上**只**看 DOM 的 alpha > 0、DSM 有限且 ≠ NoData，
-    **不套判据①的 RGB / 128 规则**（那条只用于 CC 原图判「有没有影像」）。
-    缩览是重采样后的结果：DOM 用平均，127/129 这种合法像元平均后会正好变成 128，
-    按 128 判「没值」会把**正确的**金字塔整级误拒（复核 R2）。
-    没有 alpha 波段时退回「RGB 不全为 0」。
-    （D-37：有限值与非 NoData 取交集；比的是主图的**实际**有效区。）"""
-    import numpy as np
-    if is_dom:
-        if has_alpha:
-            return a[3] > 0
-        return np.any(a[:3] != 0, axis=0)
-    ok = np.isfinite(a[0])
-    if nodata is not None:
-        ok &= a[0] != float(nodata)
-    return ok
-
-
-def cc_pyramid_main_blocks(path, levels, is_dom, nodata, has_alpha, stopped=None, progress=None):
-    """一次扫描主图，算出每一级金字塔对应的「粗块」统计。
-
-    levels：[(倍数, 缩览宽, 缩览高), ...]（按实际 IFD 读出来的真实尺寸，不按公式算）。
-    返回 {k: (每块有效像元数, 每块总像元数, 列边界, 行边界)}，两个数组都是 (块行数, 块列数)。
-
-    R1：粗块怎么分 —— 按这一级的**实际**尺寸（缩览宽 lw、高 lh）把缩览切成
-    CC_OVR_BLOCK（32）× 32 的块，一块对应主图里 (mw/lw)×32 × (mh/lh)×32 的一片区域，
-    换算用**实际尺寸比**，不按倍数去猜 GDAL 的取样点（复核 R1：固定 (f·y, f·x) 在奇数尺寸上错位）。
-    主图那边按条带读，不整张读进内存。"""
-    import numpy as np
+def _cc_read_level_full(path, level, block=512):
+    """把某一级金字塔按窗口整个读一遍（读完不报错就算「读得通」）。返回读到的像元数。"""
     import rasterio
     from rasterio.windows import Window
-    grids, cnt_valid, cnt_total, cols = {}, {}, {}, {}
-    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
-        mw, mh = ds.width, ds.height
-        for k, item in enumerate(levels):
-            f, lw, lh = item[0], item[1], item[2]
-            nbx = (lw + CC_OVR_BLOCK - 1) // CC_OVR_BLOCK
-            nby = (lh + CC_OVR_BLOCK - 1) // CC_OVR_BLOCK
-            xb = [int(math.floor(b * CC_OVR_BLOCK * float(mw) / float(lw))) for b in range(nbx)]
-            yb = [int(math.floor(b * CC_OVR_BLOCK * float(mh) / float(lh))) for b in range(nby)]
-            xb.append(mw)
-            yb.append(mh)
-            grids[k] = (nbx, nby, xb, yb)
-            cnt_valid[k] = np.zeros((nby, nbx), dtype=np.int64)
-            cnt_total[k] = np.zeros((nby, nbx), dtype=np.int64)
-            cols[k] = (np.searchsorted(np.asarray(xb), np.arange(mw), side="right") - 1).astype(np.int32)
-        strip = max(CC_STRIP_ROWS, 1)
-        r0 = 0
-        while r0 < mh:
-            if stopped and stopped():
-                raise AlignCancelled()
-            n = min(strip, mh - r0)
-            a = ds.read(window=Window(0, r0, mw, n))
-            v = _cc_pyramid_valid(a, is_dom, nodata, has_alpha)
-            del a
-            for k, (nbx, nby, xb, yb) in grids.items():
-                ri = (np.searchsorted(np.asarray(yb), np.arange(r0, r0 + n), side="right") - 1).astype(np.int32)
-                blk = (ri[:, None] * np.int32(nbx) + cols[k][None, :]).ravel()
-                cnt_total[k] += np.bincount(blk, minlength=nbx * nby).reshape(nby, nbx)
-                if v.any():
-                    cnt_valid[k] += np.bincount(blk[v.ravel()], minlength=nbx * nby).reshape(nby, nbx)
-                del blk
-            r0 += n
-            if progress:
-                progress(r0 / float(mh))
-    return {k: (cnt_valid[k], cnt_total[k], grids[k][2], grids[k][3]) for k in grids}
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path), OVERVIEW_LEVEL=level) as lv:
+        w, h = lv.width, lv.height
+        n = 0
+        for y in range(0, h, block):
+            rows = min(block, h - y)
+            a = lv.read(window=Window(0, y, w, rows))
+            n += int(a.shape[1]) * int(a.shape[2])
+        return n
 
 
-def cc_ovr_level_mask(path, level, is_dom, nodata, has_alpha=None):
-    """某一级金字塔的有效掩膜（逐像元）。读不出来返回 None。
+def cc_check_ovr(path, expect=None, log=None):
+    """D-38：核金字塔的**结构**（不做内容抽查、不做面积估算）。返回 (问题列表, [(倍数, 宽, 高)])。
 
-    R1：缩览上**不套** 128 规则（主控澄清）—— 缩览是重采样结果，DOM 用平均，
-    127/129 平均后正好 128，按 128 判「没值」会把正确的金字塔整级误拒（复核 R2）。"""
-    import numpy as np
-    import rasterio
-    try:
-        if has_alpha is None:
-            with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
-                has_alpha = ds.count >= 4 and ds.colorinterp[3].name == "alpha"
-        with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path), OVERVIEW_LEVEL=level) as lv:
-            a = lv.read()
-            return _cc_pyramid_valid(a, is_dom, nodata, has_alpha)
-    except Exception:
-        return None
+    核这几件事：
+      ①级数 = 这次要求的级数（GDAL 对这张 tif 的预期）；
+      ②每级宽高 = GDAL 对这张 tif 的预期（逐级 ceil(上一级 / 2)）；
+      ③每一级按窗口完整读一遍不报错（读得通）；
+      ④和这张 tif 成套（换的时候另外核 tif 的 SHA-256 没变，见 cc_ovr_build）。
 
-
-def cc_check_ovr(path, log=None):
-    """D-37：核交付目录里的金字塔。返回 (问题列表, [(倍数, 宽, 高)])。
-
-    查两件事：
-    (1)每一级的真实尺寸（按实际 IFD 读）和「主图尺寸 / 倍数」对得上（差 1 个像元以内都算对）；
-    (2)**有效区一致**：主图有有效数据的地方，对应缩览也必须有有效数据（不许丢）。
-
-    R1（主控澄清，2026-10-23 复核 R1/R2 两项返修）：
-      · 缩览「有效」只看 **DOM 的 alpha > 0** / **DSM 有限且 ≠ NoData**，
-        **不套判据①的 RGB / 128 规则**（那条只用于 CC 原图；DOM 平均后 127/129 会变成 128，
-        按 128 判没值会把**正确的**金字塔整级误拒 —— 复核 R2）。
-      · **不模拟 GDAL 的取样点**。按这一级的**实际尺寸**（缩览宽 lw、高 lh）把缩览切成
-        CC_OVR_BLOCK（32）×32 的块，一块对应主图里 (mw/lw)×32 × (mh/lh)×32 的一片；
-        主图块里有有效像元 → 缩览块（**向外多看 1 像元**）里必须有；主图块全无效 → 不要求。
-        不用固定 (f·y, f·x) 取样（奇数尺寸下 GDAL 的真实取样会错位 —— 复核 R1）。
-      · 丢块的判据用「缩览有值的像元数」和「主图块里有值的像元数」两条**比值**，
-        不再用「期望块数 vs 实际块数」的掩膜相减（那样零样本会整级放行 —— 复核 R1 的 F4 同类）。
-    全程按窗口读，不整张读进内存。"""
-    import numpy as np
-    import rasterio
+    D-38 明确接受：内容层面的局部损坏（只改某一级一小块像素）**不要求**检出。
+    """
     probs = []
     name = Path(path).name
+    import rasterio
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
+        w, h = ds.width, ds.height
+    want = list(expect) if expect else cc_ovr_expected(w, h)
     levels = cc_ovr_levels(path)
     if not levels:
         return ["%s 没有金字塔" % name], []
-    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(path)) as ds:
-        w, h = ds.width, ds.height
-        is_dom = ds.count >= 3 and ds.dtypes[0] == "uint8"
-        nodata = ds.nodata
-        has_alpha = ds.count >= 4 and ds.colorinterp[3].name == "alpha"
+    if len(levels) != len(want):
+        probs.append("%s 的金字塔有 %d 级，这次要求 %d 级（%s）" % (
+            name, len(levels), len(want), "/".join(str(f) for f, _, _ in want)))
     for k, (f, lw, lh) in enumerate(levels):
         if lw <= 0 or lh <= 0:
             probs.append("%s 第 %d 级金字塔尺寸读不出来" % (name, k + 1))
             continue
-        if abs(lw - w / float(f)) > 1.5 or abs(lh - h / float(f)) > 1.5:
-            probs.append("%s 第 %d 级金字塔（%d × %d）和主图（%d × %d，%d 倍）对不上" % (
-                name, k + 1, lw, lh, w, h, f))
-    try:
-        blocks = cc_pyramid_main_blocks(path, levels, is_dom, nodata, has_alpha)
-    except Exception as ex:
-        return probs + ["%s 的有效区读不出来：%s" % (name, ex)], levels
-    for k, (f, lw, lh) in enumerate(levels):
-        if lw <= 0 or lh <= 0:
+        if k < len(want):
+            ef, ew, eh = want[k]
+            if f != ef:
+                probs.append("%s 第 %d 级是 %d 倍，这次要求 %d 倍" % (name, k + 1, f, ef))
+            if lw != ew or lh != eh:
+                probs.append("%s 第 %d 级金字塔是 %d × %d，GDAL 对这张 tif 的预期是 %d × %d" % (
+                    name, k + 1, lw, lh, ew, eh))
+        try:
+            n = _cc_read_level_full(path, k)
+        except Exception as ex:
+            probs.append("%s 第 %d 级按窗口读不完：%s" % (name, k + 1, ex))
             continue
-        om = cc_ovr_level_mask(path, k, is_dom, nodata, has_alpha)
-        if om is None:
-            probs.append("%s 第 %d 级读不出来" % (name, k + 1))
-            continue
-        if om.shape != (lh, lw):
-            probs.append("%s 第 %d 级是 %d × %d，和算出来的 %d × %d 对不上" % (
-                name, k + 1, om.shape[1], om.shape[0], lw, lh))
-            continue
-        n_valid, n_total, xb, yb = blocks[k]
-        nbx, nby = n_valid.shape[1], n_valid.shape[0]
-        # 缩览侧：按同样的 32×32 分块，每块**向外多看 1 像元**，看块里有没有值
-        ov_has = np.zeros((nby, nbx), dtype=bool)
-        for by in range(nby):
-            oy0, oy1 = by * CC_OVR_BLOCK, min((by + 1) * CC_OVR_BLOCK, lh)
-            for bx in range(nbx):
-                ox0, ox1 = bx * CC_OVR_BLOCK, min((bx + 1) * CC_OVR_BLOCK, lw)
-                ex0, ex1 = max(0, ox0 - 1), min(lw, ox1 + 1)
-                ey0, ey1 = max(0, oy0 - 1), min(lh, oy1 + 1)
-                if om[ey0:ey1, ex0:ex1].any():
-                    ov_has[by, bx] = True
-        n_main_px = int(n_valid.sum())
-        n_ovr_px = int(np.count_nonzero(om))
-        # 判据一（块规则）：主图**整块全是**有效像元 → 缩览对应块（外扩 1 像元）必须有值。
-        #   这一条是可靠的：不管最近邻还是平均，缩览像元取的都是主图这一块里的像元，
-        #   块里全是有效像元时缩览不可能整块没值。
-        #   「块里只有一部分像元有效」时**不**要求：最近邻在奇数宽度上会「相位翻转」——
-        #   主图偶数列有效时，正确的一级缩览合法地只有左半边有值（实测 GDAL 3.10：
-        #   513 见方、偶数列有效的 DSM，正确缩览 257×257 只有 0～128 列有值）。
-        full = (n_total > 0) & (n_valid >= n_total)
-        n_full = int(full.sum())
-        n_lost = int((full & ~ov_has).sum())
-        # 判据二（总量比）：缩览的有效像元数，应该约等于「主图有效像元数 × 这一级的面积比」。
-        #   用绝对量的容差（不是相对量），这样「细长条」在高倍级合法地缩没了也不会被误拒。
-        if n_main_px > 0:
-            expect_ratio = (float(lw) * float(lh)) / (float(w) * float(h))
-            expect_px = n_main_px * expect_ratio
-            allowed = max(20.0, expect_px * 0.25)
-            if expect_px - n_ovr_px > allowed:
-                probs.append("%s 第 %d 级：缩览只有 %d 个有效像元，按主图 %d 个和面积比 %.4f 应有约 %.0f 个，"
-                             "少了 %.0f 个（允许少 %.0f 个）" % (
-                                 name, k + 1, n_ovr_px, n_main_px, expect_ratio, expect_px,
-                                 expect_px - n_ovr_px, allowed))
-        if n_full > 0 and n_lost > 0:
-            probs.append("%s 第 %d 级：主图有 %d 个整块全是有效数据，缩览丢了 %d 个" % (
-                name, k + 1, n_full, n_lost))
         if log:
-            log("    %s 第 %d 级：主图有效像元 %d 个、缩览有值 %d 个、整块全有值的主图块 %d 个、其中缩览没值 %d 个" % (
-                name, k + 1, n_main_px, n_ovr_px, n_full, n_lost))
+            log("    %s 第 %d 级：%d × %d，按窗口完整读通（%d 个像元）" % (name, k + 1, lw, lh, n))
     return probs, levels
 
 
-def cc_ovr_build(tif, kind, log=None):
-    """D-37：用 GDAL 从**交付的那张 tif** 自建外部 .tif.ovr（DOM 平均、DSM 最近邻），主 tif 一个字节不动。
-    建完核每级真实尺寸和有效区；有问题就删掉坏的金字塔并抛异常。"""
+def cc_ovr_build_temp(tif, kind, log=None):
+    """在**最终名**的 tif 旁边，用**临时名**建金字塔，核过结构才成套换上（D-38）。
+
+    GDAL 只会把外部金字塔写成「<基准文件>.ovr」，所以临时基准文件也得用 .tif 结尾；
+    它用硬链接做（不复制内容；万一建链接失败才复制一份），建完就删掉这个临时基准文件。
+    换的时候核这张 tif 的 SHA-256 还是建金字塔时那份 —— 变了就不换。
+    返回 (各级 [(倍数, 宽, 高)], 这张 tif 建金字塔时的 SHA-256)。"""
     log = log or (lambda s: None)
-    tif, ovr = Path(tif), Path(str(tif) + ".ovr")
+    tif = Path(tif)
+    before = _file_sha256(tif, lambda: False, lambda n: None)
+    tmp_tif = tif.with_name(tif.name + ".建金字塔中.tif")
+    tmp_ovr = Path(str(tmp_tif) + ".ovr")
+    final_ovr = Path(str(tif) + ".ovr")
+    _cc_unlink(tmp_tif, tmp_ovr)
+    try:
+        try:
+            os.link(str(tif), str(tmp_tif))
+        except OSError:
+            shutil.copy2(str(tif), str(tmp_tif))
+        levels, _ = cc_ovr_build(tmp_tif, kind, log=log)
+    except Exception:
+        _cc_unlink(tmp_ovr, tmp_tif)
+        raise
+    try:
+        if _file_sha256(tif, lambda: False, lambda n: None) != before:
+            raise RuntimeError("换金字塔时 %s 被改了" % tif.name)
+        os.replace(str(tmp_ovr), str(final_ovr))
+    except Exception:
+        _cc_unlink(tmp_ovr)
+        raise
+    finally:
+        _cc_unlink(tmp_tif)
+    return levels, before
+
+
+def cc_ovr_build(tif, kind, log=None):
+    """用 GDAL 在**给定的这张图**旁边建外部 .ovr 金字塔（DOM 平均、DSM 最近邻），图本身一个字节不动。
+
+    D-38：建完只核**结构**，不做内容抽查、不做面积估算：
+      ①建的过程中 GDAL 报任何错误 → 失败；
+      ②级数 = 这次要求的级数、每级宽高 = GDAL 对这张图的预期（逐级 ceil(上一级 / 2)）；
+      ③每一级按窗口完整读一遍不报错（读得通）。
+    调用方负责把它放在**临时名**上（GDAL 只把外部金字塔写成 <基准文件>.ovr），核过了再成套换上、
+    换上时再核这张图的 SHA-256 没变。返回 (各级 [(倍数, 宽, 高)], 建金字塔时这张图的 SHA-256)。"""
+    log = log or (lambda s: None)
+    tif = Path(tif)
     if not tif.is_file():
         raise RuntimeError("要建金字塔的图不存在：%s" % tif.name)
     before = _file_sha256(tif, lambda: False, lambda n: None)
-    fs = cc_build_ovr(tif, kind)
+    fs, gdal_errs = cc_ovr_build_to(tif, kind)
+    ovr = Path(str(tif) + ".ovr")
     if _file_sha256(tif, lambda: False, lambda n: None) != before:
         raise RuntimeError("建金字塔时 %s 被改了" % tif.name)
     if not ovr.is_file():
         raise RuntimeError("%s 的金字塔没建出来（%s 不存在）" % (tif.name, ovr.name))
-    probs, levels = cc_check_ovr(tif, log=log)
+    if gdal_errs:
+        raise RuntimeError("%s 建金字塔时 GDAL 报错：%s" % (tif.name, "；".join(gdal_errs[:3])))
+    import rasterio
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"), rasterio.open(str(tif)) as ds:
+        w, h = ds.width, ds.height
+    probs, levels = cc_check_ovr(tif, expect=cc_ovr_expected(w, h), log=log)
     if probs:
-        _cc_unlink(ovr)
         raise RuntimeError("%s 的金字塔不对：%s" % (tif.name, "；".join(probs)))
-    log("    %s 的金字塔建好了（%d 级：%s）" % (tif.name, len(levels), "/".join(str(f) for f, _, _ in levels)))
-    return fs
+    log("    %s 的金字塔建好了（GDAL 自建 %d 级：%s；只做结构核对）" % (
+        tif.name, len(levels),
+        "、".join("%d 级 %d × %d" % (k + 1, lw, lh) for k, (f, lw, lh) in enumerate(levels))))
+    return levels, before
 
 
 def cc_write_clipped(src, dst, kind, polys, win, stopped=None, progress=None, epsg=None):
@@ -7478,7 +7447,7 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
     """裁一个正射/DSM 成果：范围线 → 写临时 tif（不重采样）→（可选）金字塔 → 自检 → 换上。
     返回 (交付文件 [(名, 路径)], 裁边信息)。
 
-    D-37：金字塔默认**不生成**；勾了才从交付的那张 tif 自建（DOM 平均、DSM 最近邻），建完核尺寸和有效区。"""
+    D-37：金字塔默认**不生成**；勾了才从交付的那张 tif 自建（DOM 平均、DSM 最近邻），建完只核结构（D-38）。"""
     stopped = lambda: stop_event is not None and stop_event.is_set()
     name = site["name"]
     g = r["grid"]
@@ -7512,11 +7481,14 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
             if ovr:
                 t1 = time.time()
                 progress(0.5 + 0.4 * (i + 1) / len(kinds), "%s（%s）" % (CC_CLIP_STAGE["ovr"], k))
-                fs = cc_ovr_build(tmp, k, log=log)
+                # D-38：建在临时名上（这里的临时 tif 本身就是临时名），只核结构；核过了才和 tif 一起换上
+                levels, tif_sha = cc_ovr_build(tmp, k, log=log)
                 info["steps"].append(("ovr_" + k.lower(), round(time.time() - t1, 1)))
+                info.setdefault("ovr_sha", {})[k] = tif_sha
+                info.setdefault("ovr_levels", {})[k] = levels
                 log("    %s：%d × %d 像元，写 %.0f 秒；金字塔 %d 级（%s），%.0f 秒" % (
-                    k, boxes[k]["w"], boxes[k]["h"], info["steps"][-2][1], len(fs), "/".join(str(f) for f in fs),
-                    info["steps"][-1][1]))
+                    k, boxes[k]["w"], boxes[k]["h"], info["steps"][-2][1], len(levels),
+                    "/".join(str(f) for f, _, _ in levels), info["steps"][-1][1]))
             else:
                 info["steps"].append(("ovr_" + k.lower(), 0.0))
                 log("    %s：%d × %d 像元，写 %.0f 秒；没生成金字塔（D-37：默认不生成）" % (
@@ -7527,9 +7499,6 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
             problems, rinfo = check_survey_rasters(tmps["DOM"], tmps["DSM"], r["epsg"], g["px"])
             problems += check_survey_raster_pair(rinfo)
         for k in kinds:
-            if ovr:                       # D-37：只有生成金字塔才核金字塔
-                p, _ = cc_check_ovr(tmps[k], log=log)
-                problems += p
             gi = geotiff_info(tmps[k])
             dc = (gi["origin"][0] - g["left"]) / g["px"]
             dr = (g["top"] - gi["origin"][1]) / g["px"]
@@ -7537,6 +7506,20 @@ def cc_deliver_ortho_clipped(r, site, sd, inset, density, metashape, log, progre
                 problems.append("%s 的像元网格和 CC 原图对不上（偏移 %.6f、%.6f 个像元）" % (k, dc, dr))
         if problems:
             raise RuntimeError("裁出来的 DOM/DSM 没通过检查：" + "；".join(problems))
+        if ovr:
+            # D-38：金字塔的结构在建的时候已经核过（只核结构）；换上之前再核一次
+            # tif 的 SHA-256 还是建金字塔时那份 —— 变了就不换（免得金字塔和 tif 不是一套）。
+            for k in kinds:
+                want = (info.get("ovr_sha") or {}).get(k)
+                if not want:
+                    continue
+                now = _file_sha256(tmps[k], lambda: False, lambda n: None)
+                if now != want:
+                    problems.append("%s 在建金字塔之后被改了（SHA-256 变了），金字塔和它不是一套，不换上" % k)
+                if not Path(str(tmps[k]) + ".ovr").is_file():
+                    problems.append("%s 的金字塔文件不见了" % k)
+            if problems:
+                raise RuntimeError("裁出来的 DOM/DSM 没通过检查：" + "；".join(problems))
         for k in kinds:                       # 检查都过了才换上：tif、.tfw（和金字塔，若生成）一起
             final = sd / (name + k + ".tif")
             pairs = [(tmps[k], final), (Path(str(tmps[k])[:-4] + ".tfw"), final.with_suffix(".tfw"))]
@@ -7558,7 +7541,7 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log, ovr=False):
     大小、修改时间没变、清单里有哈希的不重复复制。
 
     D-37：**不复制 CC 的 .tif.ovr**（CC 的 .ovr 是给它自己那张原图建的，和交付目录里改名后的图对不上）。
-    金字塔改成可选：勾了就从**交付的这张 tif** 自己建（DOM 平均、DSM 最近邻），建完核尺寸和有效区；
+    金字塔改成可选：勾了就从**交付的这张 tif** 自己建（DOM 平均、DSM 最近邻），建完只核结构（D-38）；
     不勾就不生成（交付目录里本软件以前放的旧 .ovr 由调用方按清单删掉）。
     R2-F2：金字塔重建过的那一行，清单里的 SHA-256 作废 → 后面按实际文件统一重算。"""
     name = site["name"]
@@ -7585,7 +7568,8 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log, ovr=False):
             written.add(fn)
         out.append((fn, dst, sha))
     if r["kind"] == CC_KIND_ORTHO and ovr:
-        # D-37：金字塔从**交付的这张 tif** 自建（DOM 平均、DSM 最近邻），不复制 CC 的。
+        # D-37/D-38：金字塔从**交付的这张 tif** 自建（DOM 平均、DSM 最近邻），不复制 CC 的。
+        # D-38：建在临时名上、只核结构，核过了才成套换上（换上时核 tif 的 SHA-256 没变）。
         for k in ("DOM", "DSM"):
             if not r[k.lower()]:
                 continue
@@ -7598,7 +7582,9 @@ def cc_deliver_copy(r, site, sd, old, stopped, on_bytes, log, ovr=False):
                     ovp.unlink()          # 上一版留下的先删掉，重新建一套和这张图配套的
                 except OSError as ex:
                     raise RuntimeError("删不掉旧的金字塔 %s：%s" % (ovp.name, ex))
-            cc_ovr_build(tif, k, log=log)
+            levels, _ = cc_ovr_build_temp(tif, k, log=log)
+            if levels:
+                r.setdefault("ovr_levels", {})[k] = levels
             if ovp.is_file() and not any(fn == ovp.name for fn, _, _ in out):
                 out.append((ovp.name, ovp, None))
     return out
@@ -7657,8 +7643,16 @@ def _cc_report_append(site, r, dest):
         lines.append("    裁边判据：%s%s" % (crit or "不裁边（CC 原图原样复制）",
                                          "（%s）" % note if note else ""))
     if r["kind"] == CC_KIND_ORTHO:
-        lines.append("    金字塔：%s" % ("从交付的这张 tif 自建（不复制 CC 的 .ovr），已核每级尺寸和有效区" if r.get("ovr")
-                                  else "没生成（默认不带 .ovr）"))
+        lv = (r.get("ovr_levels") or (r.get("clip") or {}).get("ovr_levels") or {})
+        parts = []
+        for k in ("DOM", "DSM"):
+            if lv.get(k):
+                parts.append("%s %d 级（%s）" % (k, len(lv[k]),
+                                                "、".join("%d 级 %d × %d" % (i + 1, lw, lh)
+                                                          for i, (_, lw, lh) in enumerate(lv[k]))))
+        lines.append("    金字塔：%s" % ("从交付的这张 tif 自建（不复制 CC 的 .ovr），只做结构核对（级数、每级尺寸、每级能完整读通）"
+                                  + ("；" + "；".join(parts) if parts else "")
+                                  if r.get("ovr") else "没生成（默认不带 .ovr）"))
     rep = Path(site["dir"]) / SURVEY_REPORT
     try:
         with open(rep, "a", encoding="utf-8") as f:
