@@ -8648,7 +8648,7 @@ def run_selftest(log=None):
         # ---- 8) 3SM 外框（T17）：按 CC 3SM 的 SMNodeHeader 表结构写一个根节点外框，再用整理 CC 成果的函数读回 ----
         try:
             import sqlite3
-            want = (634973.29, 3997750.42, 2100.5, 635801.36, 3998362.27, 2400.25)
+            want = (500100.25, 3900200.5, 1000.5, 500900.75, 3900800.25, 1300.25)
             con = sqlite3.connect(":memory:")
             con.execute("CREATE TABLE SMNodeHeader (NodeId INTEGER PRIMARY KEY,ParentNodeId INTEGER,Resolution INTEGER,"
                         "Filtered INTEGER,Extent BLOB,ContentExtent BLOB,TotalCount INTEGER,NodeCount INTEGER)")
